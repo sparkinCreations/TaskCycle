@@ -1,0 +1,191 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   App Container Layout
+   Main structural elements and view containers
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Root container */
+.app-root {
+    justify-content: flex-start;
+    font-family: var(--font-family);
+    text-align: center;
+    color: var(--theme-text-primary);
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding-bottom: 150px;
+}
+
+/* Main app container */
+#app-container {
+    position: relative;
+    width: 100vw;
+    overflow: hidden;
+    /* Reserve the measured header+mode-selector height (--header-total-height,
+       published by headerLayoutManager). Falls back to the prior fixed estimate
+       before JS measures / if JS is unavailable. */
+    padding-top: var(--header-total-height, calc(env(safe-area-inset-top, 0px) + var(--header-height-fallback)));
+}
+
+/* Task view container - vertically centered */
+#task-view {
+    position: fixed;
+    /* Centre the card in the BAND between the fixed header and the Routine|Stats
+       nav dots, so its top clears the header AND its bottom (the Complete button
+       + help window, which live at the bottom of #task-view) clears the nav
+       dots. --header-total-height and --nav-dots-clearance are published by
+       headerLayoutManager. The `(header - navClearance)/2` shift biases the
+       centre toward whichever edge has more chrome; paired with the band-capped
+       max-height below, the whole card always sits clear of both. Falls back to
+       fixed estimates before JS measures (and if JS is unavailable). */
+    top: calc(50% + (var(--header-total-height, var(--header-height-fallback)) - var(--nav-dots-clearance, var(--nav-dots-clearance-fallback))) / 2);
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 90vw;
+    max-width: 400px;
+    /* The centering math (top: 50% + transform: -50%) puts the top edge of
+       #task-view at (100vh - max_height) / 2 — i.e., half the reduction
+       constant. With 320px the top edge sits ≥160px from the viewport top,
+       which clears the fixed header (~138px on iPad in Safari, taller in
+       PWA standalone where env(safe-area-inset-top) adds to header padding).
+       The `env() * 2` term adds extra clearance in PWA mode where the
+       header gains its full safe-area padding-top, doubled because the
+       centering reduction is split across top and bottom.
+
+       Also: 100dvh tracks the visible viewport on iPad Safari (vs 100vh
+       which includes the area behind the dynamic toolbar). Older browsers
+       fall through to the 100vh line. Same pattern as focus-mode.css. */
+    /* THE BAND, AND ONLY THE BAND (tablet + desktop; the <=768px block below
+       keeps its own min() with --task-view-max-reduction-mobile). Until Oct
+       2026 this was min(100dvh - 290px - 2*inset, band - 8px). The literal
+       won on every tablet and desktop size, and the content was not bound to
+       it anyway — there was no shrink chain above 768px, so a long routine
+       simply overflowed: on iPad portrait (834x1112, 15 tasks) the status pill
+       sat 44px into the nav dots in Auto mode and the Complete Cycle button
+       100px into them in Manual mode, with the pill over the footer. With the
+       chain in place (task-view-layout.css / task-list.css) the literal only
+       left dead space: 97px above the dots on iPad portrait, 38px on desktop.
+       --home-band-gap is the clearance at each edge — the box is centred on
+       the band, so the content sits that far below the header and above the
+       nav dots. Same reasoning as Focus View's band (FOCUS_VIEW_LAYOUT.md). */
+    max-height: calc(100vh - var(--header-total-height, var(--header-height-fallback)) - var(--nav-dots-clearance, var(--nav-dots-clearance-fallback)) - 2 * var(--home-band-gap));
+    max-height: calc(100dvh - var(--header-total-height, var(--header-height-fallback)) - var(--nav-dots-clearance, var(--nav-dots-clearance-fallback)) - 2 * var(--home-band-gap));
+    min-height: auto;
+    transition: left var(--animation-pop) ease-in-out, transform var(--animation-pop) ease-in-out;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    z-index: var(--z-content); /* Above slide arrows so quick-actions panel renders on top */
+    pointer-events: none;
+}
+
+/* Tablet + desktop: the box IS the band, not merely capped by it. With only
+   the max-height above, #task-view hugged its in-flow content and was centred
+   on the band, so its origin moved whenever that content changed: a longer
+   routine, the Add-task row opening, or — the case that mattered — one of the
+   desktop drag-customize elements floating out of flow. Those elements are
+   positioned in pixels RELATIVE TO THIS BOX (taskViewLayoutManager), so every
+   such change shifted everything the user had placed, and a position saved on
+   one reload meant something else on the next (Oct 2026: followers restored
+   inside the card, the Add-task row docked 30px high). A fixed-height band box
+   is a stable frame. Visually nothing changes — content centred in the band is
+   where the hugging box already put it — except that the card group must not
+   grow into the new slack (task-view-layout.css). Focus View keeps its own
+   top/bottom-anchored band (`height: auto` in focus-mode.css); <=768px keeps
+   the hugging box, there is no drag feature to anchor. `safe` so content that
+   cannot shrink any further overflows the bottom, not the header. */
+@media (min-width: 769px) {
+    #task-view {
+        height: calc(100vh - var(--header-total-height, var(--header-height-fallback)) - var(--nav-dots-clearance, var(--nav-dots-clearance-fallback)) - 2 * var(--home-band-gap));
+        height: calc(100dvh - var(--header-total-height, var(--header-height-fallback)) - var(--nav-dots-clearance, var(--nav-dots-clearance-fallback)) - 2 * var(--home-band-gap));
+        justify-content: safe center;
+    }
+}
+
+/* Re-enable clicks on task view content */
+#task-view * {
+    pointer-events: auto;
+}
+
+/* Hidden state - slide off left */
+#task-view.hide {
+    left: -50%;
+    transform: translate(-200%, -50%);
+}
+
+/* Directional hide (panel carousel): when the focus task panel (index 0)
+   is active, #task-view sits to its RIGHT and must exit right instead.
+   The carousel sets .hide-left/.hide-right alongside .hide based on each
+   panel's position relative to the active one. */
+#task-view.hide.hide-right {
+    left: 150%;
+    transform: translate(-50%, -50%);
+}
+
+/* Visible state - centered */
+#task-view.show {
+    left: 50%;
+    transform: translate(-50%, -50%);
+}
+
+/* Stats panel container - layout only, visual styles in stats-panel.css */
+#stats-panel.show {
+    opacity: 1;
+    pointer-events: all;
+}
+
+/* View toggle animations */
+.view-toggle-active #task-view {
+    transform: translate(-50%, -50%);
+}
+
+.view-toggle-active #stats-panel {
+    transform: translate(-50%, -50%);
+}
+
+/* Mobile: Adjust task view max-height and offset for header clearance */
+@media (max-width: 768px) {
+    #task-view {
+        /* See dvh note on the base #task-view rule above. */
+        max-height: calc(100vh - var(--task-view-max-reduction-mobile));
+        max-height: min(
+            calc(100dvh - var(--task-view-max-reduction-mobile)),
+            calc(100dvh - var(--header-total-height, var(--header-height-fallback)) - var(--nav-dots-clearance, var(--nav-dots-clearance-fallback)) - var(--space-2))
+        );
+        /* top inherits from the base rule (band-centred between header and nav
+           dots); the old manual `+ 10px + env/2` nudge is now covered by the
+           measured chrome. */
+        overflow: hidden; /* Contain flex children — task-card shrinks, button stays fixed */
+    }
+
+    #task-view.show {
+        transform: translate(-50%, -50%);
+    }
+}
+
+/* Desktop: wider task view, vertically centered - MUST come after base rules */
+@media (min-width: 1024px) {
+    #task-view {
+        max-width: 50vw;
+        /* top inherits from the base rule (centred below --header-total-height)
+           — do NOT reset to 50% here or the card would ignore the header again. */
+        left: 50%;
+        transform: translate(-50%, -50%);
+    }
+
+    #task-view.show {
+        left: 50%;
+        transform: translate(-50%, -50%);
+    }
+
+    #task-view.hide {
+        left: -50%;
+        transform: translate(-200%, -50%);
+    }
+
+    .view-toggle-active #task-view {
+        transform: translate(-50%, -50%);
+    }
+}

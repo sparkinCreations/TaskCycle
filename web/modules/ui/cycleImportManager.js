@@ -1,0 +1,1146 @@
+/**
+ * Cycle Import Manager (DI-Pure)
+ * Handles importing cycles from .mcyc files
+ *
+ * NO window.* globals - all dependencies must be injected
+ * NO legacy fallbacks - strict DI only
+ *
+ * @module ui/cycleImportManager
+ */
+
+import { createDIModule, required, optional } from '../core/diBase.js';
+import { LIMITS, DOM_SELECTORS, Z_INDEX, APP_VERSION, UI_TIMEOUTS } from '../core/constants.js';
+import { getLabel } from '../labels/labelResolver.js';
+// Pure normalizer (no DI, no side effects) — statically imported like
+// recurringCalculators in migrationManager, so imported settings get the same
+// enumerated shape every other write path emits. KNOWN-ACCEPTABLE dual
+// instance: this module loads via the settingsManager facade's ?v= dynamic
+// import, so this static import resolves to a second unversioned copy of
+// recurringSettings.js (the situation recurringMatcher.js deliberately avoids
+// via setNormalizer). Safe here because only the pure function is used — the
+// matcher's concern is memo-cache identity shared with recurringCore, which
+// import doesn't need; the cost is one duplicate cache, nothing behavioral.
+import { normalizeRecurringSettings } from '../recurring/recurringSettings.js';
+import { buildRecurringTemplate } from '../recurring/recurringTemplate.js';
+import { isValidHex } from '../utils/styleValidators.js';
+import { getRoutines, setActiveRoutineId } from '../utils/cycleMode.js';
+import { isPriorityLevel, getLegacyPriorityLevel, getLevelForColor, collectSwatchSets } from '../utils/priorityLevel.js';
+import { THEME_DEFINITIONS } from '../labels/themes.js';
+
+// Every theme's swatches, so a 2.5 file's colour — picked under any theme — maps
+// to its level (utils/priorityLevel.js).
+const LEGACY_SWATCH_SETS = collectSwatchSets(THEME_DEFINITIONS);
+
+// ============================================================================
+// 2.6 file fields — read AHEAD of the format bump
+// ============================================================================
+// A .mcyc written by a newer build carries `autoClear` and `priority` instead
+// of the 2.5 pair (SCHEMA_2_6_PLAN.md, ".mcyc"). The platform snapshots lag
+// the web app both ways, so this build is the "older reader" the plan warns
+// about: without these aliases a 2.6 file imports "successfully" and silently
+// falls to defaults. When both spellings are present the 2.6 one wins, so a
+// dual-written file never needs reconciling. Both readers return the 2.5
+// shape the rest of this module stores.
+
+/**
+ * The per-mode clear map a file record carries, in either spelling, or null.
+ * @param {Object|null|undefined} record - task, template or cleared entry from the file
+ * @returns {Object|null}
+ */
+function importedAutoClearMap(record) {
+    if (record?.autoClear && typeof record.autoClear === 'object') return record.autoClear;
+    if (record?.deleteWhenCompleteSettings && typeof record.deleteWhenCompleteSettings === 'object') {
+        return record.deleteWhenCompleteSettings;
+    }
+    return null;
+}
+
+/**
+ * A file record's priority as the stored LEVEL. A 2.6 record carries it as is
+ * (`priority: null` turns priority off even beside a 2.5 flag); a 2.5 record's
+ * flag + colour are read through the legacy rule — a swatch of any theme names
+ * its level, a custom colour its colour family. Cleared entries spell the 2.5
+ * flag `wasHighPriority`.
+ * @param {Object|null|undefined} record
+ * @returns {{priority: ('high'|'medium'|'low'|null)}}
+ */
+function importedPriorityFields(record) {
+    if (record && Object.prototype.hasOwnProperty.call(record, 'priority')) {
+        if (isPriorityLevel(record.priority)) return { priority: record.priority };
+        if (record.priority === null) return { priority: null };
+    }
+    const flagged = record?.highPriority === true || record?.wasHighPriority === true;
+    const color = isValidHex(record?.priorityColor) ? record.priorityColor : null;
+    return { priority: getLegacyPriorityLevel({ highPriority: flagged, priorityColor: color }, LEGACY_SWATCH_SETS) };
+}
+
+// ============================================================================
+// DYNAMIC IMPORTS (loaded at init time with version cache-busting)
+// ============================================================================
+
+// Storage utilities - dynamically loaded to avoid ES module cache issues
+let getObjectSizeBytes, canAddToStorage, getStorageShortageMessage;
+
+// Name utilities
+let getUniqueCycleName;
+
+// ============================================================================
+// DEPENDENCY INJECTION SETUP
+// ============================================================================
+
+const di = createDIModule('CycleImportManager', {
+    AppState: required(),
+    showNotification: required(),
+    safeAddEventListener: required(),
+    showChoiceModal: optional(null),  // Optional - for import mode choice
+    DataValidator: optional(null),  // Optional - graceful handling if missing
+    calculateNextOccurrence: optional(null),  // Optional - for recurring tasks
+    AppMeta: optional(null),  // For version info
+    vocabThemeManager: optional(null),  // For theme validation during import
+    loadMiniCycle: optional(null),  // For in-place UI refresh after import (replaces location.reload)
+    showLoader: optional(null),  // Loading overlay from uiBoot
+    hideLoader: optional(null),   // Loading overlay from uiBoot
+    onCycleCreated: optional(null)  // Initializes per-cycle undo stacks for the imported routine
+});
+
+/** @type {{AppState: Object, showNotification: Function, safeAddEventListener: Function, DataValidator: Object|null, calculateNextOccurrence: Function|null, AppMeta: Object|null}} */
+const _deps = new Proxy({}, {
+    get(_, prop) {
+        return di.resolve()[prop];
+    }
+});
+
+/**
+ * Inject dependencies for the cycle import manager module.
+ * @param {Object} dependencies - Dependencies including AppState, showNotification, etc.
+ * @returns {void}
+ */
+export function setCycleImportManagerDependencies(dependencies) {
+    di.setDependencies(dependencies);
+}
+
+// ============================================================================
+// SECURITY CONSTANTS
+// ============================================================================
+
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB limit
+const MAX_TASK_COUNT = LIMITS.TASKS_PER_CYCLE; // Use centralized limit (150)
+const MAX_TASK_TEXT_LENGTH = LIMITS.TASK_CHARACTER;
+const MAX_CYCLE_NAME_LENGTH = LIMITS.CYCLE_NAME_CHARACTER;
+// Imported task ids land in DATA_SELECTORS.taskById() selectors and key the
+// recurringTemplates map, so accept them only in this safe shape; anything
+// else (quotes, brackets, oversized) is regenerated. Kept permissive enough
+// that every id the app itself generates (task-<ts>-..., legacy repairs)
+// round-trips, so the template-metadata merge below still matches by id.
+const SAFE_IMPORTED_TASK_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+// `__proto__` and friends pass SAFE_IMPORTED_TASK_ID's character class but are
+// unusable as plain-object keys: `map['__proto__'] = t` sets the PROTOTYPE — the
+// write reads back fine, serialises to {}, and vanishes on reload (CLAUDE.md #18).
+// Imported task ids key cycle.recurringTemplates, so reject these and regenerate.
+const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const isSafeImportedTaskId = (id) =>
+    typeof id === 'string' && SAFE_IMPORTED_TASK_ID.test(id) && !UNSAFE_OBJECT_KEYS.has(id);
+
+/**
+ * Validate an imported date string: ISO YYYY-MM-DD with optional time, and a
+ * real calendar date. Mirrors dataSanitizer's validateDateString (private
+ * there) — an unvalidated dueDate renders "Invalid Date" in the task list.
+ * @param {*} dateValue
+ * @returns {string|null}
+ */
+function validateImportedDate(dateValue) {
+    if (typeof dateValue !== 'string') return null;
+    // eslint-disable-next-line security/detect-unsafe-regex -- anchored ISO 8601 pattern, input is length-limited by file caps
+    if (!/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?([+-]\d{2}:?\d{2}|Z)?)?$/.test(dateValue)) return null;
+    return Number.isNaN(new Date(dateValue).getTime()) ? null : dateValue;
+}
+
+// ============================================================================
+// FALLBACK IMPORT-TEXT NORMALIZATION (when DataValidator not available)
+// ============================================================================
+
+/**
+ * Normalize free-text from an imported .mcyc file: strip control characters,
+ * trim, and clamp length.
+ *
+ * ⚠️ This does NOT HTML-escape. Imported text is stored raw and escaped at the
+ * render sink (task text via textContent, notifications via escapeHtml), so
+ * escaping here would double-encode shared routines on re-import. The
+ * control-character strip is defense-in-depth against untrusted import data —
+ * null bytes and control chars have no place in a task name and can defeat
+ * visual review of a .mcyc file.
+ *
+ * @param {string} input - Text to normalize
+ * @param {number} [maxLength=100] - Maximum allowed length
+ * @returns {string} Trimmed, length-clamped, control-char-free text (unescaped)
+ */
+function normalizeImportedText(input, maxLength = 100) {
+    if (typeof input !== 'string') return '';
+    // Strip C0/C1 control characters (0x00-0x1F and 0x7F-0x9F): they have no
+    // place in a task name and can defeat visual review of an imported .mcyc
+    // file. Done with a codepoint filter (not a control-char regex literal) so
+    // the source stays free of literal control bytes. Emoji/international text
+    // is preserved (code points above 0x9F pass through).
+    const cleaned = Array.from(input).filter(ch => {
+        const code = ch.codePointAt(0);
+        return code > 0x1F && !(code >= 0x7F && code <= 0x9F);
+    }).join('');
+    return cleaned.trim().substring(0, maxLength);
+}
+
+// History event detail keys the renderer actually reads (historyManager's
+// detail-text branches). Import drops everything else — this closes the one
+// unbounded object in an otherwise strict import allowlist (drift-review C-15).
+// Display-only _* keys (_eventIcon, _eventLabel, _cycleNoun, _taskNoun) are
+// regenerated from getLabel()/icon maps at render time and are never imported.
+const HISTORY_DETAIL_NUMBER_KEYS = ['cycleCount', 'tasksCleared', 'count'];
+const HISTORY_DETAIL_STRING_KEYS = ['achievementId', 'achievementName', 'oldName', 'newName', 'taskName', 'themeName', 'priority', 'priorityColor'];
+
+/**
+ * Reduce an imported history event's details to the allowlisted, type-checked
+ * key set. Unknown keys and wrong-typed values are dropped.
+ * @param {*} details - Raw details object from the imported file
+ * @returns {Object} Sanitized details
+ */
+function sanitizeHistoryDetails(details) {
+    if (!details || typeof details !== 'object') return {};
+    const safe = {};
+    for (const k of HISTORY_DETAIL_NUMBER_KEYS) {
+        if (typeof details[k] === 'number' && Number.isFinite(details[k])) safe[k] = details[k];
+    }
+    for (const k of HISTORY_DETAIL_STRING_KEYS) {
+        if (typeof details[k] === 'string') safe[k] = normalizeImportedText(details[k], MAX_TASK_TEXT_LENGTH);
+    }
+    // The event carries a LEVEL (Schema 2.6). A 2.5 file's colour maps to its
+    // level the way task colours do; the level wins when both are present.
+    delete safe.priority;
+    if (isPriorityLevel(details.priority)) {
+        safe.priority = details.priority;
+    } else if (typeof details.priorityColor === 'string' && isValidHex(details.priorityColor)) {
+        safe.priority = getLevelForColor(details.priorityColor, LEGACY_SWATCH_SETS);
+    }
+    delete safe.priorityColor;
+    if (Array.isArray(details.taskNames)) {
+        safe.taskNames = details.taskNames
+            .filter(n => typeof n === 'string')
+            .slice(0, 50)
+            .map(n => normalizeImportedText(n, MAX_TASK_TEXT_LENGTH));
+    }
+    return safe;
+}
+
+/**
+ * DI injects DataValidator as a lazy accessor function (see depMappings in
+ * moduleLoader.js), not the class itself. Unwrap it; tolerate a direct class
+ * for tests that inject one.
+ * @param {Function|Object|null} dep - Injected DataValidator dep
+ * @returns {Object|null} The DataValidator class, or null
+ */
+function resolveDataValidator(dep) {
+    if (typeof dep === 'function' && !dep.validateTask) return dep() || null;
+    return dep || null;
+}
+
+// ============================================================================
+// IMPORT FUNCTIONS
+// ============================================================================
+
+// ============================================================================
+// IDEMPOTENCY GUARDS
+// ============================================================================
+
+let _importButtonsInitialized = false;
+let _dragDropInitialized = false;
+
+/**
+ * Setup import button functionality
+ */
+export function setupImportButtons() {
+    // ✅ Idempotency guard
+    if (_importButtonsInitialized) {
+        return;
+    }
+    _importButtonsInitialized = true;
+
+    // Display pending import notification from previous reload
+    try {
+        const pending = localStorage.getItem('miniCycle_importNotification');
+        if (pending) {
+            localStorage.removeItem('miniCycle_importNotification');
+            const { message, type } = JSON.parse(pending);
+            if (message) {
+                _deps.showNotification(message, type || 'success', UI_TIMEOUTS.NOTIFICATION_EXTENDED);
+            }
+        }
+    } catch (e) {
+        localStorage.removeItem('miniCycle_importNotification');
+    }
+
+    const safeAddEventListener = _deps.safeAddEventListener;
+    if (!safeAddEventListener) {
+        console.error('CycleImportManager: safeAddEventListener dependency not injected');
+        return;
+    }
+
+    const importButtons = ["import-mini-cycle", "miniCycleUpload"];
+
+    // Shared state
+    let fileInput = null;
+    let isPickerOpen = false;
+
+    const resetPickerState = () => {
+        isPickerOpen = false;
+    };
+
+    const handleImport = () => {
+        if (isPickerOpen) return;
+        isPickerOpen = true;
+
+        // Clean previous input
+        if (fileInput) {
+            fileInput.remove();
+            fileInput = null;
+        }
+
+        // Fresh input
+        fileInput = document.createElement("input");
+        fileInput.type = "file";
+        fileInput.id = "import-data-file-input";
+        fileInput.name = "dataImport";
+        fileInput.accept = ".mcyc,.json,application/json,application/octet-stream";
+        fileInput.style.display = "none";
+        document.body.appendChild(fileInput);
+
+        // When the OS file dialog closes (even on cancel), window regains focus
+        const onFocusAfterPicker = () => {
+            resetPickerState();
+            window.removeEventListener("focus", onFocusAfterPicker);
+            if (fileInput && !fileInput.files?.length) {
+                fileInput.remove();
+                fileInput = null;
+            }
+        };
+        safeAddEventListener(window, "focus", onFocusAfterPicker, { once: true });
+
+        fileInput._changeHandler = (event) => {
+            const file = event.target.files[0];
+            if (!file) {
+                fileInput.remove();
+                fileInput = null;
+                resetPickerState();
+                return;
+            }
+
+            if (file.name.endsWith(".tcyc")) {
+                _deps.showNotification(getLabel('notify.tcycNotSupported'));
+                fileInput.remove();
+                fileInput = null;
+                resetPickerState();
+                return;
+            }
+
+            // Security: File size limit to prevent memory exhaustion
+            if (file.size > MAX_FILE_SIZE_BYTES) {
+                _deps.showNotification(getLabel('notify.fileTooLarge'), "error");
+                console.warn(`Import rejected: file size ${(file.size / 1024 / 1024).toFixed(2)}MB exceeds 10MB limit`);
+                fileInput.remove();
+                fileInput = null;
+                resetPickerState();
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    await processImportedData(e.target.result);
+                } catch (error) {
+                    _deps.showNotification?.(getLabel('notify.importError'));
+                    console.error("Import error:", error);
+                } finally {
+                    if (fileInput) {
+                        fileInput.remove();
+                        fileInput = null;
+                    }
+                    resetPickerState();
+                    window.removeEventListener("focus", onFocusAfterPicker);
+                }
+            };
+
+            reader.readAsText(file);
+        };
+
+        safeAddEventListener(fileInput, "change", fileInput._changeHandler, { once: true });
+        fileInput.click();
+    };
+
+    // Attach listeners to import buttons
+    importButtons.forEach((buttonId) => {
+        const button = document.getElementById(buttonId);
+        if (!button) return;
+
+        button.title = getLabel('routine.importTitle');
+        button.setAttribute('aria-label', getLabel('routine.importTitle'));
+        button._importHandler = handleImport;
+        safeAddEventListener(button, "click", button._importHandler);
+    });
+}
+
+/**
+ * Setup drag and drop import for .mcyc files
+ * Allows users to drag .mcyc files anywhere on the page to import
+ */
+export function setupDragDropImport() {
+    // Idempotency guard
+    if (_dragDropInitialized) {
+        return;
+    }
+    _dragDropInitialized = true;
+
+    const safeAddEventListener = _deps.safeAddEventListener;
+    if (!safeAddEventListener) {
+        console.error('CycleImportManager: safeAddEventListener dependency not injected');
+        return;
+    }
+
+    let dragCounter = 0; // Track nested drag events
+
+    // Create drop overlay element
+    const overlay = document.createElement('div');
+    overlay.id = 'mcyc-drop-overlay';
+    overlay.innerHTML = `
+        <div class="mcyc-drop-content">
+            <div class="mcyc-drop-icon">+</div>
+            <div class="mcyc-drop-text">${getLabel('notify.importDropFile')}</div>
+        </div>
+    `;
+    overlay.style.cssText = `
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.7);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: ${Z_INDEX.OVERLAY_CRITICAL};
+        pointer-events: none;
+    `;
+    overlay.querySelector(DOM_SELECTORS.MCYC_DROP_CONTENT).style.cssText = `
+        background: var(--bg-color, #1a1a2e);
+        border: 3px dashed var(--accent-color, #4a9eff);
+        border-radius: 16px;
+        padding: 48px 64px;
+        text-align: center;
+        color: var(--text-color, #fff);
+    `;
+    overlay.querySelector(DOM_SELECTORS.MCYC_DROP_ICON).style.cssText = `
+        font-size: 48px;
+        margin-bottom: 16px;
+        color: var(--accent-color, #4a9eff);
+    `;
+    overlay.querySelector(DOM_SELECTORS.MCYC_DROP_TEXT).style.cssText = `
+        font-size: 18px;
+        font-weight: 500;
+    `;
+    document.body.appendChild(overlay);
+
+    const showOverlay = () => {
+        overlay.style.display = 'flex';
+    };
+
+    const hideOverlay = () => {
+        overlay.style.display = 'none';
+    };
+
+    // Check if file is a valid import format (.mcyc or .json)
+    const isValidImportFile = (file) => {
+        const name = file?.name?.toLowerCase() || '';
+        return name.endsWith('.mcyc') || name.endsWith('.json');
+    };
+
+    // Check if drag contains files
+    const hasFiles = (event) => {
+        return event.dataTransfer?.types?.includes('Files');
+    };
+
+    // Dragenter - show overlay
+    safeAddEventListener(document, 'dragenter', (e) => {
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        dragCounter++;
+        if (dragCounter === 1) {
+            showOverlay();
+        }
+    });
+
+    // Dragleave - hide overlay when leaving window
+    safeAddEventListener(document, 'dragleave', (e) => {
+        e.preventDefault();
+        dragCounter--;
+        if (dragCounter === 0) {
+            hideOverlay();
+        }
+    });
+
+    // Dragover - required to allow drop
+    safeAddEventListener(document, 'dragover', (e) => {
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+    });
+
+    // Drop - process the file
+    safeAddEventListener(document, 'drop', (e) => {
+        e.preventDefault();
+        dragCounter = 0;
+        hideOverlay();
+
+        const files = e.dataTransfer?.files;
+        if (!files || files.length === 0) return;
+
+        // Warn if multiple files dropped
+        if (files.length > 1) {
+            _deps.showNotification(getLabel('notify.importOneFileOnly'), 'warning');
+            return;
+        }
+
+        const file = files[0];
+
+        // Validate file extension
+        if (!isValidImportFile(file)) {
+            _deps.showNotification(getLabel('notify.importDropMcyc'), 'warning');
+            return;
+        }
+
+        // Reject .tcyc files (shouldn't happen with extension check, but be safe)
+        if (file.name.endsWith('.tcyc')) {
+            _deps.showNotification(getLabel('notify.tcycNotSupported'));
+            return;
+        }
+
+        // Security: File size limit
+        if (file.size > MAX_FILE_SIZE_BYTES) {
+            _deps.showNotification(getLabel('notify.fileTooLarge'), 'error');
+            console.warn(`Import rejected: file size ${(file.size / 1024 / 1024).toFixed(2)}MB exceeds 10MB limit`);
+            return;
+        }
+
+        // Read and process the file
+        const reader = new FileReader();
+        reader.onload = async (event) => {
+            try {
+                await processImportedData(event.target.result);
+            } catch (error) {
+                _deps.showNotification?.(getLabel('notify.importError'), 'error');
+                console.error('Drag-drop import error:', error);
+            }
+        };
+        reader.onerror = () => {
+            _deps.showNotification(getLabel('notify.importReadError'), 'error');
+            console.error('FileReader error:', reader.error);
+        };
+        reader.readAsText(file);
+    });
+
+}
+
+/**
+ * Look up a vocab theme definition without trusting `?.` to guard the call.
+ *
+ * `vocabThemeManager` is delivered as a **Proxy** whose `get` trap forwards to
+ * `deps.features.vocabThemeManager`. The Proxy object itself is always truthy, so
+ * `_deps.vocabThemeManager?.getThemeDefinition(x)` short-circuits on the dep being
+ * absent but NOT on the method being absent — if the underlying manager is missing,
+ * the trap returns `undefined` and the call throws "is not a function" mid-import,
+ * after the user has already picked an import mode. Check the method, not the object.
+ *
+ * @param {string} themeId - Vocab theme id from the imported file
+ * @returns {Object|null} Theme definition, or null if unavailable/unknown
+ */
+function getThemeDefinitionSafe(themeId) {
+    const manager = _deps.vocabThemeManager;
+    if (!manager || typeof manager.getThemeDefinition !== 'function') return null;
+    try {
+        // Called as a METHOD, not through an extracted reference: the depMappings
+        // Proxy binds what it hands back, but a directly-injected manager (tests,
+        // future wiring) would lose `this` if the function were pulled off first.
+        return manager.getThemeDefinition(themeId) ?? null;
+    } catch (err) {
+        console.warn('Theme lookup failed during import:', err.message);
+        return null;
+    }
+}
+
+/**
+ * Process imported cycle data
+ * @param {string} fileContent - Raw file content
+ * @returns {Promise<void>}
+ */
+export async function processImportedData(fileContent) {
+    let importedData;
+    try {
+        importedData = JSON.parse(fileContent);
+    } catch (parseErr) {
+        console.error('Import JSON parse failed:', parseErr.message);
+        _deps.showNotification?.(getLabel('notify.invalidJson'), "error", UI_TIMEOUTS.NOTIFICATION_EXTENDED);
+        return;
+    }
+
+    if (!importedData.name || !Array.isArray(importedData.tasks)) {
+        _deps.showNotification(getLabel('notify.invalidFormat'));
+        return;
+    }
+
+    // Security: Truncate tasks if exceeding limit (instead of rejecting)
+    let tasksTruncated = false;
+    const originalTaskCount = importedData.tasks.length;
+    if (importedData.tasks.length > MAX_TASK_COUNT) {
+        console.warn(`Import truncating: ${importedData.tasks.length} tasks exceeds ${MAX_TASK_COUNT} limit, keeping first ${MAX_TASK_COUNT}`);
+        importedData.tasks = importedData.tasks.slice(0, MAX_TASK_COUNT);
+        tasksTruncated = true;
+    }
+
+    // ✅ Check storage quota before importing
+    if (typeof getObjectSizeBytes === 'function' && typeof canAddToStorage === 'function') {
+        const estimatedSize = getObjectSizeBytes(importedData);
+        const storageCheck = canAddToStorage(estimatedSize);
+        if (!storageCheck.allowed) {
+            console.warn('Storage quota exceeded. Cannot import routine.');
+            _deps.showNotification(
+                typeof getStorageShortageMessage === 'function'
+                    ? getStorageShortageMessage(storageCheck.shortfall)
+                    : getLabel('notify.importNoStorage'),
+                'error',
+                UI_TIMEOUTS.NOTIFICATION_SLOW
+            );
+            return;
+        }
+    } else {
+        console.warn('Storage utilities not initialized — skipping quota check');
+    }
+
+    // ✅ Use AppState as source of truth
+    const appState = typeof _deps.AppState === 'function' ? _deps.AppState() : _deps.AppState;
+
+    // Ensure AppState is ready (reload from localStorage if needed)
+    if (!appState?.isReady?.()) {
+        appState?.reload?.();
+    }
+
+    if (!appState?.isReady?.()) {
+        console.error("AppState not ready for import");
+        _deps.showNotification(getLabel('notify.importAppNotReady'), "error");
+        return;
+    }
+
+    // Show import mode choice modal
+    const routineName = importedData.title || importedData.name || 'Routine';
+    const taskCount = importedData.tasks.length;
+    let importMode = 'template'; // Default if modal not available
+
+    if (typeof _deps.showChoiceModal === 'function') {
+        importMode = await new Promise((resolve) => {
+            _deps.showChoiceModal({
+                title: getLabel('modal.importModeTitle'),
+                message: getLabel('modal.importModeMessage', { vars: { name: routineName, taskCount } }),
+                choices: [
+                    { text: getLabel('modal.importAsTemplate'), value: 'template', description: getLabel('modal.importAsTemplateDesc') },
+                    { text: getLabel('modal.importWithProgress'), value: 'progress', description: getLabel('modal.importWithProgressDesc') }
+                ],
+                cancelText: getLabel('button.cancel'),
+                callback: resolve
+            });
+        });
+
+        if (importMode === null) {
+            return;
+        }
+    }
+
+    const cycleId = `imported_${Date.now()}`;
+
+    // Validate and sanitize all task data
+    const importTimestamp = Date.now();
+    const mappedTasks = importedData.tasks.map((task, index) => {
+        // Normalize to the enumerated shape every other write path emits
+        // (panel / activation / applicator) — import was the only writer
+        // skipping normalizeRecurringSettings, silently violating the invariant
+        // the watcher and matcher rely on. Unknown keys are dropped, including
+        // the vestigial defaultRecurTime this block used to invent (no reader
+        // anywhere consumes it). Then filter value-level poison the shape
+        // normalizer passes through: specificDates entries must be real ISO
+        // dates — a garbage entry that becomes "next" throws inside the 15s
+        // spawn tick — and are capped to a sane count.
+        const safeSettings = normalizeRecurringSettings(
+            (task.recurringSettings && typeof task.recurringSettings === 'object') ? task.recurringSettings : {}
+        );
+        if (safeSettings.specificDates.dates.length > 0) {
+            safeSettings.specificDates.dates = safeSettings.specificDates.dates
+                .filter(d => validateImportedDate(d) !== null)
+                .slice(0, LIMITS.MAX_SPECIFIC_DATES);
+            if (safeSettings.specificDates.dates.length === 0) {
+                safeSettings.specificDates.enabled = false;
+            }
+        }
+
+        // Security: Always sanitize task text, with or without DataValidator
+        const sanitizedText = normalizeImportedText(task.text || "", MAX_TASK_TEXT_LENGTH);
+
+        // Strict field validation (matches the C-14 style used for newer fields):
+        // `|| false` preserved truthy junk ("yes" stayed a string), dueDate went
+        // unvalidated (rendering "Invalid Date"), and priorityColor passed
+        // through unnormalized in this path while history entries validate it.
+        const priority = importedPriorityFields(task);
+        const autoClearMap = importedAutoClearMap(task);
+        const taskData = {
+            id: isSafeImportedTaskId(task.id)
+                ? task.id
+                : `task-${importTimestamp}-${index}`,
+            text: sanitizedText,
+            completed: task.completed === true,
+            dueDate: validateImportedDate(task.dueDate),
+            ...priority,
+            remindersEnabled: task.remindersEnabled === true,
+            recurring: task.recurring === true,
+            recurringSettings: safeSettings,
+            // Recurring tasks: always clear (cycle: true, todo: true)
+            // Non-recurring tasks: respect mode (cycle: false, todo: true)
+            autoClear:
+                (autoClearMap &&
+                 typeof autoClearMap.cycle === 'boolean' &&
+                 typeof autoClearMap.todo === 'boolean')
+                    ? autoClearMap
+                    : (task.recurring === true ? { cycle: true, todo: true } : { cycle: false, todo: true }),
+            schemaVersion: 2
+        };
+
+        // Validate task structure (DataValidator provides additional validation if available)
+        try {
+            const DataValidator = resolveDataValidator(_deps.DataValidator);
+            if (DataValidator?.validateTask) {
+                return DataValidator.validateTask(taskData);
+            }
+            return taskData;
+        } catch (error) {
+            console.warn(`Skipping invalid task during import:`, error.message);
+            return null;
+        }
+    }).filter(task => task !== null);
+
+    // Create recurring templates for tasks with recurring: true
+    const recurringTemplates = {};
+    const calculateNextOccurrence = _deps.calculateNextOccurrence;
+
+    mappedTasks.forEach((task, index) => {
+        if (task.recurring && task.recurringSettings) {
+            try {
+                let nextOccurrence = null;
+                if (typeof calculateNextOccurrence === 'function') {
+                    nextOccurrence = calculateNextOccurrence(task.recurringSettings, Date.now());
+                }
+                recurringTemplates[task.id] = buildRecurringTemplate({
+                    id: task.id,
+                    text: task.text,
+                    // The file's task order is the author's order — recreated
+                    // instances go back to this spot, not the bottom of the routine.
+                    position: index,
+                    dueDate: task.dueDate || null,
+                    priority: task.priority,
+                    remindersEnabled: task.remindersEnabled || false,
+                    recurringSettings: structuredClone(task.recurringSettings),
+                    nextScheduledOccurrence: nextOccurrence
+                });
+            } catch (error) {
+                console.warn(`Failed to create template for task ${task.id}:`, error);
+            }
+        }
+    });
+
+    // Apply template resets if user chose "Use as Template"
+    if (importMode === 'template') {
+        mappedTasks.forEach(task => {
+            task.completed = false;
+            task.dueDate = null;
+        });
+        importedData.cycleCount = 0;
+        importedData.history = null;
+        importedData.clearedTasks = null;
+    }
+
+    // Security: Always sanitize cycle title, with or without DataValidator
+    let cycleTitle = normalizeImportedText(
+        importedData.title || importedData.name || 'Imported Cycle',
+        MAX_CYCLE_NAME_LENGTH
+    );
+    // Additional validation via DataValidator if available
+    try {
+        const DataValidator = resolveDataValidator(_deps.DataValidator);
+        if (DataValidator?.validateCycleName) {
+            cycleTitle = DataValidator.validateCycleName(cycleTitle);
+        }
+    } catch (error) {
+        console.warn(`Invalid cycle title, using default:`, error.message);
+        cycleTitle = 'Imported Cycle';
+    }
+
+    // ✅ Get unique name (auto-increment if duplicate) - use title as storage key
+    const existingCycles = getRoutines(appState.get()) || {};
+    const { name: finalCycleTitle, wasModified: titleWasModified } = getUniqueCycleName(cycleTitle, existingCycles);
+
+
+    // Security: Merge imported template metadata with sanitized text from tasks.
+    // Only extract specific safe metadata fields from import (timestamps, etc.)
+    // All text content comes from our sanitized generated templates.
+    const mergedTemplates = {};
+    for (const [id, generated] of Object.entries(recurringTemplates)) {
+        const imported = importedData.recurringTemplates?.[id] || {};
+
+        // Only extract specific safe metadata fields from import
+        const {
+            id: importedId,
+            createdAt: importedCreatedAt,
+            updatedAt: importedUpdatedAt
+        } = imported;
+
+        const safeImported = {};
+        if (importedId !== undefined) safeImported.id = importedId;
+        if (importedCreatedAt !== undefined) safeImported.createdAt = importedCreatedAt;
+        if (importedUpdatedAt !== undefined) safeImported.updatedAt = importedUpdatedAt;
+
+        mergedTemplates[id] = {
+            ...safeImported,    // Keep only explicitly allowed metadata fields from import
+            ...generated,       // Override with our sanitized/generated data
+            text: generated.text  // Explicitly ensure text is from sanitized source
+        };
+    }
+
+    // Carry over templates that have NO live task instance.
+    //
+    // A routine sitting between occurrences is the normal resting state: cycle
+    // reset removes the spawned instance from cycle.tasks and leaves its template
+    // behind for recurringWatcher to respawn (taskCycleReset ->
+    // removeRecurringTasksFromCycle). The merge above rebuilds templates from the
+    // TASK LIST alone, so every such routine lost its recurring tasks outright on
+    // import - no task, no template, no error, and a success notification.
+    //
+    // Present since the first commit, where import hardcoded `recurringTemplates:
+    // {}` and never read the file's copy. The Nov 2025 task-derived rebuild
+    // repaired only the case where the instance happened to be live, which is what
+    // kept the remainder invisible. The duplicate-routine path already reached the
+    // same conclusion (routineSwitcherActions.js: "a template without a live task
+    // instance is normal - keep it").
+    //
+    // No task is spawned here on purpose: the watcher spawns it at the next
+    // occurrence, exactly as it would have in the routine this file came from.
+    //
+    // These entries never passed through task sanitization, so every field is
+    // re-derived through the same validators the task path uses - nothing is
+    // copied from the file untouched.
+    const importedTemplates =
+        (importedData.recurringTemplates && typeof importedData.recurringTemplates === 'object')
+            ? importedData.recurringTemplates
+            : {};
+    // Ids belonging to a task in the FILE. "Orphan" means no task claims the id;
+    // a template keyed to a task that IS present is that task's business, and its
+    // own `recurring` flag already decided the matter above - if the task is
+    // recurring the merge loop generated a template, and if it is not, the stray
+    // entry must not resurrect one. Without this, importing a task with
+    // `recurring: false` alongside a template for its id produced a non-recurring
+    // task sitting beside a live template for itself (measured; introduced by the
+    // orphan carry-over in v2.537, whose only guard was mergedTemplates).
+    // Note: this reads the task array AFTER any MAX_TASK_COUNT truncation, so a
+    // template belonging to a truncated task is treated as an orphan. That is the
+    // kinder outcome - the recurring work survives - and the template total is
+    // capped by the same limit below.
+    const importedTaskIds = new Set(
+        (importedData.tasks || [])
+            .map(t => t && t.id)
+            .filter(id => typeof id === 'string')
+    );
+    let orphanTemplateIndex = 0;
+    for (const [rawId, imported] of Object.entries(importedTemplates)) {
+        if (Object.prototype.hasOwnProperty.call(mergedTemplates, rawId)) continue;
+        if (importedTaskIds.has(rawId)) continue;
+        if (!imported || typeof imported !== 'object') continue;
+        // A template with no recurrence rule can never fire. Skip it rather than
+        // invent a default schedule the user never chose.
+        if (!imported.recurringSettings || typeof imported.recurringSettings !== 'object') continue;
+        if (Object.keys(mergedTemplates).length >= MAX_TASK_COUNT) {
+            console.warn(`Import: recurring template limit (${MAX_TASK_COUNT}) reached, dropping the rest`);
+            break;
+        }
+
+        const orphanSettings = normalizeRecurringSettings(imported.recurringSettings);
+        if (orphanSettings.specificDates.dates.length > 0) {
+            orphanSettings.specificDates.dates = orphanSettings.specificDates.dates
+                .filter(d => validateImportedDate(d) !== null)
+                .slice(0, LIMITS.MAX_SPECIFIC_DATES);
+            if (orphanSettings.specificDates.dates.length === 0) {
+                orphanSettings.specificDates.enabled = false;
+            }
+        }
+
+        const orphanId = isSafeImportedTaskId(rawId)
+            ? rawId
+            : `task-${importTimestamp}-t${orphanTemplateIndex}`;
+        orphanTemplateIndex++;
+
+        const orphanPriority = importedPriorityFields(imported);
+
+        let orphanNextOccurrence = null;
+        if (typeof calculateNextOccurrence === 'function') {
+            try {
+                // Recomputed, never copied: the file's nextScheduledOccurrence is a
+                // timestamp from another device and is usually already in the past.
+                orphanNextOccurrence = calculateNextOccurrence(orphanSettings, Date.now());
+            } catch (error) {
+                console.warn(`Failed to schedule imported template ${orphanId}:`, error);
+            }
+        }
+
+        mergedTemplates[orphanId] = buildRecurringTemplate({
+            id: orphanId,
+            text: normalizeImportedText(imported.text || '', MAX_TASK_TEXT_LENGTH)
+                || getLabel('noun.untitledTask'),
+            dueDate: validateImportedDate(imported.dueDate),
+            ...orphanPriority,
+            remindersEnabled: imported.remindersEnabled === true,
+            recurringSettings: orphanSettings,
+            nextScheduledOccurrence: orphanNextOccurrence
+        });
+    }
+
+    // Sanitize taskOptionButtons — only allow known boolean keys
+    let safeTaskOptionButtons = null;
+    if (importedData.taskOptionButtons && typeof importedData.taskOptionButtons === 'object') {
+        const allowedBtnKeys = ['customize', 'moveArrows', 'threeDots', 'highPriority',
+            'rename', 'delete', 'recurring', 'dueDate', 'reminders', 'deleteWhenComplete'];
+        safeTaskOptionButtons = {};
+        for (const key of allowedBtnKeys) {
+            if (key in importedData.taskOptionButtons) {
+                const val = importedData.taskOptionButtons[key];
+                safeTaskOptionButtons[key] = typeof val === 'boolean' ? val : false;
+            }
+        }
+    }
+
+    // Sanitize reminders — only allow known keys with correct types
+    let safeReminders = null;
+    if (importedData.reminders && typeof importedData.reminders === 'object') {
+        const r = importedData.reminders;
+        safeReminders = {
+            enabled: !!r.enabled,
+            indefinite: !!r.indefinite,
+            dueDatesReminders: !!r.dueDatesReminders,
+            repeatCount: typeof r.repeatCount === 'number' ? r.repeatCount : 0,
+            frequencyValue: typeof r.frequencyValue === 'number' ? r.frequencyValue : 1,
+            frequencyUnit: (r.frequencyUnit === 'minutes' || r.frequencyUnit === 'hours') ? r.frequencyUnit : 'hours',
+            customMessages: Array.isArray(r.customMessages)
+                ? r.customMessages.filter(m => typeof m === 'string').map(m => normalizeImportedText(m, MAX_TASK_TEXT_LENGTH))
+                : []
+        };
+    }
+
+    // Sanitize autoUncheckDaily — preserve user intent (enabled, hour, minute);
+    // reset transient runtime fields (lastResetDate, pendingNotification) so the
+    // imported routine doesn't think it already fired today on the source machine
+    // and doesn't surface a "tasks were auto-unchecked" toast for a foreign event.
+    let safeAutoUncheckDaily = null;
+    if (importedData.autoUncheckDaily && typeof importedData.autoUncheckDaily === 'object') {
+        const a = importedData.autoUncheckDaily;
+        const h = typeof a.hour === 'number' ? Math.max(0, Math.min(23, Math.floor(a.hour))) : 0;
+        const m = typeof a.minute === 'number' ? Math.max(0, Math.min(59, Math.floor(a.minute))) : 0;
+        safeAutoUncheckDaily = {
+            enabled: !!a.enabled,
+            hour: h,
+            minute: m,
+            lastResetDate: null,
+            pendingNotification: false
+        };
+    }
+
+    // ✅ Resolve theme — use imported theme if unlocked, otherwise fall back to Classic
+    const importedTheme = importedData.theme ?? 'classic';
+    const currentState = appState.get();
+    const unlockedThemes = currentState?.settings?.unlockedThemes ?? ['classic'];
+    let resolvedTheme = 'classic';
+    let themeWasDowngraded = false;
+
+    if (importedTheme === 'classic' || unlockedThemes.includes(importedTheme)) {
+        resolvedTheme = importedTheme;
+    } else if (getThemeDefinitionSafe(importedTheme)) {
+        // Theme exists but user hasn't unlocked it yet
+        resolvedTheme = currentState?.settings?.defaultTheme ?? 'classic';
+        themeWasDowngraded = true;
+    }
+
+    // Sanitize history — only allow valid structure with events array
+    let safeHistory = null;
+    if (importedData.history && typeof importedData.history === 'object') {
+        const h = importedData.history;
+        const maxEvents = typeof h.maxEvents === 'number' ? Math.min(h.maxEvents, 500) : 100;
+        const events = Array.isArray(h.events)
+            ? h.events.filter(e => e && typeof e === 'object' && typeof e.type === 'string')
+                .slice(0, maxEvents)
+                .map(e => ({
+                    type: normalizeImportedText(e.type, 50),
+                    timestamp: Number.isFinite(e.timestamp) ? e.timestamp : Date.now(),
+                    details: sanitizeHistoryDetails(e.details)
+                }))
+            : [];
+        safeHistory = { events, maxEvents };
+    }
+
+    // Sanitize clearedTasks — only allow valid structure
+    let safeClearedTasks = null;
+    if (importedData.clearedTasks && typeof importedData.clearedTasks === 'object') {
+        const ct = importedData.clearedTasks;
+        const entries = Array.isArray(ct.entries)
+            ? ct.entries.filter(e => e && typeof e === 'object')
+                .slice(0, 500)
+                .map(e => ({
+                    // Canonical field is taskText (clearedTasksManager._buildClearedEntry);
+                    // this mapping used to read `e.text` — a key real entries never have —
+                    // so round-tripped cleared history rendered blank. Accept `text` too
+                    // for files written by the old (broken) mapping.
+                    taskText: normalizeImportedText(e.taskText || e.text || '', MAX_TASK_TEXT_LENGTH),
+                    clearedAt: typeof e.clearedAt === 'number' ? e.clearedAt : Date.now(),
+                    ...(e.id ? { id: normalizeImportedText(String(e.id), 100) } : {}),
+                    // Round-trip fidelity (drift-review C-14): preserve the fields
+                    // _buildClearedEntry() records — validated the same way the task
+                    // path above validates its equivalents — so Recreate after an
+                    // export→import yields the task with due date, priority, and
+                    // recurring settings intact, exactly as the manual promises.
+                    ...importedPriorityFields(e),
+                    hadDueDate: e.hadDueDate === true,
+                    dueDate: typeof e.dueDate === 'string' ? e.dueDate : null,
+                    remindersEnabled: e.remindersEnabled === true,
+                    autoClear: (() => {
+                        const map = importedAutoClearMap(e);
+                        return map ? { cycle: map.cycle === true, todo: map.todo !== false } : null;
+                    })(),
+                    recurring: e.recurring === true,
+                    recurringSettings: (e.recurring === true && e.recurringSettings && typeof e.recurringSettings === 'object')
+                        ? e.recurringSettings
+                        : null,
+                    clearedInMode: typeof e.clearedInMode === 'string'
+                        ? normalizeImportedText(e.clearedInMode, 30)
+                        : null
+                }))
+            : [];
+        safeClearedTasks = {
+            entries,
+            totalCleared: typeof ct.totalCleared === 'number' ? ct.totalCleared : entries.length,
+            autoPruneEnabled: ct.autoPruneEnabled !== false
+        };
+    }
+
+    // ✅ Create imported cycle via AppState.update() - use title as storage key (consistent with app)
+    appState.update(state => {
+        getRoutines(state)[finalCycleTitle] = {
+            id: cycleId,
+            title: finalCycleTitle,
+            tasks: mappedTasks,
+            autoReset: importedData.autoReset !== false,
+            cycleCount: importedData.cycleCount || 0,
+            deleteCheckedTasks: importedData.deleteCheckedTasks || false,
+            createdAt: Date.now(),
+            theme: resolvedTheme,
+            recurringTemplates: mergedTemplates,
+            taskOptionButtons: safeTaskOptionButtons,
+            reminders: safeReminders,
+            autoUncheckDaily: safeAutoUncheckDaily,
+            history: safeHistory,
+            clearedTasks: safeClearedTasks
+        };
+
+        setActiveRoutineId(state, finalCycleTitle);
+        state.metadata.totalRoutinesCreated = (state.metadata.totalRoutinesCreated || 0) + 1;
+    }, true); // immediate save
+
+    // Initialize empty undo stacks for the imported cycle and reset the
+    // in-memory active stack. Without this, the previous routine's undo
+    // history bleeds into the imported routine — clicking Undo would pop
+    // a snapshot from the old cycle and switch the user back to it.
+    // Same pattern routineManager uses after creating a new routine.
+    if (typeof _deps.onCycleCreated === 'function') {
+        // Promise.resolve(): the moduleLoader DI wrapper optional-chains its inner
+        // call, so it yields undefined when the hook is unwired and `.catch` on
+        // undefined throws here — inside a UI flow, after state already changed.
+        Promise.resolve(_deps.onCycleCreated(finalCycleTitle)).catch(err => {
+            console.warn('Failed to initialize undo stack for imported cycle:', err);
+        });
+    }
+
+    const recurringCount = Object.keys(mergedTemplates).length;
+
+    // Fix #50-51: Store notification message in sessionStorage so it survives reload
+    // The notification will be shown after the page reloads
+    let importMessage = '';
+    let messageType = 'success';
+
+    if (themeWasDowngraded) {
+        const themeName = getThemeDefinitionSafe(importedTheme)?.name ?? importedTheme;
+        // Name the theme actually applied. resolvedTheme is the user's defaultTheme
+        // here, which is not always Classic — the label used to claim it was.
+        const fallbackName = getThemeDefinitionSafe(resolvedTheme)?.name ?? resolvedTheme;
+        importMessage = getLabel('notify.themeLockedOnImport', { vars: { name: themeName, fallback: fallbackName } });
+        messageType = 'info';
+    } else if (tasksTruncated) {
+        const truncatedCount = originalTaskCount - MAX_TASK_COUNT;
+        importMessage = getLabel('notify.importTruncated', { vars: { name: finalCycleTitle, limit: MAX_TASK_COUNT, count: truncatedCount } });
+        messageType = 'warning';
+    } else if (titleWasModified) {
+        importMessage = getLabel('notify.importNameCollision', { vars: { original: cycleTitle, name: finalCycleTitle } });
+        messageType = 'success';
+    } else if (recurringCount > 0) {
+        importMessage = getLabel('notify.importWithRecurring', { vars: { name: finalCycleTitle, count: recurringCount } });
+    } else {
+        importMessage = getLabel('notify.importSuccess', { vars: { name: finalCycleTitle } });
+    }
+
+    // Re-render UI in place using loadMiniCycle() — faster than location.reload()
+    // and avoids iOS PWA offline issues where reload bypasses the service worker.
+    if (typeof _deps.loadMiniCycle === 'function') {
+        // Show loading overlay for visual feedback (via DI from uiBoot)
+        _deps.showLoader?.(getLabel('notify.importLoading'));
+        // Small delay so the loader is visible before re-render
+        setTimeout(() => {
+            _deps.loadMiniCycle();
+            _deps.hideLoader?.();
+            _deps.showNotification(importMessage, messageType, UI_TIMEOUTS.NOTIFICATION_EXTENDED);
+        }, 400);
+    } else {
+        // Fallback: full page reload if loadMiniCycle not wired
+        try {
+            localStorage.setItem('miniCycle_importNotification', JSON.stringify({ message: importMessage, type: messageType }));
+            localStorage.setItem('miniCycle_importReloading', 'true');
+        } catch (e) {
+            console.warn('Could not store import notification:', e);
+        }
+        location.reload();
+    }
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+/**
+ * Initialize CycleImportManager module
+ * Dynamically imports utilities with version cache-busting
+ * @returns {Promise<void>}
+ */
+export async function initCycleImportManager() {
+    // Dynamically import utilities with version for cache-busting
+    const version = APP_VERSION;
+
+    // Import storage utilities
+    const storageUtils = await import(`../utils/storageUtils.js?v=${version}`);
+    getObjectSizeBytes = storageUtils.getObjectSizeBytes;
+    canAddToStorage = storageUtils.canAddToStorage;
+    getStorageShortageMessage = storageUtils.getStorageShortageMessage;
+
+    // Import name utilities
+    const nameUtils = await import(`../utils/nameUtils.js?v=${version}`);
+    getUniqueCycleName = nameUtils.getUniqueCycleName;
+
+}

@@ -1,0 +1,2260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     index.html — FILE MAP & LOAD-ORDER CONTRACTS
+     ═══════════════════════════════════════════════════════════════════════════
+
+     The head is an ordered boot gauntlet where the sequence is load-bearing, and 
+     the ES5 syntax above the feature gate is a deliberate parse-safety chain. 
+     Read the two contracts before editing.
+
+     NOTE: this banner sits AFTER <meta charset> on purpose. The HTML spec only
+     guarantees encoding detection in the first 1024 bytes; a banner above the
+     charset would push it out of that window (the bug lite/miniCycle-lite.html
+     actually had). Keep <meta charset> first inside <head>.
+
+     ── REGIONS (line numbers drift; the section banners below are canonical) ──
+       BOOT GAUNTLET (head) ...... the ordered <head> scripts, see contract 2
+       LOADER & FIRST-RUN ........ #app-loader + first-run choice screen
+       APP CHROME ................ header, quick actions, main menu
+       MODALS & PANELS ........... hidden <dialog> overlays
+       APP ROOT .................. focus panel, task view, stats, footer, nav dots
+       FOOTER SCRIPTS ............ about-version sync, late Lite fallback
+
+     ── CONTRACT 1: PARSE SAFETY ─────────────────────────────────────────────
+     Every script ABOVE the ES3/ES5 feature gate MUST parse on ES3/ES5 browsers:
+     no arrow functions, no const/let, no template literals, no optional chaining,
+     no shorthand/destructuring. A script element is parsed IN FULL before ANY of it
+     runs — so one modern token anywhere in a pre-gate block kills that entire
+     block on an old browser. If a block above the gate fails to parse, the gate
+     never runs and old devices get a white screen instead of the Lite redirect.
+     The gate can only catch what parses before it.
+
+     The gate lives in its OWN script block for exactly this reason — do not
+     merge it with neighbouring code. Everything below the "END OF ES5-ONLY
+     REGION" banner may use modern syntax freely.
+
+     ONE deliberate exception: the ES2020 SYNTAX CANARY block directly above
+     the gate contains `?.` and `??` ON PURPOSE. It parses whole or dies whole,
+     and the gate reads its flag to catch engines the built-in checks admit
+     (iOS 12 has globalThis but not optional chaining). It is exempt from the
+     ES5 rule by its marker comment; nothing else is.
+
+     Verify with acorn (ecmaVersion: 5) over every pre-gate inline block before
+     shipping changes to the head.
+
+     ── CONTRACT 2: ORDER (the head gauntlet) ────────────────────────────────
+     The sequence IS the engineering. Do not reorder:
+       1. async-CSS swap
+       2. version.js (SYNCHRONOUS, and BEFORE any modulepreload)
+       3. getBuildVersion helper
+       4. iOS standalone handling
+       5. boot-failure failsafe
+       6. version-mismatch check + cache-clear interstitial
+       7. modulepreload injection (map-aware, bare hashed URLs)
+       8. pre-paint settings reader (single parse — dark mode / a11y / app bg)
+       9. ES2020 syntax canary (the one post-ES5 block; alone; sets a flag)
+      10. ES3 feature gate  ← must be last of the PRE-GATE sequence, alone in its block
+      11. 60s load-timeout failsafe (INLINE on purpose — a load-failure net
+          must not depend on an external file loading; ES5)
+      12. boot-sw.js (EXTERNAL, defer) — SW registration, update management,
+          PWA install. Extracted Aug 2026: `defer` keeps it off the
+          parse/first-paint path, and external files ride script-src 'self'
+          so edits there no longer force CSP hash regeneration. Its tag must
+          stay AFTER version.js (reads window.APP_VERSION) and keep `defer`
+          (its DOMContentLoaded/load/beforeinstallprompt listeners rely on
+          running post-parse, pre-DCL).
+
+     Why: version detection must finish before preloads populate the browser's
+     module map with stale content; the settings reader must run before first
+     paint (anti-flash); the gate runs last so everything above it has had its
+     chance on old browsers.
+
+     BODY CONTRACT: #app-loader + the first-run choice screen stay FIRST in
+     <body> — that is the ~28 ms first-paint path.
+
+     ── ALSO ─────────────────────────────────────────────────────────────────
+     Editing ANY inline script changes its CSP hash. Ship via
+     scripts/update-version.sh, which regenerates the hashes in netlify.toml.
+
+     ⚠️ NEVER write a literal script open/close tag inside an HTML comment in this
+     file. The CSP hashing step in update-version.sh matches script blocks with a
+     regex that does NOT strip comments, so a tag written in prose starts a bogus
+     match that swallows the next REAL script block — that block's true hash then
+     never reaches the CSP and the browser blocks it in production. Write "script
+     element" or "script block" in prose instead. (This shipped broken once in
+     v2.316: it blocked the async main-CSS loader and the boot failsafe.)
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+
+<meta name="theme-color" content="#4c79ff" id="theme-color-meta">
+
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" id="status-bar-style-meta">
+
+<meta name="app-version" content="2.613">
+
+<!-- CSP is served via HTTP header in netlify.toml (production) -->
+<!-- No <meta> CSP tag needed — Netlify headers handle it, and omitting it here allows local HTTP dev servers -->
+
+<title>TaskCycle - ROUTINE MANAGER</title>
+<meta name="description" content="TaskCycle is a routine workflow companion that turns repeatable tasks into effortless cycles. Track progress, build momentum, and manage daily routines with auto-cycling task lists.">
+<link rel="canonical" href="https://minicycle.app/minicycle">
+
+<!-- Preload the dominant weights so Poppins is available AT first paint. The
+     bundled build inlines fonts.css, which makes first paint early enough that
+     text would otherwise render in the fallback font and reflow when Poppins
+     swaps in (the v2.305 CLS-0.76 regression). crossorigin is REQUIRED on font
+     preloads even same-origin, or the preload is refetched and wasted. -->
+<link rel="preload" href="assets/fonts/poppins-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/poppins-500.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/poppins-600.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/fonts/fonts.css">
+
+<!-- Blue-background square icon (same art as the PWA / store icons). The transparent
+     black-and-white mark stays the Lite app's favicon on purpose. -->
+<link rel="icon" type="image/png" href="assets/images/logo/pwa-icons/icon-192.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="assets/images/logo/pwa-icons/icon-192.png" />
+<!-- Font Awesome removed - using inline SVG icons instead (see modules/utils/icons.js). fa-* classes are kept as the semantic source and swapped to inline <svg> at runtime by iconInit.js. -->
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     § BOOT GAUNTLET (head) — ORDERED. DO NOT REARRANGE.
+     Steps 1-9 of Contract 2 (see file map at the top of this file) run from here
+     down to the feature gate. Everything in this region is ES5-only (Contract 1).
+
+     The two failure modes this ordering prevents:
+       • modulepreload injected before version.js  → preloads populate the module
+         map with STALE hashed URLs, and the app boots a mixed-version tree.
+       • pre-paint settings reader moved after first paint → visible flash of
+         light mode / full motion / default background on every load.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+<link rel="preload" href="styles/main.css?v=0.1.0" as="style">
+<link rel="preload" href="styles/base/variables.css?v=0.1.0" as="style">
+<link rel="preload" href="styles/base/reset.css?v=0.1.0" as="style">
+<link rel="preload" href="styles/layout/app-container.css?v=0.1.0" as="style">
+<link rel="preload" href="styles/layout/header.css?v=0.1.0" as="style">
+<link rel="preload" href="styles/components/task-list.css?v=0.1.0" as="style">
+
+<!-- Async CSS loading - doesn't block render, app starts with inline critical CSS -->
+<link rel="stylesheet" href="styles/main.css?v=0.1.0" media="print" id="async-main-css">
+<script>(function(){var l=document.getElementById('async-main-css');if(!l)return;function apply(){l.media='all';}if(l.sheet){apply();}else{l.addEventListener('load',apply);}})();</script>
+<noscript><link rel="stylesheet" href="styles/main.css?v=0.1.0"></noscript>
+<link rel="manifest" href="manifest.json">
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     CRITICAL: Version check MUST run BEFORE modulepreload hints!
+     Modulepreloads start fetching immediately when parsed. If we detect a
+     version mismatch, we need to clear caches and reload BEFORE those fetches
+     complete and populate the browser's module map with stale content.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+<!-- version.js MUST load synchronously BEFORE modulepreloads to set globalThis.APP_VERSION -->
+<script src="./version.js?v=0.1.0"></script>
+
+<!-- Build version = the version baked into THIS HTML document (the meta tag
+     above). It is the honest "what am I actually running" signal. By contrast,
+     globalThis.APP_VERSION comes from version.js, which the service worker
+     serves NETWORK-FIRST on a version mismatch — so APP_VERSION can read NEWER
+     than the stale HTML/CSS that's actually rendered. The About dialog and the
+     update checks use getBuildVersion(), never APP_VERSION, so they reflect the
+     real build instead of the network. -->
+<script>
+  window.getBuildVersion = function () {
+    var m = document.querySelector('meta[name="app-version"]');
+    return (m && m.getAttribute('content')) ||
+           (typeof globalThis !== 'undefined' && globalThis.APP_VERSION) || 'unknown';
+  };
+</script>
+
+<!-- iOS PWA Detection - adds .ios-pwa class for safe area fixes -->
+<script>
+(function() {
+  var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  var isStandalone = window.matchMedia('(display-mode: standalone)').matches ||
+                     window.navigator.standalone === true;
+  if (isIOS && isStandalone) {
+    document.documentElement.classList.add('ios-pwa');
+  }
+})();
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     BOOT FAILURE FAILSAFE: Auto-clear caches after repeated boot failures
+     If boot fails 2+ times in a row, nuke all caches and reload fresh.
+     This catches users stuck with corrupted/stale cached modules.
+     Counter is cleared on successful boot (in orchestrator.js).
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+(function() {
+  // Only run on production
+  var host = location.hostname;
+  if (host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.')) return;
+
+  var FAIL_KEY = '__miniCycle_bootFails';
+  var CLEARING_KEY = '__miniCycle_failsafeClearing';
+  var MAX_FAILS = 2;
+
+  // Check if we're in the middle of a failsafe clear (prevent loops)
+  if (sessionStorage.getItem(CLEARING_KEY)) {
+    console.log('🔄 Failsafe clear in progress, skipping check');
+    sessionStorage.removeItem(CLEARING_KEY);
+    sessionStorage.removeItem(FAIL_KEY);
+    return;
+  }
+
+  var fails = parseInt(sessionStorage.getItem(FAIL_KEY) || '0', 10);
+  console.log('🔍 Boot failure check: ' + fails + ' previous failures');
+
+  // ⚠️ Skip nuclear cache clear when offline — caches are the only source of files
+  if (fails >= MAX_FAILS && !navigator.onLine) {
+    console.warn('📴 Boot failures detected but offline — skipping cache clear');
+    sessionStorage.removeItem(FAIL_KEY);
+    return;
+  }
+
+  if (fails >= MAX_FAILS) {
+    console.warn('🚨 ' + fails + ' consecutive boot failures detected - triggering failsafe cache clear');
+    sessionStorage.setItem(CLEARING_KEY, 'true');
+    sessionStorage.removeItem(FAIL_KEY);
+
+    // Nuclear option: clear everything
+    var clearPromises = [];
+
+    if ('caches' in window) {
+      clearPromises.push(
+        caches.keys().then(function(names) {
+          console.log('🗑️ Failsafe: Deleting ' + names.length + ' caches');
+          return Promise.all(names.map(function(name) { return caches.delete(name); }));
+        })
+      );
+    }
+
+    if ('serviceWorker' in navigator) {
+      clearPromises.push(
+        navigator.serviceWorker.getRegistrations().then(function(regs) {
+          console.log('🗑️ Failsafe: Unregistering ' + regs.length + ' service workers');
+          return Promise.all(regs.map(function(reg) { return reg.unregister(); }));
+        })
+      );
+    }
+
+    Promise.all(clearPromises).then(function() {
+      console.log('✅ Failsafe cache clear complete, reloading...');
+      window.location.reload(true);
+    }).catch(function(e) {
+      console.error('❌ Failsafe clear failed:', e);
+      window.location.reload(true);
+    });
+
+    return; // Stop execution - reload will happen
+  }
+
+  // Increment failure counter (will be cleared on successful boot)
+  sessionStorage.setItem(FAIL_KEY, (fails + 1).toString());
+
+  // Expose function for orchestrator to clear on success
+  window.__miniCycleBootSuccess = function() {
+    sessionStorage.removeItem(FAIL_KEY);
+    console.log('✅ Boot success - failure counter cleared');
+  };
+})();
+</script>
+
+<!-- Automatic cache clear on version change - BLOCKS further parsing if reload needed -->
+<script>
+(function() {
+  // Only run on production - skip ALL localhost/dev environments
+  var host = location.hostname;
+  if (host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.endsWith('.local')) return;
+  if (host.indexOf('minicycle.app') === -1) return;
+
+  // Clean up cache-buster param from URL (for Safari workaround)
+  if (location.search.indexOf('_cb=') !== -1) {
+    var cleanUrl = location.pathname + location.hash;
+    history.replaceState(null, '', cleanUrl);
+  }
+
+  // Guarded like the block at ~line 168: forced-full users on pre-es2020
+  // browsers bypass the feature gate, and a bare globalThis read would kill
+  // this whole block with a ReferenceError.
+  var currentVersion = (typeof globalThis !== 'undefined' && globalThis.APP_VERSION) || 'unknown';
+  var lastSeenVersion = localStorage.getItem('__miniCycle_lastVersion');
+  var justCleared = sessionStorage.getItem('__miniCycle_justCleared');
+
+  console.log('🔍 Version check (early): current=' + currentVersion + ', lastSeen=' + lastSeenVersion);
+
+  // If we just cleared for this version, don't clear again (prevent loops)
+  if (justCleared === currentVersion) {
+    console.log('✅ Cache already cleared for v' + currentVersion);
+    localStorage.setItem('__miniCycle_lastVersion', currentVersion);
+    return;
+  }
+
+  // If this is a NEW version (different from last seen), clear ALL caches
+  // CRITICAL: This must complete BEFORE modulepreloads fetch stale content
+  if (lastSeenVersion && lastSeenVersion !== currentVersion) {
+    console.warn('🔄 NEW VERSION DETECTED: ' + lastSeenVersion + ' → ' + currentVersion);
+    console.warn('🗑️ Clearing all caches and service workers BEFORE module loading...');
+
+    // Mark that we're clearing THIS version to prevent loops
+    sessionStorage.setItem('__miniCycle_justCleared', currentVersion);
+    // Store version BEFORE document.write (synchronous, persists across reload)
+    localStorage.setItem('__miniCycle_lastVersion', currentVersion);
+
+    // Tell the user which version they are moving between, so the update pause is
+    // legible instead of an unexplained wait. Both values are sanitised to a
+    // version-safe charset and capped: lastSeenVersion comes out of localStorage,
+    // which is untrusted input, and this is written straight into markup.
+    // ES5 only — this block sits above the feature gate (Contract 1).
+    // Text is hardcoded rather than routed through getLabel(): no module has
+    // loaded at this point, so the label system does not exist yet.
+    var safeVersionText = function (value) {
+      return String(value === null || value === undefined ? '' : value)
+        .replace(/[^0-9A-Za-z.\-_]/g, '').slice(0, 16);
+    };
+    var fromVersionText = safeVersionText(lastSeenVersion);
+    var toVersionText = safeVersionText(currentVersion);
+    var versionLineHtml = (fromVersionText && toVersionText && fromVersionText !== toVersionText)
+      ? '<p style="margin-top:6px;font-size:13px;opacity:0.85;letter-spacing:0.02em;">Version ' +
+        fromVersionText + ' &rarr; ' + toVersionText + '</p>'
+      : '';
+
+    // Use document.write to STOP further HTML parsing immediately
+    // This prevents modulepreload hints from being processed with stale caches
+    // NOTE: The generated SCRIPT content below is intentionally static (no interpolated
+    // values) so its CSP SHA-256 hash can be precomputed. Do NOT embed dynamic values in
+    // the document.write calls that follow the '<script>' opener. The MARKUP written in
+    // this first call is not hashed, so the version line above is safe here.
+    document.write('<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body{margin:0;min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;background:linear-gradient(135deg,#4c79ff,#74c0fc);font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:white;}.loader{width:40px;height:40px;border:3px solid rgba(255,255,255,0.3);border-top-color:white;border-radius:50%;animation:spin 1s linear infinite;}@keyframes spin{to{transform:rotate(360deg)}}</style></head><body><div class="loader"></div><p style="margin-top:20px;font-size:16px;">Updating miniCycle...</p>' + versionLineHtml + '<script>');
+    document.write('var clearPromises = [];');
+    document.write('if ("caches" in window) { clearPromises.push(caches.keys().then(function(n) { console.log("Deleting caches:", n); return Promise.all(n.map(function(c) { return caches.delete(c); })); })); }');
+    document.write('if ("serviceWorker" in navigator) { clearPromises.push(navigator.serviceWorker.getRegistrations().then(function(r) { console.log("Unregistering", r.length, "service workers"); return Promise.all(r.map(function(reg) { return reg.unregister(); })); })); }');
+    document.write('Promise.all(clearPromises).then(function() { console.log("Cache cleared, reloading..."); window.location.href = window.location.pathname + "?_cb=" + Date.now(); }).catch(function(e) { console.error("Clear failed:", e); window.location.href = window.location.pathname + "?_cb=" + Date.now(); });');
+    document.write('</' + 'script></body></html>');
+    document.close();
+    return; // Stop - document.write replaced the page
+  }
+
+  // First visit or same version - just record it
+  localStorage.setItem('__miniCycle_lastVersion', currentVersion);
+})();
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     MODULEPRELOAD: Dynamic injection using APP_VERSION from version.js
+     Only preloads modules loaded exclusively via versioned dynamic imports.
+     Modules with unversioned static imports (constants.js, diBase.js,
+     labelResolver.js) are excluded to avoid duplicate module instances.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+(function() {
+  // Guarded like the block at ~line 168 (see version-check block note):
+  // forced-full users on pre-es2020 browsers bypass the feature gate.
+  var g = typeof globalThis !== 'undefined' ? globalThis : {};
+  var v = g.APP_VERSION || 'dev-local';
+  // Bundled dist: version.js also sets __MC_MODULE_MAP (source path → hashed
+  // URL). Preload the hashed URL BARE so it matches the exact URL the boot
+  // chain imports; dev has no map and keeps the ?v= form.
+  var map = g.__MC_MODULE_MAP || null;
+  var modules = [
+    './main.js',
+    './modules/boot/orchestrator.js',
+    './modules/boot/coreBoot.js',
+    './modules/boot/featureBoot.js',
+    './modules/boot/uiBoot.js',
+    './modules/boot/moduleLoader.js',
+    './modules/boot/moduleManifests.js',
+    './modules/core/appState.js',
+    './modules/core/appGlobalState.js',
+    './modules/core/appInit.js',
+    './modules/utils/globalUtils.js',
+    './modules/utils/debugMode.js',
+    './modules/utils/storageUtils.js',
+    './modules/utils/errorHandler.js',
+    './modules/utils/notifications.js'
+  ];
+  var head = document.head;
+  for (var i = 0; i < modules.length; i++) {
+    var hashed = map && map[modules[i].slice(1)]; // './x' → '/x' (map keys are root-absolute)
+    var link = document.createElement('link');
+    link.rel = 'modulepreload';
+    link.href = hashed || (modules[i] + '?v=' + v);
+    head.appendChild(link);
+  }
+})();
+</script>
+
+<!-- Critical CSS - extracted to external file for CSP compliance (no 'unsafe-inline' needed) -->
+<link rel="stylesheet" href="./styles/base/critical.css">
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     PRE-PAINT SETTINGS READER — dark mode, accessibility, custom app background.
+     Runs before first paint so none of these settings visibly flash in.
+
+     Merged (Jul 2026) from three separate blocks that EACH did their own
+     localStorage.getItem + JSON.parse of miniCycleData — the same blob parsed
+     three times before paint, costing most on exactly the old/slow devices the
+     boot gauntlet exists to protect. Now: read once, parse once, apply three.
+
+     Failure isolation is preserved deliberately — each setting is applied in its
+     own try/catch so one corrupt value (say a garbage custom color) cannot stop
+     dark mode from applying. A failed read/parse skips all three, which is what
+     the three original blocks did too; the app's JS applies them properly later.
+
+     ⚠️ ES5 ONLY — this sits ABOVE the feature gate. No const/let, no arrows, no
+     template literals, no optional chaining. See the file-map banner at the top
+     of this file for the full parse-safety contract.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+  (function() {
+    var settings = null;
+    try {
+      var data = localStorage.getItem('miniCycleData');
+      if (!data) return;
+      var parsed = JSON.parse(data);
+      settings = (parsed && parsed.settings) || null;
+    } catch (e) {
+      return; // Unreadable/corrupt — everything gets applied later by app JS.
+    }
+
+    // Local helper; this block shares nothing with other gauntlet scripts.
+    function onReady(fn) {
+      document.addEventListener('DOMContentLoaded', fn);
+    }
+    var root = document.documentElement;
+
+    // 1. Dark mode — prevents flash of light mode.
+    try {
+      if (settings && settings.darkMode) {
+        // Apply to html immediately (body doesn't exist yet), body once ready.
+        root.classList.add('dark-mode');
+        onReady(function() { document.body.classList.add('dark-mode'); });
+      } else {
+        // Ensure dark mode is removed (in case of stale state).
+        root.classList.remove('dark-mode');
+        onReady(function() { document.body.classList.remove('dark-mode'); });
+      }
+    } catch (e) {
+      // Silently fail - dark mode will be applied later by JS
+    }
+
+    // 2. Accessibility — prevents animation/contrast/font-size flash.
+    try {
+      if (settings) {
+        if (settings.reducedMotion) {
+          root.classList.add('reduced-motion');
+          onReady(function() { document.body.classList.add('reduced-motion'); });
+        }
+        if (settings.highContrast) {
+          root.classList.add('high-contrast');
+          onReady(function() { document.body.classList.add('high-contrast'); });
+        }
+        if (settings.fontSize && settings.fontSize !== '16') {
+          root.style.setProperty('--font-size-base', settings.fontSize + 'px');
+        }
+      }
+    } catch (e) {
+      // Silently fail - accessibility settings will be applied later by JS
+    }
+
+    // 3. Custom app background — only set when a custom color is saved, so the
+    //    default gradient survives.
+    try {
+      var customAppBg = settings && settings.customColors && settings.customColors.appBg;
+      if (customAppBg) {
+        root.style.setProperty('--pref-app-bg', customAppBg);
+      }
+    } catch (e) {
+      // Silently fail - gradient will be used as default
+    }
+  })();
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     PRE-PAINT FIRST-RUN READER (ES5 — above the feature gate)
+
+     Decides BEFORE first paint whether the first-run choice screen is shown,
+     and records it as `mc-first-run` on <html> so critical.css can lay the
+     screen out in the very first frame.
+
+     Why it lives here and not in the body controller: the controller ran after
+     #app-loader had already painted, so flipping the screen from hidden to
+     visible reflowed the page — Lighthouse attributed 0.204 of a 0.238 CLS to
+     #first-run-choice, the app's single largest layout shift (Aug 2026). A
+     decision made pre-paint can't shift anything: the screen is either in the
+     first frame or never rendered.
+
+     The pending-restore hand-off moved up with it, and MUST stay ahead of the
+     decision: it writes miniCycleData from sessionStorage, and reading
+     localStorage before that would judge a restoring user by their pre-restore
+     (empty) data and wrongly show them the first-run screen. The body
+     controller keeps all behaviour (choice handlers, use-case rotation,
+     data-awaiting-choice) and now only runs when this class is present.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+  (function () {
+    // Apply a pending restore FIRST — before the gate below reads localStorage
+    // and before any app code runs. The restore is handed off via sessionStorage
+    // because writing localStorage directly pre-reload gets CLOBBERED: the app
+    // running behind the choice screen saves its in-memory state on unload,
+    // overwriting the restored data (found by the rescue-loop E2E).
+    try {
+      var pendingRestore = sessionStorage.getItem('miniCycle_pendingRestore');
+      if (pendingRestore) {
+        sessionStorage.removeItem('miniCycle_pendingRestore');
+        var restorePayload = JSON.parse(pendingRestore);
+        if (restorePayload && restorePayload.type === 'miniCycle-backup' && restorePayload.keys && restorePayload.keys.miniCycleData) {
+          var restoreNames = Object.keys(restorePayload.keys);
+          for (var ri = 0; ri < restoreNames.length; ri++) {
+            if (typeof restorePayload.keys[restoreNames[ri]] === 'string') {
+              localStorage.setItem(restoreNames[ri], restorePayload.keys[restoreNames[ri]]);
+            }
+          }
+        }
+      }
+    } catch (e) { /* invalid payload — fall through to normal first-run */ }
+
+    // Show the choice screen until the user actually MAKES a choice. Boot creates
+    // miniCycleData during startup (createInitialSchema25Data), so "data exists" is
+    // NOT a reliable "returning user" signal — a user who reloads before choosing
+    // would otherwise fall through to the default focus-mode flow. Gate on the
+    // first-run decision instead:
+    //   • no data at all           → first run → show
+    //   • data exists, but onboarding not completed AND no durable choice recorded
+    //                              → non-chooser → show again
+    //   • onboarding done, OR a choice was recorded (learn mid-flow, create, sample)
+    //                              → returning/decided → normal splash
+    // ES5-safe (&&-chains, no optional chaining) to match the other inline scripts.
+    var raw = null;
+    try { raw = localStorage.getItem('miniCycleData'); } catch (e) { return; /* storage unavailable — normal splash */ }
+    if (raw) {
+      var choiceMade = false, onboardingDone = false, hasRoutines = false;
+      try { choiceMade = localStorage.getItem('miniCycle_firstRunChoiceMade') === '1'; } catch (e) { /* storage unavailable — treat as not chosen */ }
+      try {
+        var parsed = JSON.parse(raw);
+        onboardingDone = !!(parsed && parsed.settings && parsed.settings.onboardingCompleted);
+        // OWNING A ROUTINE is the durable "established user" signal that the
+        // flags above are not. Boot's createInitialSchema25Data writes
+        // data.routine = {}, so a fresh user who reloads before choosing still
+        // has ZERO routines and correctly sees this screen — the reason the
+        // comment above rejects bare "data exists" does not apply to routines.
+        // Anyone WITH a routine has used the app, and every action on this
+        // screen assumes an empty one (its "restore from backup" invites
+        // overwriting live data), so never trap them here because a graduation
+        // flag failed to write — app close mid-flow, crash, PWA kill.
+        // Aug 2026 lockout: 2 routines + 2 completed cycles, shown this screen
+        // on every load with no route back to their own data.
+        //
+        // BOTH schema spellings are read, and that is not belt-and-braces: this
+        // block runs pre-paint, BEFORE schemaMigration26 has touched storage, so
+        // a user arriving from 2.5 still has `data.cycles` at this moment and a
+        // migrated user has `data.routine` (the migration deletes `cycles`).
+        // Reading only `cycles` is how this escape hatch went dead for every 2.6
+        // user from v2.573 until it was caught — the comment above survived the
+        // rename, the code did not. Keep both until 2.5 docs are unreachable.
+        var mcData = parsed && parsed.data;
+        var mcRoutines = mcData && (mcData.routine || mcData.cycles);
+        hasRoutines = !!(mcRoutines && Object.keys(mcRoutines).length > 0);
+      } catch (e) { onboardingDone = true; } // unparseable → treat as returning, don't trap
+      if (choiceMade || onboardingDone || hasRoutines) return; // decided, mid-flow, or established → normal splash
+    }
+
+    document.documentElement.classList.add('mc-first-run');
+  })();
+</script>
+
+<!-- NOTE: version.js and cache clearing script moved BEFORE modulepreload hints (line ~71) -->
+<!-- This ensures version check runs before browser starts prefetching modules -->
+
+<!-- ES2020 SYNTAX CANARY — the ONE deliberately post-ES5 block above the gate.
+     A script element parses in full or not at all, so on an engine without
+     optional chaining / nullish coalescing this whole block dies as a
+     SyntaxError, the flag is never set, and the gate below reads that as
+     'no-es2020-syntax'. That is the only way to parse-test syntax without
+     new Function (CSP forbids it). Keep it alone in its block and keep it
+     free of anything that could throw at RUNTIME — a runtime error would be
+     indistinguishable from the parse failure it exists to detect.
+     validate-inline.py exempts this block by the marker on its first line. -->
+<script>
+// @es2020-syntax-canary — see the comment above; validate-inline.py keys on this marker.
+(function () {
+  var n = null;
+  window.__ES2020SyntaxOk = (n?.x === undefined) && ((n ?? true) === true);
+})();
+</script>
+
+<script>
+
+// Minimal, ES3-safe feature gate: if the browser can't run the es2020 build, go Lite.
+(function () {
+  var needsLite = false;
+  var reasons = [];
+  var w = window;
+
+  // Check for arrow function support without using new Function (CSP-friendly)
+  // Simple heuristic: arrow functions appeared around when Promise & fetch did.
+  if (!w.Promise || !w.fetch) {
+    needsLite = true;
+    if (!w.Promise) reasons.push('no-promise');
+    if (!w.fetch)   reasons.push('no-fetch');
+  }
+
+  // The gate's floor must match the BUILD TARGET (es2020), not just ES2015.
+  // Two es2020 floors, because they arrive in different releases:
+  //
+  //  SYNTAX — optional chaining / nullish coalescing: Chrome 80, Firefox 74,
+  //  Safari 13.1. esbuild leaves both verbatim at target es2020, so the
+  //  shipped module graph is a SyntaxError on anything older. The canary
+  //  block just above sets the flag only if the engine parsed `?.` and `??`.
+  //
+  //  BUILT-IN — globalThis: Chrome 71, Firefox 65, Safari 12.1 (later than
+  //  ES modules in all three, so this also covers the no-module band).
+  //  Without it, browsers with Promise+fetch but no globalThis passed the
+  //  gate, then version.js and the pre-gate version-check/modulepreload
+  //  blocks threw ReferenceError and white-screened (drift-review Lite-path
+  //  finding, Aug 2026).
+  //
+  // The built-in floor is the EARLIER one, so on its own it admitted the
+  // band in between — Chrome 71-79, Firefox 65-73, Safari 12.1-13.0, which
+  // is iOS 12, the last OS for the iPhone 5s / 6 / 6 Plus. Those devices
+  // passed the gate, hit a SyntaxError loading the modules, sat on the splash
+  // for 16 s and reached Lite via the no-boot net instead of here (Sep 2026).
+  if (!w.__ES2020SyntaxOk) {
+    needsLite = true;
+    reasons.push('no-es2020-syntax');
+  }
+  if (typeof globalThis === 'undefined') {
+    needsLite = true;
+    reasons.push('no-globalthis');
+  }
+
+  // localStorage test
+  try {
+    localStorage.setItem('__t','1'); 
+    localStorage.removeItem('__t');
+  } catch (e) {
+    window.__LocalStorageBlocked = true;
+    reasons.push('localStorage-blocked'); // not fatal
+  }
+
+  var forcedFull = (location.search.indexOf('mode=full') !== -1);
+  try {
+    forcedFull = forcedFull || localStorage.getItem('miniCycleForceFullVersion') === 'true';
+  } catch(e){ /* storage unavailable — keep the URL-derived value */ }
+
+  window.__FeatureGateNeedsLite = needsLite;
+  window.__FeatureGateReasons = reasons;
+
+  if (needsLite && !forcedFull && location.pathname.indexOf('miniCycle-lite.html') === -1) {
+    location.replace('./lite/miniCycle-lite.html?mode=lite&src=feature-gate&reasons=' + encodeURIComponent(reasons.join(',')));
+  }
+})();
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     ⛔ END OF THE ES5-ONLY REGION. Everything BELOW this line may use modern
+     syntax; everything ABOVE it may not. See the file-map banner at the top.
+
+     This block break is load-bearing, not cosmetic. A script element is parsed in full
+     before ANY of it executes, so while the gate above lived in the same block as
+     the ES6 code below (let/const/arrows in the SW registration), the whole block
+     failed to parse on exactly the ES3/ES5 browsers the gate exists to catch —
+     making the gate dead code for its only audience. Those devices fell through
+     to the 16-second late fallback and were logged as 'no-boot' rather than
+     'feature-gate'. Keep the gate in its own block. (Fixed Jul 2026.)
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+// KEPT INLINE deliberately (Aug 2026 boot-sw.js extraction): a load-failure
+// safety net must not depend on an external file loading. ES5 on purpose.
+// ✅ Loading timeout failsafe - redirect to lite if app doesn't load in 60 seconds
+(function() {
+  var LOAD_TIMEOUT_MS = 60000; // 60 seconds
+  setTimeout(function() {
+    // Check if app actually loaded (app-loader hidden means success)
+    var loader = document.getElementById('app-loader');
+    var isStillLoading = loader && loader.style.display !== 'none';
+
+    // Check if app loaded successfully via dataset (set by uiBoot.js)
+    if (document.documentElement.dataset.appLoaded === 'true') {
+      return; // App loaded successfully
+    }
+    if (isStillLoading && location.pathname.indexOf('miniCycle-lite.html') === -1) {
+      console.warn('⚠️ App load timeout - redirecting to lite version');
+      location.replace('./lite/miniCycle-lite.html?mode=lite&src=load-timeout');
+    }
+  }, LOAD_TIMEOUT_MS);
+})();
+</script>
+    <script src="boot-sw.js?v=0.1.0" defer></script>
+
+
+
+
+
+
+</head>
+
+<body class="app-loading">
+  <a href="#app-container" class="skip-to-content">Skip to main content</a>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     § LOADER & FIRST-RUN
+     #app-loader + the first-run choice screen. These stay FIRST in <body> —
+     it is the ~28 ms first-paint path (body contract, see file map at top).
+     Do not push markup above this block.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+  <div id="app-loader" role="status" aria-label="Application loading" aria-live="polite">
+    <div id="loader-tip" class="loader-tip" aria-live="polite">
+      <div class="loader-tip-header">💡 Tip:</div>
+      <div class="loader-tip-text"></div>
+    </div>
+    <img src="assets/images/logo/minicycle_logo_icon.png" alt="Loading..." class="loader-logo" width="120" height="96" fetchpriority="high">
+    <div class="loader-text">Loading miniCycle...</div>
+    <div class="loader-bar-container">
+      <div class="loader-bar"></div>
+    </div>
+    <!-- First-run choice screen (revealed by inline script below when no data exists).
+         Strings are baked like the splash text — getLabel isn't available pre-boot. -->
+    <!-- No `hidden` attribute: visibility is decided PRE-PAINT via the
+         `mc-first-run` class on <html> (see the head reader). Adding `hidden`
+         back would reintroduce the post-paint reveal and its layout shift. -->
+    <div id="first-run-choice" class="first-run-choice">
+      <div class="first-run-brand">
+        <div class="first-run-wordmark">miniCycle</div>
+        <div class="first-run-descriptor">Routine Checklist Manager</div>
+      </div>
+      <p class="first-run-tagline">Repeatable checklists that reset on completion — not one-and-done to-dos.</p>
+      <!-- Rotating use cases (controller cycles these like the bottom tips).
+           aria-hidden: decorative reinforcement — screen readers get the tagline. -->
+      <!-- Two stacked layers so the rotation is a true CROSSFADE (incoming fades
+           in while outgoing fades out) — a line is always visible, no empty flash. -->
+      <p class="first-run-usecase" aria-hidden="true"><span id="first-run-usecase-text" class="first-run-usecase-text is-active">✈️ Pre-flight checklists</span><span id="first-run-usecase-text-b" class="first-run-usecase-text"></span></p>
+      <!-- Actions group: centered in the space below the brand header (brand + tagline
+           stay top-anchored; buttons sit in the vertical middle). -->
+      <div class="first-run-actions">
+        <div class="first-run-buttons">
+          <!-- Order and weight are deliberate. "Cycles" is the one idea the whole
+               product rests on, and the tagline above already concedes it needs
+               explaining ("not one-and-done to-dos") — a user who skips it builds
+               a to-do list, watches it reset, and concludes the app is broken.
+               This is not a docs detour either: the learn path ends in a working
+               routine in Focus View, same as the other two.
+               Three identically-styled pills gave equal weight to three different
+               commitments at the moment the user knows least; primary/secondary
+               does the choosing work for them. Sample sits above Create because
+               someone who declines the explainer wants to SEE it working, and a
+               blank routine is the weakest second impression.
+               Handlers key off data-choice, never position. -->
+          <button type="button" class="first-run-btn first-run-btn-primary" data-choice="learn" data-busy="Starting the tour…" data-label="Learn How Cycles Work">Learn How Cycles Work</button>
+          <button type="button" class="first-run-btn first-run-btn-secondary" data-choice="sample" data-busy="Loading samples…" data-label="Load a Sample">Load a Sample</button>
+          <button type="button" class="first-run-btn first-run-btn-secondary" data-choice="create" data-busy="Setting up your routine…" data-label="Create My First Routine">Create My First Routine</button>
+        </div>
+        <!-- Wait-gated escape hatch: revealed only if boot exceeds ~10s and isn't done
+             yet (see controller below). Not shown upfront — a new user can't reason
+             about "Lite" cold, and capable devices should never be nudged into it. -->
+        <a id="first-run-lite" class="first-run-lite" href="./lite/miniCycle-lite.html?mode=lite&src=choice-slow">Taking a while? Try the Lite version →</a>
+        <!-- Restore path for users returning after a clear/reinstall (pairs with the
+             boot error screen's "Back Up My Data" button — INCIDENT doc §6a). -->
+        <button type="button" id="first-run-restore" class="first-run-restore">Restore from a backup file</button>
+        <input type="file" id="first-run-restore-file" accept=".json,application/json" hidden>
+      </div>
+    </div>
+    <!-- Low-key live boot status (bottom-right); mirrored from updateLoaderProgress(). -->
+    <div id="first-run-status" class="first-run-status" aria-hidden="true"></div>
+    <!-- Pre-paint visibility, same as #first-run-choice above. -->
+    <div id="first-run-bottom-bar" class="first-run-bottom-bar">
+      <div class="first-run-bottom-fill"></div>
+    </div>
+  </div>
+
+  <script>
+  (function() {
+    var el = document.getElementById('loader-tip');
+    if (!el) return;
+    var text = el.querySelector('.loader-tip-text');
+    if (!text) return;
+
+    // Suppress the tip when it would sit on top of (or crowd) the first-run
+    // "Restore from a backup file" link. On a short viewport the tip's
+    // bottom-anchored strip and the bottom of the choice column meet, and the
+    // two render over each other. Measured rather than guessed at a breakpoint:
+    // whether they collide depends on the viewport, the browser's own chrome,
+    // and how many lines the current tip wraps to — a media query cannot see
+    // any of that. The tip is decorative, so it yields.
+    //
+    // Measuring is safe before showing: the tip is position:absolute and only
+    // opacity-hidden, so it is laid out and has a real rect either way, which
+    // is what lets this decide without a visible flash.
+    var MIN_TIP_GAP = 8; // px of clear air required below the restore link
+
+    function tipWouldCollide() {
+      var restore = document.getElementById('first-run-restore');
+      if (!restore) return false;              // not the first-run screen
+      var rr = restore.getBoundingClientRect();
+      if (rr.height <= 0) return false;        // present but not rendered
+      var tr = el.getBoundingClientRect();
+      if (tr.height <= 0) return false;
+      return tr.top < rr.bottom + MIN_TIP_GAP;
+    }
+
+    function showTip() {
+      if (tipWouldCollide()) {
+        el.classList.remove('visible');
+        return;
+      }
+      el.classList.add('visible');
+    }
+
+    // Rotation, orientation and the browser hiding its own toolbar all change
+    // the answer, so re-decide rather than latching the first result.
+    function onViewportChange() { showTip(); }
+    window.addEventListener('resize', onViewportChange);
+    window.addEventListener('orientationchange', onViewportChange);
+
+    var tipPools = null;   // the fetched { firstRun, inApp } pools, kept for a re-arm
+    var rotation = null;
+
+    function stopTipRotation() {
+      if (rotation) { clearInterval(rotation); rotation = null; }
+      window.removeEventListener('resize', onViewportChange);
+      window.removeEventListener('orientationchange', onViewportChange);
+    }
+
+    function startTipRotation(tips) {
+      stopTipRotation();
+      // Same listener reference, so re-adding after a stop never doubles it.
+      window.addEventListener('resize', onViewportChange);
+      window.addEventListener('orientationchange', onViewportChange);
+      var i = Math.floor(Math.random() * tips.length);
+      text.textContent = tips[i];
+      showTip();
+      rotation = setInterval(function() {
+        // Stop rotating once the app has booted (loader is gone) — otherwise this
+        // timer runs forever, mutating a hidden/detached element. uiBoot.js sets
+        // dataset.appLoaded='true' on a successful boot. Exception: while the
+        // first-run choice screen is awaiting a pick, boot may be done but the
+        // loader is still visible — keep the tips rotating.
+        var loaderEl = document.getElementById('app-loader');
+        var awaitingChoice = loaderEl && loaderEl.getAttribute('data-awaiting-choice') === 'true';
+        if (document.documentElement.dataset.appLoaded === 'true' && !awaitingChoice) {
+          stopTipRotation();
+          return;
+        }
+        el.classList.remove('visible');
+        setTimeout(function() {
+          i = (i + 1) % tips.length;
+          text.textContent = tips[i];
+          // Re-measure per tip: a three-line tip collides where a one-line
+          // tip does not, which is visible in the reported screenshots.
+          showTip();
+        }, 400);
+      }, 4000);
+    }
+
+    fetch('./modules/labels/loading-tips.json')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        // Shape is { firstRun: [...], inApp: [...] }, NOT a bare array.
+        // Audience matters: on the first-run choice screen the user has no
+        // routine, no tasks and no UI to point at, so an instructional tip
+        // ("click your progress badge") is simply false there. Reuse the same
+        // #first-run-restore probe tipWouldCollide() already does — that
+        // element exists ONLY on the choice screen, so it is a free signal.
+        // A missing pool just yields no tips; these are decorative.
+        tipPools = data;
+        var onFirstRun = !!document.getElementById('first-run-restore');
+        var tips = data && (onFirstRun ? data.firstRun : data.inApp);
+        if (!tips || !tips.length) return;
+        startTipRotation(tips);
+      })
+      .catch(function() { /* boot tips are decorative — a failed fetch just shows none */ });
+
+    // An in-place factory reset puts the choice screen back WITHOUT a page load
+    // (backupRestoreManager.rearmFirstRunChoiceScreen). The rotation above had
+    // already stopped itself at the user's first pick, so the screen came back
+    // with one frozen tip until the app was relaunched. The reset dispatches
+    // this after re-arming; restart on the first-run pool, which is the only
+    // audience that screen has.
+    document.addEventListener('firstrun:rearm', function () {
+      var tips = tipPools && tipPools.firstRun;
+      if (tips && tips.length) startTipRotation(tips);
+    });
+  })();
+  </script>
+
+  <!-- First-run choice screen controller (ES5-safe, like the other inline scripts).
+       Shows the three-choice screen for brand-new users (no miniCycleData) while
+       boot continues behind it. Boot side: uiBoot.hideAppLoader() defers the hide
+       while data-awaiting-choice='true' and resumes on the 'firstrun:choice' event.
+       If boot fails, orchestrator's showBootError() replaces the loader's content,
+       which removes this screen — error UI takes precedence by construction. -->
+  <script>
+  (function () {
+    // Restore-from-backup. Wired BEFORE the first-run gate below, on every page
+    // load, because the gate is only true when the page LOADED on the choice
+    // screen. A factory reset re-arms that screen in place (no reload), and until
+    // Oct 2026 this block sat after the gate — so after a reset the three choice
+    // buttons worked (backupRestoreManager re-binds those itself) but "Restore
+    // from a backup file" had no listener at all until the app was relaunched.
+    // The button and input are always in the DOM; the listeners are inert while
+    // the screen is hidden, and the sessionStorage hand-off + reload below is
+    // exactly right after an in-place reset too.
+    //
+    // THE APP WRITES TWO DIFFERENT BACKUP FORMATS and both
+    // have to be accepted here:
+    //   • Settings -> Create Backup : { schemaVersion, miniCycleData: "<string>", liteStorage? }
+    //   • pre-boot rescue screen    : { type: 'miniCycle-backup', keys: { ...raw localStorage } }
+    // Until v2.506 this accepted ONLY the second, so every backup a user actually
+    // made was rejected here with "not a valid miniCycle backup" — while the same
+    // file restored fine from Settings. Reported from a phone, not caught by a test.
+    //
+    // Normalizing to ONE internal shape here is deliberate: the sessionStorage
+    // handoff stays single-format, so the pre-load applier in <head> keeps its
+    // single check and cannot drift out of sync with this list of formats.
+    // ES5 only — this is a pre-gate inline script (see the head banner).
+    var restoreBtn = document.getElementById('first-run-restore');
+    var restoreFile = document.getElementById('first-run-restore-file');
+
+    // Only keys the exporters themselves collect are restorable, so a hand-edited
+    // file cannot use this path to write arbitrary localStorage entries.
+    var RESTORE_EXTRA_KEYS = ['lastUsedMiniCycle', 'milestoneUnlocks', 'darkModeEnabled', 'currentTheme'];
+    function isRestorableKey(name) {
+      return name.indexOf('miniCycle') === 0
+          || name.indexOf('__miniCycle') === 0
+          || RESTORE_EXTRA_KEYS.indexOf(name) !== -1;
+    }
+
+    function collectStringKeys(source, into) {
+      var names = Object.keys(source), i, value;
+      for (i = 0; i < names.length; i++) {
+        value = source[names[i]];
+        if (typeof value === 'string' && isRestorableKey(names[i])) {
+          into[names[i]] = value;
+        }
+      }
+      return into;
+    }
+
+    // Returns a localStorage key/value map, or null if this is not a backup we know.
+    function normalizeBackupKeys(parsed) {
+      if (!parsed || typeof parsed !== 'object') return null;
+
+      // Rescue-screen export — already a raw localStorage map.
+      if (parsed.type === 'miniCycle-backup' && parsed.keys
+          && typeof parsed.keys.miniCycleData === 'string') {
+        return collectStringKeys(parsed.keys, {});
+      }
+
+      // Settings export — one stringified payload plus an optional lite snapshot.
+      if (typeof parsed.miniCycleData === 'string') {
+        var keys = { miniCycleData: parsed.miniCycleData };
+        if (parsed.liteStorage && typeof parsed.liteStorage === 'object') {
+          collectStringKeys(parsed.liteStorage, keys);
+        }
+        return keys;
+      }
+
+      return null;
+    }
+
+    if (restoreBtn && restoreFile) {
+      restoreBtn.addEventListener('click', function () { restoreFile.click(); });
+      restoreFile.addEventListener('change', function () {
+        var file = restoreFile.files && restoreFile.files[0];
+        if (!file) return;
+        var reader = new FileReader();
+        reader.onload = function () {
+          var parsed = null;
+          try { parsed = JSON.parse(reader.result); } catch (err) { /* invalid JSON — the null check below shows the error */ }
+          var keys = normalizeBackupKeys(parsed);
+          if (!keys) {
+            alert('That file is not a valid miniCycle backup.');
+            restoreFile.value = '';
+            return;
+          }
+          // Hand off via sessionStorage; the NEXT load applies it before any app
+          // code runs. Writing localStorage here would be clobbered by the
+          // running app's save-on-unload during the reload.
+          try {
+            sessionStorage.setItem('miniCycle_pendingRestore', JSON.stringify({
+              type: 'miniCycle-backup',
+              keys: keys
+            }));
+          } catch (err) {
+            alert('Restore failed: ' + err.message);
+            return;
+          }
+          location.reload();
+        };
+        reader.readAsText(file);
+      });
+    }
+
+    // The DECISION (and the pending-restore hand-off it depends on) now happens
+    // in the head's pre-paint reader, which records it as `mc-first-run` on
+    // <html>; critical.css lays the screen out from the first frame. This
+    // controller owns BEHAVIOUR only — reading the class instead of re-deriving
+    // it keeps one source of truth and, critically, keeps the reveal out of the
+    // post-paint phase where it used to cost ~0.2 CLS.
+    // Rotating use-case line (under the tagline) — same rhythm as the bottom
+    // tips: fade out, swap, fade in. Stops once the screen is dismissed.
+    // Counterpart list lives in modules/labels/loading-tips.json ("useCases"),
+    // which the Welcome Screen reads. Kept inline here because this line must
+    // paint before any fetch could resolve — keep the two in sync.
+    //
+    // Defined ABOVE the mc-first-run gate below: an in-place factory reset puts
+    // the choice screen back without a page load (backupRestoreManager
+    // .rearmFirstRunChoiceScreen), on a page that may have loaded as a
+    // returning user — where this controller returned early and this line
+    // never rotated at all; and where it had, the timer had stopped itself at
+    // the first pick. The reset dispatches 'firstrun:rearm'; restart on it.
+    var useCases = [
+      '✈️ Pre-flight checklists',
+      '🩺 Hourly nurse rounds',
+      '🔍 QA inspections',
+      '🍳 Opening & closing procedures',
+      '🧹 Cleaning rounds',
+      '🌅 Morning routines',
+      '💪 Workout circuits',
+      '📦 Packing lists you reuse'
+    ];
+    var ucTimer = null;
+    function startUseCaseRotation() {
+      var loaderEl = document.getElementById('app-loader');
+      var useCaseA = document.getElementById('first-run-usecase-text');
+      var useCaseB = document.getElementById('first-run-usecase-text-b');
+      if (!loaderEl || !useCaseA || !useCaseB) return;
+      if (ucTimer) { clearInterval(ucTimer); ucTimer = null; }
+      var uc = 0;
+      var showingA = useCaseA.classList.contains('is-active') || !useCaseB.classList.contains('is-active');
+      ucTimer = setInterval(function () {
+        // Stop when the choice screen is gone (loader dismissed after a pick).
+        if (getComputedStyle(loaderEl).display === 'none') { clearInterval(ucTimer); ucTimer = null; return; }
+        uc = (uc + 1) % useCases.length;
+        var incoming = showingA ? useCaseB : useCaseA;
+        var outgoing = showingA ? useCaseA : useCaseB;
+        // True crossfade: the incoming layer fades IN at the same time the
+        // outgoing fades OUT (both animate together), so a line is always on
+        // screen — no blank frame between use cases.
+        incoming.textContent = useCases[uc];
+        incoming.classList.add('is-active');
+        outgoing.classList.remove('is-active');
+        showingA = !showingA;
+      }, 2800);
+    }
+    document.addEventListener('firstrun:rearm', startUseCaseRotation);
+
+    if (!document.documentElement.classList.contains('mc-first-run')) return;
+
+    var loader = document.getElementById('app-loader');
+    var choice = document.getElementById('first-run-choice');
+    if (!loader || !choice) return;
+
+    // Kept for JS that inspects the loader's mode; styling no longer depends on
+    // it (critical.css keys off html.mc-first-run so it applies pre-paint).
+    loader.classList.add('first-run-mode');
+    loader.setAttribute('data-awaiting-choice', 'true');
+    try { performance.mark('mc:firstrun:choiceShown'); } catch (e) { /* Performance API unavailable — marks are diagnostics only */ }
+
+    startUseCaseRotation();
+    // NOTE: the Lite escape hatch reveal is CSS-driven (animation-delay), NOT a
+    // JS timer. A slow boot saturates the main thread, so a setTimeout would be
+    // starved until boot finishes — defeating the hint on exactly the devices
+    // that need it. CSS animations run off the main thread, so the reveal fires
+    // on time even mid-boot. If boot finishes first, the whole loader fades out
+    // before the delay elapses, so the link is never seen. See critical.css.
+
+    // Pre-boot welcome splash for the create/sample picks. Mounts the SAME
+    // #first-run-splash the onboarding module builds (ids, classes, per-char
+    // --char-index / --letter-pos, --last-char-index on the container) the
+    // moment the user taps, so the letter cascade runs while the module graph
+    // is still downloading instead of after boot finishes. onboardingSplash
+    // adopts this element via the --preboot marker class and settles its
+    // completion promise when the already-running animation ends, so the
+    // creation dialog opens at max(boot, splash) rather than boot + splash.
+    // Measured before this: ~7 s from tap to dialog on wifi, ~14 s on slow 4G,
+    // with ~5 s of that the splash queued behind boot. ES5 only (pre-gate).
+    // The title is hardcoded: the label system is not loaded yet, and the
+    // first run always speaks the default vocabulary.
+    function showPrebootSplash() {
+      if (document.getElementById('first-run-splash')) return;
+      var titleText = 'Welcome to miniCycle';
+      var splash = document.createElement('div');
+      splash.id = 'first-run-splash';
+      splash.className = 'first-run-splash first-run-splash--preboot';
+      splash.setAttribute('aria-live', 'polite');
+      var title = document.createElement('h2');
+      title.id = 'first-run-splash-title';
+      title.className = 'first-run-splash__title';
+      title.setAttribute('aria-label', titleText);
+      var words = titleText.split(' ');
+      var lineTexts = [words.slice(0, words.length - 1).join(' '), words[words.length - 1]];
+      var globalCharIndex = 0;
+      var maxCharIndex = 0;
+      for (var li = 0; li < lineTexts.length; li++) {
+        var line = document.createElement('div');
+        line.className = 'first-run-splash__line';
+        var chars = lineTexts[li].split('');
+        var lineCenter = (chars.length - 1) / 2;
+        var wordGroup = null;
+        for (var ci = 0; ci < chars.length; ci++) {
+          var charIndex = globalCharIndex++;
+          if (charIndex > maxCharIndex) maxCharIndex = charIndex;
+          var ch = chars[ci];
+          var isSpace = ch === ' ';
+          var span = document.createElement('span');
+          span.className = 'first-run-splash__char' + (isSpace ? ' first-run-splash__char--space' : '');
+          span.style.setProperty('--char-index', String(charIndex));
+          span.style.setProperty('--letter-pos', String(ci - lineCenter));
+          span.setAttribute('aria-hidden', 'true');
+          span.textContent = ch;
+          if (isSpace) {
+            wordGroup = null;
+            line.appendChild(span);
+          } else {
+            if (!wordGroup) {
+              wordGroup = document.createElement('span');
+              wordGroup.className = 'first-run-splash__word';
+              line.appendChild(wordGroup);
+            }
+            wordGroup.appendChild(span);
+          }
+        }
+        title.appendChild(line);
+      }
+      splash.appendChild(title);
+      splash.style.setProperty('--last-char-index', String(maxCharIndex));
+      document.body.appendChild(splash);
+      try { performance.mark('mc:firstrun:splashMounted'); } catch (err) { /* Performance API unavailable — marks are diagnostics only */ }
+      // Same-session flag: if this splash is gone by the time the module runs
+      // (watchdog below, or boot error cleanup), the module must NOT play a
+      // second one. Consumed by onboardingSplash on adoption or skip.
+      try { sessionStorage.setItem('miniCycle_prebootSplash', '1'); } catch (err) { /* storage unavailable — worst case the module plays its own splash */ }
+      // Tap-to-skip works before the module is here: record the request and
+      // let the module honour it the moment it adopts the element.
+      splash.addEventListener('pointerdown', function () {
+        splash.setAttribute('data-skip', '1');
+      });
+      // Safety net: if boot never adopts this element (module graph failed,
+      // rescue screen, or a very slow boot), fade it out so nothing important
+      // is left covered. 12 s is the same ceiling the module gives its own
+      // splash and lands before the 16 s Lite fallback. Adoption clears the
+      // guard; if boot arrives later, the session flag above stops the module
+      // from playing a second splash, so the dialog simply opens on boot.
+      setTimeout(function () {
+        if (splash.getAttribute('data-adopted') === '1' || !splash.parentNode) return;
+        splash.classList.add('first-run-splash--fading');
+        setTimeout(function () {
+          if (splash.parentNode) splash.parentNode.removeChild(splash);
+        }, 700);
+      }, 12000);
+    }
+
+    choice.addEventListener('click', function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest('.first-run-btn') : null;
+      if (!btn || btn.disabled) return;
+      var value = btn.getAttribute('data-choice');
+      try { sessionStorage.setItem('miniCycle_firstRunChoice', value); } catch (err) { /* storage unavailable — same-tab routing degrades gracefully */ }
+      // Durable flag (survives relaunch) so a reload after choosing doesn't
+      // re-show the choice screen — the gate above reads it. sessionStorage
+      // handles same-tab routing; localStorage handles the cross-launch gate.
+      try { localStorage.setItem('miniCycle_firstRunChoiceMade', '1'); } catch (err) { /* storage unavailable — worst case the choice screen re-shows */ }
+      try { performance.mark('mc:firstrun:choiceTapped'); } catch (err) { /* Performance API unavailable — marks are diagnostics only */ }
+      if (value === 'create' || value === 'sample') showPrebootSplash();
+
+      // Button takeover: the tapped button becomes the progress surface.
+      var btns = choice.querySelectorAll('.first-run-btn');
+      for (var i = 0; i < btns.length; i++) { btns[i].disabled = true; }
+      btn.classList.add('is-chosen');
+      btn.textContent = btn.getAttribute('data-busy') || 'Setting up…';
+
+      loader.setAttribute('data-awaiting-choice', 'false');
+      try {
+        document.dispatchEvent(new CustomEvent('firstrun:choice', { detail: { choice: value } }));
+      } catch (err) { /* CustomEvent constructor unsupported — boot proceeds without the signal */ }
+    });
+  })();
+  </script>
+
+  <div id="loading-overlay" class="loading-overlay" role="status" aria-label="Operation in progress">
+    <div class="loading-spinner">
+      <img src="assets/images/logo/minicycle_logo_icon.png" alt="Loading..." width="60" height="48" style="object-fit: contain;">
+      <div class="loading-spinner-text">Processing...</div>
+    </div>
+  </div>
+
+  <div id="notification-container" popover="manual" aria-live="polite" aria-atomic="true" role="status"></div>
+
+
+  
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     § APP CHROME — header, quick actions, main menu
+     Persistent UI that frames the app. The main menu (<nav id="main-menu">) is a
+     custom Tab-trap, not a <dialog> — see EVENT_LISTENER_GUIDE.md before
+     changing its focus handling.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+<div class="fixed-header-container">
+  <header class="mini-cycle-header-row">
+    <h1 class="visually-hidden">miniCycle Routine Manager</h1>
+    <div class="header-branding">
+      <img src="assets/images/logo/logo.png" alt="miniCycle" class="header-logo" width="40" height="36">
+      <div class="app-name-group">
+        <img src="assets/images/logo/App_Name_miniCycle.png" alt="miniCycle App Name" class="app-name" width="100" height="21">
+        <span id="app-subtitle" class="app-subtitle">ROUTINE MANAGER</span>
+      </div>
+    </div>
+
+    <button class="menu-button" aria-label="Menu" aria-expanded="false" aria-controls="main-menu" title="Open menu">☰</button>
+  </header>
+
+  <div class="mode-selector-wrapper">
+  <div class="quick-actions-container">
+    <button id="quick-actions-btn" class="quick-actions-btn" aria-label="Quick actions" title="Quick actions">
+      <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"></path>
+      </svg>
+    </button>
+    <div id="quick-actions-menu" class="quick-actions-menu">
+      <button id="toggle-task-input-btn" class="quick-action-item">
+        <span class="quick-action-icon">📝</span>
+        <span id="toggle-task-input-text" class="quick-action-text"></span>
+      </button>
+      <button id="create-routine-btn" class="quick-action-item">
+        <span class="quick-action-icon">✨</span>
+        <span class="quick-action-text">Create New Routine</span>
+      </button>
+    </div>
+  </div>
+  <select id="mode-selector" class="mode-selector" aria-label="Select mode" title="Switch mode: Auto Cycle, Manual Cycle, or To-Do">
+    <option value="auto-cycle" title="Tasks reset automatically when all are completed — great for daily routines">Auto Cycle ↻</option>
+    <option value="manual-cycle" title="Tasks stay checked until you manually reset them — complete at your own pace">Manual Cycle ✋↻</option>
+    <option value="todo-mode" title="Completed tasks are removed — use as a traditional checklist">To-Do Mode 📋</option>
+  </select>
+  <button id="routine-switcher-btn" class="routine-switcher-btn" aria-label="Switch routine" title="Switch routine">
+    <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+    </svg>
+  </button>
+  </div>
+
+  <div id="saving-indicator" class="saving-indicator">Saving...</div>
+</div>
+
+
+    <!-- Main Menu Backdrop — fades in via CSS when .menu-container.visible -->
+    <div id="main-menu-backdrop" class="main-menu-backdrop" aria-hidden="true"></div>
+
+    <nav id="main-menu" class="menu-container has-corner-logo" data-modal data-menu>
+        <div id="main-menu-header-row" class="main-menu-header-row">
+            <div id="main-menu-header" class="main-menu-header">
+                <span id="main-menu-mini-cycle-title"></span>
+                <span id="current-date"></span>
+            </div>
+      <button id="open-about-modal" class="open-about-modal" aria-label="About miniCycle" title="About miniCycle">
+        <i class="fas fa-info-circle" aria-hidden="true"></i>
+        </button>
+
+
+                
+        </div>
+
+       
+
+            <dialog id="about-modal" class="modal" data-modal aria-labelledby="about-modal-title" aria-modal="true">
+                <div class="modal-content about-modal-content has-corner-logo">
+                    <button class="close-modal" aria-label="Close about modal">&times;</button>
+
+                    <div class="about-header">
+                        <img src="assets/images/logo/minicycle_logo_icon.png" alt="miniCycle Logo" class="about-logo">
+                        <h2 id="about-modal-title">miniCycle<sup class="about-trademark">&trade;</sup></h2>
+                        <p class="about-tagline">Routine Manager</p>
+                    </div>
+
+                    <div class="about-version-badge">
+                        v<span id="about-version">—</span>
+                    </div>
+
+                    <p class="about-description">Your routine workflow companion — turn repeatable tasks into effortless cycles, stay focused, and build momentum.</p>
+
+                    <div class="about-links">
+                        <a href="pages/product.html#changelog" target="_blank" rel="noopener noreferrer">Changelog</a>
+                        <span class="about-link-divider">•</span>
+                        <a href="pages/product.html" target="_blank" rel="noopener noreferrer">About miniCycle</a>
+                    </div>
+
+                    <div class="about-footer">
+                        <p>Developed by <a href="https://sparkincreations.com" target="_blank" rel="noopener noreferrer">sparkinCreations</a></p>
+                        <p class="about-copyright">&copy; <span data-copyright-year>2026</span> miniCycle&trade;</p>
+                        <p class="about-cache">Cache: <span id="about-sw-version">—</span></p>
+                    </div>
+                </div>
+            </dialog>
+
+
+        <div class="menu-sections">
+            <div class="menu-section quick-actions-menu-row" data-section="quick-actions">
+                <div class="quick-actions-header">
+                    <button class="quick-actions-nav quick-actions-prev" aria-label="Previous view">&#x25C0;</button>
+                    <span class="quick-actions-title">Quick Actions</span>
+                    <button class="quick-actions-nav quick-actions-next" aria-label="Next view">&#x25B6;</button>
+                </div>
+                <div class="quick-actions-slots" id="quick-actions-menu-slots"></div>
+            </div>
+            <div class="menu-section collapsed" data-section="routines">
+                <div class="menu-section-header collapsible" role="button" tabindex="0" data-toggle="routines" aria-expanded="false" aria-label="Toggle Routine Actions section" aria-controls="menu-section-routines" title="Create, open, import, export, and share routines">
+                    <span class="menu-section-label">
+                        <i class="fas fa-list menu-section-icon" aria-hidden="true"></i>
+                        <span>Routine Actions</span>
+                    </span>
+                    <span class="menu-section-toggle">&#x25BC;</span>
+                </div>
+                <div class="menu-section-grid" id="menu-section-routines">
+                    <button id="new-mini-cycle" title="Create a new routine"><i class="fas fa-sparkles"></i>New</button>
+                    <button id="export-mini-cycle" title="Download the current routine as a file"><i class="fas fa-file-download"></i>Download</button>
+                    <button id="open-mini-cycle" title="Open an existing routine"><i class="fas fa-folder-open"></i>Open</button>
+                    <button id="import-mini-cycle" title="Import a routine from a file"><i class="fas fa-file-upload"></i>Import</button>
+                    <button id="save-as-mini-cycle" title="Duplicate the current routine"><i class="fas fa-copy"></i>Duplicate</button>
+                    <button id="share-routine" title="Share the current routine as a file" aria-label="Share the current routine as a file"><i class="fas fa-share-nodes"></i>Share</button>
+                </div>
+            </div>
+
+            <div class="menu-section collapsed" data-section="tasks">
+                <div class="menu-section-header collapsible" role="button" tabindex="0" data-toggle="tasks" aria-expanded="false" aria-label="Toggle Task Actions section" aria-controls="menu-section-tasks" title="Manage tasks, reminders, recurring schedules, and task options">
+                    <span class="menu-section-label">
+                        <i class="fas fa-check-circle menu-section-icon" aria-hidden="true"></i>
+                        <span>Task Actions & Features</span>
+                    </span>
+                    <span class="menu-section-toggle">&#x25BC;</span>
+                </div>
+                <div class="menu-section-grid" id="menu-section-tasks">
+                    <div class="auto-uncheck-row" title="Automatically uncheck all tasks in this routine at a set time each day">
+                        <label class="auto-uncheck-row-label" for="auto-uncheck-daily-toggle">
+                            <input type="checkbox" id="auto-uncheck-daily-toggle">
+                            <span class="auto-uncheck-row-text">Auto-uncheck daily</span>
+                        </label>
+                        <button type="button" id="auto-uncheck-daily-time-btn" class="auto-uncheck-row-time-btn hidden" title="Change auto-uncheck time">
+                            <span id="auto-uncheck-daily-time-label">12:00 AM</span>
+                            <i class="fas fa-clock" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                    <button id="clear-mini-cycle-tasks" title="Uncheck all tasks in this routine"><i class="fas fa-eraser"></i>Uncheck All</button>
+                    <button id="delete-all-mini-cycle-tasks" title="Delete all tasks in this routine"><i class="fas fa-trash"></i>Delete All</button>
+                    <button id="open-reminders-modal" title="Configure reminders and notifications"><i class="fas fa-bell"></i>Reminders</button>
+                    <button id="menu-toggle-input-bar" title="Show or hide the task input bar"><i class="fas fa-edit"></i>Input Bar</button>
+                    <button id="menu-task-options" title="Customize task option buttons"><span class="icon-text">+/-</span>Task Options</button>
+                    <button id="open-recurring-panel" title="Manage recurring tasks"><i class="fas fa-repeat"></i>Recurring</button>
+                </div>
+            </div>
+
+
+
+            <div class="menu-section collapsed" data-section="rewards">
+                <div class="menu-section-header collapsible" role="button" tabindex="0" data-toggle="rewards" aria-expanded="false" aria-label="Toggle Rewards section" aria-controls="menu-section-rewards" title="Unlock themes and mini-games as you complete cycles">
+                    <span class="menu-section-label">
+                        <i class="fas fa-trophy menu-section-icon" aria-hidden="true"></i>
+                        <span>Rewards & Extras</span>
+                    </span>
+                    <span class="menu-section-toggle">&#x25BC;</span>
+                </div>
+                <div class="menu-section-grid" id="menu-section-rewards">
+                    <div id="themes-menu-option" class="themes-menu-option">
+                        <button id="open-themes-panel" class="open-themes-panel" title="Open Themes Panel"><i class="fas fa-palette"></i>Themes</button>
+                    </div>
+                    <div id="games-menu-option" style="display: none;">
+                        <button id="open-games-panel"><i class="fas fa-gamepad"></i>Games</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="menu-section collapsed" data-section="help">
+                <div class="menu-section-header collapsible" role="button" tabindex="0" data-toggle="help" aria-expanded="false" aria-label="Toggle Help section" aria-controls="menu-section-help" title="User manual, feedback, updates, and sharing">
+                    <span class="menu-section-label">
+                        <i class="fas fa-question-circle menu-section-icon" aria-hidden="true"></i>
+                        <span>Help & Support</span>
+                    </span>
+                    <span class="menu-section-toggle">&#x25BC;</span>
+                </div>
+                <div class="menu-section-grid" id="menu-section-help">
+                    <button id="open-user-manual" class="open-user-manual" title="Open the user manual"><i class="fas fa-book"></i>User Manual</button>
+                    <button id="open-feedback-modal" class="open-feedback-modal"><i class="fas fa-comment"></i>Feedback</button>
+                    <button id="menu-lite-version" title="Switch to the lightweight version"><i class="fas fa-mobile-alt"></i>Lite Version</button>
+                    <button id="share-app" title="Share miniCycle with someone" aria-label="Share miniCycle with someone"><i class="fas fa-share-nodes"></i>Share App</button>
+                    <button id="menu-check-updates" title="Check for app updates"><i class="fas fa-sync-alt"></i>Check for Updates</button>
+                    <button id="open-tip-archive" title="Browse every loading tip"><i class="fas fa-lightbulb"></i><span class="menu-item-label">Tips</span></button>
+                    <button id="menu-retake-tours" title="Turn on tour prompts for major features"><i class="fas fa-route"></i>Enable Tour Prompts</button>
+                </div>
+            </div>
+      
+
+            <div class="menu-section collapsed" data-section="legal">
+                <div class="menu-section-header collapsible" role="button" tabindex="0" data-toggle="legal" aria-expanded="false" aria-label="Toggle Legal section" aria-controls="menu-section-legal" title="Privacy policy, terms of service, accessibility, and security">
+                    <span class="menu-section-label">
+                        <i class="fas fa-balance-scale menu-section-icon" aria-hidden="true"></i>
+                        <span>Legal & Info</span>
+                    </span>
+                    <span class="menu-section-toggle">&#x25BC;</span>
+                </div>
+                <div class="menu-section-grid" id="menu-section-legal">
+                    <a href="legal/privacy.html" target="_blank" rel="noopener noreferrer" class="menu-link-button" title="Read the Privacy Policy"><i class="fas fa-shield-alt"></i>Privacy Policy</a>
+                    <a href="legal/terms.html" target="_blank" rel="noopener noreferrer" class="menu-link-button" title="Read the Terms of Service"><i class="fas fa-file-alt"></i>Terms of Service</a>
+                    <a href="legal/accessibility.html" target="_blank" rel="noopener noreferrer" class="menu-link-button" title="Read the Accessibility Statement"><i class="fas fa-universal-access"></i>Accessibility</a>
+                    <a href="legal/security.html" target="_blank" rel="noopener noreferrer" class="menu-link-button" title="Read the Security Policy"><i class="fas fa-lock"></i>Security</a>
+                </div>
+            </div>
+
+            <div class="menu-section collapsed" data-section="app">
+                <div class="menu-section-header collapsible" role="button" tabindex="0" data-toggle="app" aria-expanded="false" aria-label="Toggle Settings section" aria-controls="menu-section-app" title="Customize colors, accessibility, and app preferences">
+                    <span class="menu-section-label">
+                        <i class="fas fa-cog menu-section-icon" aria-hidden="true"></i>
+                        <span>Settings & Personalization</span>
+                    </span>
+                    <span class="menu-section-toggle">&#x25BC;</span>
+                </div>
+                <div class="menu-section-grid" id="menu-section-app">
+                    <button id="open-preferences" title="Customize task list colors"><i class="fas fa-paint-brush"></i>Personalization</button>
+                    <button id="open-settings" class="open-settings" title="Open settings"><i class="fas fa-cog"></i>Settings</button>
+                </div>
+            </div>
+              </div>
+
+        <div class="main-menu-controls-container">
+            <div class="mode-description-wrapper">
+                <button id="mode-description-toggle" class="mode-description-toggle" aria-expanded="true" aria-controls="mode-description">
+                    <i class="fas fa-scroll mode-info-icon" aria-hidden="true"></i>
+                    <span class="toggle-label">Mode Info</span>
+                    <span class="mode-badge" aria-hidden="true"></span>
+                    <i class="fas fa-chevron-down toggle-icon"></i>
+                </button>
+                <div id="mode-description" class="mode-description" aria-live="polite"></div>
+                <div id="mode-radio-group" class="mode-radio-row" role="radiogroup" aria-label="Switch routine mode">
+                    <label class="mode-radio-option">
+                        <input type="radio" name="mode-radio" value="auto-cycle">
+                        <span class="mode-radio-label">Auto Cycle</span>
+                    </label>
+                    <label class="mode-radio-option">
+                        <input type="radio" name="mode-radio" value="manual-cycle">
+                        <span class="mode-radio-label">Manual Cycle</span>
+                    </label>
+                    <label class="mode-radio-option">
+                        <input type="radio" name="mode-radio" value="todo-mode">
+                        <span class="mode-radio-label">To-Do</span>
+                    </label>
+                </div>
+            </div>
+           <div class="toggle-container" id="autoResetContainer" style="display: none;">
+            <label class="switch">
+                <input type="checkbox" id="toggleAutoReset" name="toggleAutoReset" aria-label="Toggle auto reset" checked>
+                <span class="slider round"></span>
+              </label>              
+            <span class="label-text">Auto Reset</span>
+        </div>
+        
+        <div class="checkbox-container" id="deleteCheckedTasksContainer" style="display: none;">
+            <label class="custom-checkbox" for="deleteCheckedTasks">
+              <input
+                type="checkbox"
+                id="deleteCheckedTasks"
+                name="deleteCheckedTasks"
+                aria-labelledby="delete-label"
+              />
+              <span class="checkmark" aria-hidden="true"></span>
+              <span id="delete-label">Delete Checked Tasks after Complete</span>
+            </label>
+          </div>
+    </div>
+
+    <div class="main-menu-primary-action-row">
+        <button id="menu-open-title-screen" class="menu-primary-action" type="button" title="Return to the Welcome Screen" aria-label="Open the Welcome Screen">
+            <i class="fas fa-door-ajar menu-primary-action-icon" aria-hidden="true"></i>
+            <span class="menu-item-label">Welcome Screen</span>
+        </button>
+        <button id="menu-enter-focus-view" class="menu-primary-action" type="button" title="Enter Focus View" aria-label="Enter Focus View">
+            <svg class="menu-primary-action-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                <!-- Corner brackets framing an eye — the same 'focusEye' glyph as the
+                     Focus View button (modules/utils/icons.js); keep the two in step. -->
+                <path d="M2 5.5V2h3.5M14 5.5V2h-3.5M2 10.5V14h3.5M14 10.5V14h-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square"/>
+                <path d="M3.6 8c1.3-2 2.8-3 4.4-3s3.1 1 4.4 3c-1.3 2-2.8 3-4.4 3S4.9 10 3.6 8z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+                <circle cx="8" cy="8" r="1.3" fill="currentColor"/>
+            </svg>
+            <span>Focus View</span>
+        </button>
+    </div>
+
+    <button id="close-main-menu" aria-label="Close Main Menu">Close</button>
+        
+</nav>
+
+
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     § MODALS & PANELS
+     Hidden <dialog> overlays. Source position here is reader-facing, but NOT
+     free: DOM order still determines Tab order and the paint order of elements
+     that tie on z-index. Prefer the Z_INDEX constants / CSS z-index tokens over
+     relying on source position.
+
+     Not all modals live here — the largest (recurring panel) is injected at boot
+     from modules/boot/modalTemplates.js. modalRegistry expects a modal's markup
+     to exist by the time it initialises, so anything moved out must be injected
+     before Phase 3 of boot.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+<!-- recurring-panel-overlay injected at boot via modalTemplates.js -->
+
+
+    <dialog id="games-panel" class="games-modal" data-modal aria-labelledby="games-panel-title" aria-modal="true">
+        <div class="games-modal-content has-corner-logo">
+          <h2 id="games-panel-title">🎮 Games</h2>
+          <p>Try to complete tasks in the correct order as fast as you can!</p>
+          <button id="open-task-order-game">Play Whack-a-Order</button>
+          <button id="close-games-panel" class="close-btn">Close</button>
+        </div>
+      </dialog>
+
+        <dialog id="reminders-modal" class="reminders-modal" data-modal aria-labelledby="reminders-modal-title" aria-modal="true">
+            <div class="reminders-modal-content has-corner-logo">
+                <h2 id="reminders-modal-title">Reminders & Notifications</h2>
+                <p id="reminders-bell-note" class="settings-warning reminders-bell-note">Reminders only cover tasks with the 🔔 button on.</p>
+        
+                <label class="settings-option">
+                    <input type="checkbox" id="enableReminders" name="enableReminders" />
+                    Enable Reminders
+                </label>
+                <p id="reminders-next-summary" class="reminders-next-summary" aria-live="polite" hidden></p>
+                <div id="frequency-section">
+                    <label>
+                        <input type="checkbox" id="indefiniteCheckbox" name="indefiniteCheckbox" />
+                        Remind Indefinitely?
+                    </label>
+                    <div id="repeat-count-row">
+                        <label for="repeatCount">Number of Times:</label>
+                        <input type="number" id="repeatCount" name="repeatCount" min="1" value="1" />
+                    </div>
+                    <div id="every-row">
+                        <label for="frequencyValue">Every:</label>
+                        <!-- max=365 is UX guidance only (the largest sensible "every N"
+                             for any unit); the real protection against long intervals is
+                             the setTimeout clamp in reminders.js scheduleNextReminder,
+                             which also covers values restored from saved state. -->
+                        <input type="number" id="frequencyValue" name="frequencyValue" min="1" max="365" value="1" />
+                        <select id="frequencyUnit" aria-label="Frequency unit">
+                            <option value="minutes">Minutes</option>
+                            <option value="hours">Hours</option>
+                            <option value="days">Days</option>
+                        </select>
+                    </div>
+                </div>
+        
+                <div>
+                    <label class="settings-option">
+                        <input type="checkbox" id="dueDatesReminders" name="dueDatesReminders" />
+                        Enable Due Date Notifications
+                    </label>
+                    <details id="due-dates-note" class="settings-warning-details">
+                        <summary class="settings-warning-summary">How these differ from task reminders</summary>
+                        <p id="due-dates-note-text" class="settings-warning">Due-date notices are banners inside the app: one when miniCycle opens with overdue tasks, and one when you set a due date that is within three days. They cover every task with a due date, no 🔔 needed, and setting a first due date switches them on. They do not follow the schedule below and never reach the system notification center. Only task reminders do that.</p>
+                    </details>
+                </div>
+                <div>
+                    <label class="settings-option">
+                        <input type="checkbox" id="browserNotifications" name="browserNotifications" />
+                        Browser Notifications
+                    </label>
+                    <details id="privacyNoticeDetails" class="settings-warning-details">
+                        <summary class="settings-warning-summary">Privacy Notice</summary>
+                        <p class="settings-warning">Task names will appear in your device&#39;s notification center and may be visible to others. Ensure notifications are enabled for your browser in your OS settings.</p>
+                    </details>
+                </div>
+        
+                <details id="reminders-web-note" class="settings-warning-details reminders-web-note" hidden>
+                    <summary class="settings-warning-summary">Reminders on the web</summary>
+                    <p id="reminders-web-note-text" class="settings-warning">On the web, reminders fire only while miniCycle is open in a tab. The iOS and Android apps schedule them with the system, so they arrive even when the app is closed.</p>
+                </details>
+                <button id="close-reminders-btn" class="settings-btn">Close</button>
+            </div>
+        </dialog>
+
+
+
+<!-- settings-modal injected at boot via modalTemplates.js -->
+
+<dialog id="testing-modal" class="testing-modal" data-modal aria-labelledby="testing-modal-title" aria-modal="true">
+    <div class="testing-modal-content">
+        <div class="testing-modal-header">
+            <h2 id="testing-modal-title">🔬 App Diagnostics & Testing</h2>
+            <button class="close-testing-modal" aria-label="Close testing modal">&times;</button>
+        </div>
+
+        <div class="testing-modal-body">
+            <div class="testing-tabs" role="tablist" aria-label="Testing categories">
+                <button class="testing-tab active" data-tab="diagnostics" role="tab" aria-selected="true" aria-controls="diagnostics-tab">📊 Diagnostics</button>
+                <button class="testing-tab" data-tab="debug" role="tab" aria-selected="false" aria-controls="debug-tab">🐛 Debug Info</button>
+                <button class="testing-tab" data-tab="automated-tests" role="tab" aria-selected="false" aria-controls="automated-tests-tab">🧪 Automated Tests</button>
+            </div>
+
+            <div id="diagnostics-tab" class="testing-tab-content active" role="tabpanel">
+                <div class="testing-section">
+                    <h3>📋 Quick Health Check</h3>
+                    <button id="run-health-check" class="test-btn test-primary">Run Full Diagnostic</button>
+                    <button id="check-data-integrity" class="test-btn test-info">Check Data Integrity</button>
+                    <button id="validate-schema" class="test-btn test-info">Validate Schema</button>
+                    <button id="dry-run-schema-26" class="test-btn test-info">Dry-Run 2.6 Migration</button>
+                </div>
+
+                <div class="testing-section">
+                    <h3>📱 App Information</h3>
+                    <button id="show-app-info" class="test-btn test-secondary">Show App Details</button>
+                    <button id="show-storage-info" class="test-btn test-secondary">Storage Analysis</button>
+                    <button id="show-performance-info" class="test-btn test-secondary">Performance Info</button>
+                    <button id="show-boot-timing" class="test-btn test-secondary">Boot Timing</button>
+                </div>
+
+                <div class="testing-section">
+                    <h3>🛠️ Data Tools</h3>
+                    <button id="run-full-analysis" class="test-btn test-primary">Run Full Analysis</button>
+                    <button id="export-debug-data" class="test-btn test-success">Export Debug Package</button>
+                    <button id="repair-data" class="test-btn test-danger">Repair Corrupted Data</button>
+                </div>
+
+                <div class="testing-section">
+                    <h3>💾 Backup Management</h3>
+                    <button id="list-available-backups" class="test-btn test-info">List Available Backups</button>
+                    <button id="create-manual-backup" class="test-btn test-success">Create Manual Backup</button>
+                    <button id="restore-from-backup" class="test-btn test-warning">Restore from Backup</button>
+                    <button id="clean-old-backups" class="test-btn test-secondary">Clean Old Backups</button>
+                </div>
+            </div>
+
+            <div id="debug-tab" class="testing-tab-content" role="tabpanel">
+                <div class="testing-section">
+                    <h3>🐛 Debug Information</h3>
+                    <button id="generate-debug-report" class="test-btn test-primary">Generate Debug Report</button>
+                    <button id="view-local-storage-btn" class="test-btn test-secondary">View Local Storage</button>
+                    <button id="show-service-worker-info" class="test-btn test-secondary">📡 Service Worker Info</button>
+                    <button id="test-service-worker-update" class="test-btn test-secondary">🔄 Test SW Update</button>
+                </div>
+
+                <div class="testing-section">
+                    <h3>📋 System Info</h3>
+                    <button id="show-browser-info" class="test-btn test-secondary">Browser Capabilities</button>
+                </div>
+
+                <div class="button-group">
+                    <h4>🎯 Auto Console Capture</h4>
+                    <button id="enable-auto-capture" class="test-btn test-info">🔄 Enable Auto-Capture Mode</button>
+                    <button id="show-all-console-logs" class="test-btn test-secondary">📊 Show All Captured Logs</button>
+                    <button id="show-migration-errors" class="test-btn test-warning">🚨 Show Migration Issues</button>
+                    <button id="clear-all-console-logs" class="test-btn test-secondary">🧹 Clear All Captured Logs</button>
+                    <button id="stop-console-capture" class="test-btn test-danger">⏹️ Stop Auto Capture</button>
+                </div>
+
+            </div>
+
+            <div id="automated-tests-tab" class="testing-tab-content" role="tabpanel">
+                <div class="testing-section">
+                    <h3>🧪 Quick Test</h3>
+                    <button id="run-all-automated-tests" class="test-btn test-primary">
+                        🏁 Run All Tests
+                    </button>
+                    <p id="quick-test-hint" class="testing-hint-text">
+                        Runs the full suite and shows a pass/fail summary.
+                    </p>
+                </div>
+
+                <div class="testing-section">
+                    <h3>🔬 Full Test Suite</h3>
+                    <p class="testing-hint-text">
+                        For detailed testing with individual module controls:
+                    </p>
+                    <a id="open-test-suite-link" href="tests/module-test-suite.html" target="_blank" rel="noopener" class="test-btn test-info">
+                        Open Test Suite Browser →
+                    </a>
+                    <p class="testing-hint-text">
+                        The test suite browser lets you run individual modules, see detailed results, and debug specific failures.
+                    </p>
+                </div>
+            </div>
+        </div>
+        
+
+        <div class="testing-results-area">
+            <div class="testing-results-header">
+                <h3>📝 Test Results</h3>
+                <div class="testing-results-controls">
+                    <button id="clear-test-results" class="test-btn test-clear">Clear</button>
+                    <button id="export-test-results" class="test-btn test-export">Export Results</button>
+                    <button id="copy-test-results" class="test-btn test-copy">Copy to Clipboard</button>
+                </div>
+            </div>
+            <div id="testing-results" class="testing-results">
+                <div id="testing-output" class="testing-output">
+                    <div class="welcome-message">
+                        <p>👋 Welcome to App Diagnostics!</p>
+                        <p>Use the tabs above to run tests and diagnostics.</p>
+                        <p>Results will appear here.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer removed — X button in header handles close -->
+    </div>
+</dialog>
+
+
+
+<dialog id="storage-viewer-overlay" class="storage-modal-overlay" aria-labelledby="storage-viewer-title" aria-modal="true">
+  <div class="storage-modal-box">
+    <div class="storage-modal-header" id="storage-viewer-title">📦 Local Storage Viewer</div>
+    <div class="storage-modal-body scrollable" id="storage-content">
+      <!-- Content injected here -->
+    </div>
+    <div class="storage-modal-buttons">
+      <label style="margin-right: auto; display: flex; align-items: center; gap: 6px;">
+        <input type="checkbox" id="stay-open-toggle" name="stay-open-toggle" />
+        Stay open when clicking outside
+      </label>
+      <button class="btn-confirm" id="close-storage-viewer-btn">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="themes-modal" data-modal id="themes-modal" aria-labelledby="themes-modal-title" aria-modal="true">
+    <div class="themes-modal-content has-corner-logo">
+      <h2 id="themes-modal-title">🎨 Theme Settings</h2>
+  
+      <div id="vocab-theme-section">
+        <!-- Vocabulary theme options injected by JS -->
+      </div>
+
+      <hr class="theme-divider" />
+
+      <div id="dark-mode-section">
+        <label class="custom-checkbox">
+          <input type="checkbox" id="darkModeToggleThemes" name="darkModeToggleThemes">
+          <span class="checkmark"></span>
+          Dark Mode 🌙
+        </label>
+      </div>
+  
+      <button id="close-themes-btn" class="close-btn">Close</button>
+    </div>
+  </dialog>
+
+<!-- preferences-modal injected at boot via modalTemplates.js -->
+
+
+<dialog id="routine-switcher-modal" class="mini-cycle-switch-modal" data-modal aria-labelledby="routine-switcher-title" aria-modal="true">
+    <div class="mini-cycle-switch-modal-content has-corner-logo" autofocus tabindex="-1">
+        <div class="mini-cycle-switch-title" id="routine-switcher-title">Open Routine</div>
+
+        <input type="text" id="routine-search-input" class="routine-search-input" placeholder="Search routines..." autocomplete="off" aria-label="Search routines">
+        <div class="routine-sort-filter-row">
+            <div class="routine-filter-controls">
+                <select id="routine-filter-select" class="routine-filter-select" aria-label="Filter routines by mode">
+                    <option value="all">All Modes</option>
+                    <option value="auto">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;🔄 Auto Cycle</option>
+                    <option value="manual">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;✋ Manual Cycle</option>
+                    <option value="todo">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;📋 To-Do</option>
+                </select>
+            </div>
+            <div class="routine-sort-controls">
+                <span class="routine-sort-label">Sort:</span>
+                <button id="sort-alpha" class="routine-sort-btn active" title="Sort alphabetically">A-Z</button>
+                <button id="sort-recent" class="routine-sort-btn" title="Sort by recently modified">Recent</button>
+                <button id="sort-size" class="routine-sort-btn" title="Sort by file size">Size</button>
+            </div>
+        </div>
+
+        <div class="routine-switcher-body">
+            <div class="routine-switcher-left">
+                <div class="routine-panel-title">Routines</div>
+                <div class="mini-cycle-switch-list" id="miniCycleList" role="listbox" aria-label="Routines"></div>
+                <div id="routine-list-hint" class="routine-list-hint"></div>
+            </div>
+
+            <div class="routine-switcher-right">
+                <div id="desktop-preview-title" class="routine-panel-title">Preview</div>
+                <div id="desktop-preview-window" class="desktop-preview-window">
+                    Select a routine to preview
+                </div>
+                <div id="desktop-preview-hint" class="desktop-preview-hint"></div>
+            </div>
+        </div>
+
+        <div id="switch-items-row" class="switch-items-row">
+            <div class="switch-items-row-title">Routine Actions</div>
+            <button id="switch-duplicate" class="switch-duplicate switch-buttons" title="Duplicate routine"><i class="fas fa-copy"></i><span class="switch-btn-label">Duplicate</span></button>
+            <button id="switch-rename" class="switch-rename switch-buttons" title="Rename routine"><i class="fas fa-edit"></i><span class="switch-btn-label">Rename</span></button>
+            <button id="switch-delete" class="switch-delete switch-buttons" title="Delete routine"><i class="fas fa-trash"></i><span class="switch-btn-label">Delete</span></button>
+            <button id="switch-download" class="switch-download switch-buttons" title="Download routine"><i class="fas fa-file-download"></i><span class="switch-btn-label">Download</span></button>
+            <button id="switch-theme" class="switch-theme switch-buttons" title="Change routine theme" aria-label="Change theme" aria-expanded="false" aria-controls="theme-picker-row">🎨<span class="switch-btn-label">Theme</span></button>
+            <div id="switch-preview-window" class="switch-preview-window"><br>Preview</div>
+        </div>
+        <div id="theme-picker-row" class="theme-picker-row hidden" role="radiogroup" aria-label="Select theme for this routine"></div>
+        <div class="switch-action-row">
+            <button id="miniCycleUpload" class="mini-cycle-upload-btn" title="Import a routine from a file" aria-label="Import a routine from a file"><i class="fas fa-file-upload"></i> Import Routine</button>
+            <button id="miniCycleSwitchConfirm" class="mini-cycle-switch-btn open-btn">Open</button>
+        </div>
+
+        <div class="storage-bar-container">
+            <div class="storage-bar-header">
+                <div class="storage-bar-label-group">
+                    <div class="storage-bar-label" title="Space used by your saved routines on this device">Routine Storage</div>
+                    <div class="storage-bar-hint">Saved locally on this device</div>
+                </div>
+                <button id="storage-refresh-btn" class="storage-refresh-btn" title="Refresh storage quota">
+                    <i class="fas fa-sync-alt"></i>
+                </button>
+            </div>
+            <div class="storage-bar-track">
+                <div id="storage-bar-fill" class="storage-bar-fill storage-normal"></div>
+            </div>
+            <div id="storage-bar-text" class="storage-bar-text">Calculating...</div>
+        </div>
+        <button id="miniCycleSwitchClose" class="close-routine-switcher">Close</button>
+    </div>
+</dialog>
+
+
+
+
+<dialog id="feedback-modal" class="feedback-modal" aria-labelledby="feedback-modal-title" data-modal aria-modal="true">
+    <div class="feedback-modal-content has-corner-logo">
+        <button class="close-feedback-modal" aria-label="Close feedback modal">&times;</button>
+        <h2 id="feedback-modal-title">Provide Feedback</h2>
+        <p>We appreciate your feedback! Let us know how we can improve miniCycle.</p>
+
+        <form id="feedback-form" action="https://api.web3forms.com/submit" method="POST" novalidate>
+            <input type="hidden" name="access_key" value="691907ec-ad04-4447-9d45-861ee622a091">
+
+            <input type="hidden" name="subject" value="miniCycle Feedback">
+
+            <!-- Web3Forms Honeypot Spam Protection -->
+            <input type="checkbox" name="botcheck" style="display: none;" tabindex="-1">
+
+            <!-- Optional Star Rating (interactivity wired by modules/features/uxRatings.js;
+                 hidden rating/rating_tags inputs ride along in the FormData POST) -->
+            <div id="feedback-rating-section" class="feedback-rating-section">
+                <span id="feedback-rating-label" class="feedback-rating-label">How would you rate miniCycle?</span>
+                <div id="feedback-star-row" class="feedback-star-row" role="radiogroup" aria-labelledby="feedback-rating-label">
+                    <button type="button" class="feedback-star" data-rating="1" role="radio" aria-checked="false"><i class="far fa-star" aria-hidden="true"></i></button>
+                    <button type="button" class="feedback-star" data-rating="2" role="radio" aria-checked="false"><i class="far fa-star" aria-hidden="true"></i></button>
+                    <button type="button" class="feedback-star" data-rating="3" role="radio" aria-checked="false"><i class="far fa-star" aria-hidden="true"></i></button>
+                    <button type="button" class="feedback-star" data-rating="4" role="radio" aria-checked="false"><i class="far fa-star" aria-hidden="true"></i></button>
+                    <button type="button" class="feedback-star" data-rating="5" role="radio" aria-checked="false"><i class="far fa-star" aria-hidden="true"></i></button>
+                </div>
+                <p id="feedback-rating-prompt" class="feedback-rating-prompt" aria-live="polite"></p>
+                <span id="feedback-tags-label" class="feedback-rating-label hidden">What stands out? (optional)</span>
+                <div id="feedback-tags-row" class="feedback-tags-row hidden"></div>
+                <p id="feedback-previous-rating" class="feedback-previous-rating hidden"></p>
+                <input type="hidden" name="rating" id="feedback-rating-value" value="">
+                <input type="hidden" name="rating_tags" id="feedback-rating-tags-value" value="">
+            </div>
+
+            <label for="feedback-text" class="visually-hidden">Your feedback</label>
+            <textarea id="feedback-text" name="message" placeholder="Write your feedback here..." required minlength="10"></textarea>
+
+            <label for="feedback-email" class="visually-hidden">Your email (optional)</label>
+            <input type="email" id="feedback-email" name="email" placeholder="Your Email (optional)" autocomplete="email">
+
+            <button type="submit" id="submit-feedback">Submit</button>
+        </form>
+
+        <p id="thank-you-message" style="display: none; color: green; font-weight: bold;">
+            ✅ Thank you for your feedback!
+        </p>
+    </div>
+</dialog>
+
+
+
+
+
+    
+    
+<div id="app-root" class="app-root">
+
+
+
+
+<main id="app-container" role="main" tabindex="-1">
+  <button id="personalization-btn" aria-label="Personalization" title="Personalize colors">
+    🖌️
+  </button>
+  <button id="quick-dark-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+    🌓
+  </button>
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     § APP ROOT
+     The three carousel panels (#focus-task-panel · #task-view · #stats-panel),
+     the view arrows, footer and nav dots. The nav dots are role="tab" and each
+     panel is its matching role="tabpanel" — keep aria-controls and the panel
+     roles in sync, and note themeManager rewrites the dots' accessible names
+     per vocabulary theme (so don't hardcode panel names that duplicate them).
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+    <!-- Left Arrow — visible in stats view, navigates to task view -->
+<div id="slide-left" class="slide-arrow" tabindex="0" role="button" aria-label="Show Routine View" title="Show Routine View">❯</div>
+
+<!-- Right Arrow — visible in task view, navigates to stats panel -->
+<div id="slide-right" class="slide-arrow" tabindex="0" role="button" aria-label="Show Statistics" title="Show Statistics">❮</div>
+
+<!-- Focus Task Panel — one task at a time (FOCUS_TASK_VIEW_PLAN Phase 1).
+     Carousel index 0 (left of #task-view); focus-view-only, gated behind
+     onboarding (D8). Hidden until Phase 2 registers it with the carousel.
+     Text content and ARIA labels are set by focusTaskPanel.js via getLabel(). -->
+<section id="focus-task-panel" class="focus-task-panel" role="tabpanel" inert>
+    <div class="focus-task-card">
+        <div id="focus-task-position" class="focus-task-position" aria-live="polite"></div>
+        <div id="focus-task-text" class="focus-task-text"></div>
+        <div class="focus-task-indicators">
+            <span id="focus-task-recurring-indicator" class="focus-task-indicator hidden" aria-hidden="true">🔁</span>
+            <span id="focus-task-due-indicator" class="focus-task-indicator hidden"></span>
+            <span id="focus-task-reset-indicator" class="focus-task-indicator hidden" role="img"></span>
+        </div>
+        <button type="button" id="focus-task-complete-btn" class="focus-task-complete-btn"></button>
+        <div class="focus-task-nav">
+            <button type="button" id="focus-task-prev-btn" class="focus-task-nav-btn"><span aria-hidden="true">‹</span></button>
+            <button type="button" id="focus-task-next-btn" class="focus-task-nav-btn"><span aria-hidden="true">›</span></button>
+        </div>
+        <div id="focus-task-alldone" class="focus-task-alldone hidden">
+            <div id="focus-task-alldone-text" class="focus-task-alldone-text"></div>
+            <div id="focus-task-alldone-hint" class="focus-task-alldone-hint"></div>
+        </div>
+        <div id="focus-task-celebration" class="focus-task-celebration hidden">
+            <div id="focus-task-celebration-text" class="focus-task-celebration-text"></div>
+        </div>
+    </div>
+</section>
+
+<div id="task-view" role="tabpanel" aria-labelledby="nav-dot-task-view">
+    <!-- Add task input bar — sibling of #task-card-group so it can be
+         independently dragged with #task-view as its positioned ancestor.
+         Default flex order keeps it visually above the routine card. -->
+    <div id="task-input-row" class="task-input hidden">
+        <label for="taskInput" class="visually-hidden">Add a new task</label>
+        <input type="text" id="taskInput" name="taskInput" class="taskInput" placeholder="Enter a task..." title="Type a task and press Add or Enter" tabindex="-1">
+        <button id="addTaskBtn" title="Add task" tabindex="-1">Add</button>
+    </div>
+    <div id="task-card-group" class="task-card-group">
+    <div class="task-card">
+        <div class="title-row">
+            <div id="mini-cycle-title" class="mini-cycle-title" contenteditable="true" role="textbox" aria-label="Routine name"></div>
+            <!-- Task Search Icon (hidden until 3+ tasks) -->
+            <div id="task-search-container" class="task-search-container" style="display: none;">
+                <button id="task-search-btn" class="task-search-btn" aria-label="Search tasks" title="Search tasks">
+                    <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <path d="m21 21-4.35-4.35"></path>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <div class="task-list-container">
+        <div id="task-filter-sort-row" class="task-filter-sort-row hidden">
+            <div class="filter-chip-group collapsed" role="group" aria-label="Filter tasks" aria-expanded="false">
+                <span class="chip-group-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                </span>
+                <button class="filter-chip active" data-filter="all" aria-pressed="true">All</button>
+                <button class="filter-chip" data-filter="incomplete" aria-pressed="false">Incomplete</button>
+                <button class="filter-chip" data-filter="completed" aria-pressed="false">Completed</button>
+                <button class="filter-chip" data-filter="priority" aria-pressed="false">Priority</button>
+                <button class="filter-chip" data-filter="due-date" aria-pressed="false">Due Date</button>
+                <button class="filter-chip" data-filter="recurring" aria-pressed="false">Recurring</button>
+            </div>
+            <div class="filter-sort-divider" aria-hidden="true"></div>
+            <div class="sort-chip-group" role="group" aria-label="Sort tasks">
+                <span class="chip-group-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/><line x1="6" y1="5" x2="18" y2="5"/></svg>
+                </span>
+                <button class="sort-chip active" data-sort="default" aria-pressed="true">Default</button>
+                <button class="sort-chip" data-sort="az" aria-pressed="false">A–Z</button>
+                <button class="sort-chip" data-sort="priority" aria-pressed="false">Priority</button>
+                <button class="sort-chip" data-sort="due-date" aria-pressed="false">Due Date</button>
+            </div>
+        </div>
+        <div id="task-search-input-row" class="task-search-input-row hidden">
+            <input type="text" id="task-search-input" class="task-search-input" placeholder="Search tasks..." aria-label="Search tasks">
+            <button id="task-search-clear" class="task-search-clear" aria-label="Clear search" title="Clear search">×</button>
+        </div>
+        <!-- Auto-uncheck status banner (per-routine; populated by dailyResetManager) -->
+        <button type="button" id="auto-uncheck-banner" class="auto-uncheck-banner hidden" aria-hidden="true" tabindex="-1">
+            <span class="auto-uncheck-banner-icon" aria-hidden="true">🕛</span>
+            <span id="auto-uncheck-banner-text" class="auto-uncheck-banner-text">All tasks auto-uncheck daily at 12:00 AM</span>
+        </button>
+        <ul id="taskList" class="task-list" aria-label="Task list" aria-live="polite" aria-relevant="additions removals"></ul>
+
+        <div id="empty-state" class="empty-state">
+            <div class="empty-state-icon">📋</div>
+            <div class="empty-state-text">Your routine is empty</div>
+            <!-- What the app IS, in one line, shown in every view/input-bar state.
+                 Vocabulary-neutral on purpose (no "task"/"habit" noun), so vocab
+                 themes need no override and the four hints below stay purely
+                 about the affordance. Hidden in the all-tasks-complete state. -->
+            <div class="empty-state-pitch">Build your routine once — then run it as many times as you like.</div>
+            <!-- Four hint variants: (home | focus) × (input bar hidden | visible).
+                 CSS in focus-mode.css shows exactly one via body.focus-mode ×
+                 body.input-bar-visible. The two focus variants are injected at
+                 runtime by focusMode.js. -->
+            <div class="empty-state-hint">Press the <strong>+</strong> button to open the task bar and add your first task</div>
+            <div class="empty-state-hint-visible">Type your first task in the bar above and press Add</div>
+            <!-- Completion variant: replaces the text + hint above when the routine
+                 HAS tasks and all of them are complete. With the completed-tasks
+                 dropdown on, finished tasks move out of #taskList, so the list is
+                 :empty and the onboarding copy above would tell someone who just
+                 finished their routine that they have no tasks. Filled at runtime
+                 by completedTasksManager.updateCount(); re-themed by themeManager. -->
+            <div class="empty-state-alldone-text">All tasks complete!</div>
+            <div class="empty-state-alldone-hint">Use the cycle button to start again</div>
+        </div>
+
+        <!-- Recurring Info Link - shown when recurring templates exist -->
+        <div id="recurring-info-link" class="recurring-info-link" role="button" tabindex="0" aria-label="View recurring settings"></div>
+
+        <!-- Onboarding Placeholder - shown before user creates/loads a routine -->
+        <div id="onboarding-placeholder" class="onboarding-placeholder">
+            <div class="onboarding-placeholder-icon">🚀</div>
+            <div class="onboarding-placeholder-title">Create your first routine</div>
+            <div class="onboarding-placeholder-text">or try a sample</div>
+        </div>
+
+        <div class="completed-tasks-section" id="completed-tasks-section">
+            <button type="button" class="completed-tasks-header clickable" id="completed-tasks-header" aria-expanded="false" aria-label="Toggle completed tasks">
+                ✓ Completed (<span id="completed-count">0</span>) <span class="toggle-icon">▼</span>
+            </button>
+            <ul id="completedTaskList" class="completed-task-list"></ul>
+        </div>
+    </div>
+    </div>
+    <div class="progress-container progress-container--routine">
+        <div id="progressBar" class="progress-bar" role="progressbar" aria-label="Routine progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+    </div>
+    </div>
+    <div id="complete-all-and-help-window-container" class="complete-all-and-help-window-container">
+  <button id="completeAll" class="complete-all-btn" title="Complete all checked tasks">Complete</button>
+    </div>
+    <div id="quick-actions-window" class="quick-actions-window">
+        <div class="quick-actions-header">
+            <button class="quick-actions-nav quick-actions-prev" title="Previous view" aria-label="Previous view">&#x25C0;</button>
+            <span class="quick-actions-title">Quick Actions</span>
+            <button class="quick-actions-nav quick-actions-next" title="Next view" aria-label="Next view">&#x25B6;</button>
+        </div>
+        <div class="quick-actions-slots" id="quick-actions-slots"></div>
+    </div>
+    <div id="help-window" class="help-window" role="status" aria-label="Help information">
+        <p></p>
+    </div>
+</div>
+
+    <section id="stats-panel" class="stats-panel" role="tabpanel" aria-labelledby="stats-header" inert>
+        <h2 id="stats-header">📊 Stats</h2>
+        <!-- Scroll surface lives HERE, not on the panel: the title above stays
+             pinned because it is outside the scroller (no sticky, no background
+             needed), and this wrapper's top mask fades content out before it
+             reaches the title — see .stats-panel-content in stats-panel.css. -->
+        <div class="stats-panel-content" id="stats-panel-content">
+        <div class="current-routine-status" id="current-routine-status">
+            <h3 class="clickable" tabindex="0" aria-expanded="true" aria-label="Toggle current routine details">
+                📋 Current Routine <span class="toggle-icon">▼</span>
+            </h3>
+            <p id="current-routine-name" class="current-routine-name"></p>
+            <div id="current-cycle-doughnut-container" class="current-cycle-doughnut-container">
+                <svg class="current-cycle-doughnut" viewBox="0 0 100 100" role="img" aria-label="Current cycle task completion">
+                    <!-- Background circle (gray) -->
+                    <circle class="doughnut-bg" cx="50" cy="50" r="40" fill="none" stroke="#e0e0e0" stroke-width="12"/>
+                    <!-- Progress circle (green) -->
+                    <circle id="current-cycle-doughnut-progress" class="doughnut-progress" cx="50" cy="50" r="40" fill="none" stroke="url(#gradient)" stroke-width="12" stroke-linecap="round" transform="rotate(-90 50 50)"/>
+                    <!-- Gradient definition -->
+                    <defs>
+                        <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                            <stop offset="0%" style="stop-color:#4caf50;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#66bb6a;stop-opacity:1" />
+                        </linearGradient>
+                    </defs>
+                    <!-- Center text (percentage) -->
+                    <text id="current-cycle-doughnut-text" x="50" y="55" text-anchor="middle" class="doughnut-text">0%</text>
+                </svg>
+            </div>
+            <p id="current-cycle-progress-text">0 of 0 Tasks Completed</p>
+            <p id="current-routine-cycle-count"><span id="per-cycle-count">0 Cycles Completed</span></p>
+            <p id="current-routine-cleared-count"><span id="per-routine-cleared">0 Cleared Tasks</span></p>
+        </div>
+                  <div class="theme-unlock-status" id="theme-unlock-status">
+            <h3 class="clickable" tabindex="0" aria-expanded="false" aria-label="Toggle milestone rewards">
+                🎯 Milestone Rewards <span class="toggle-icon">▼</span>
+              </h3>
+            <p id="theme-unlock-message">Loading...</p>
+            <p id="golden-unlock-message">Loading...</p>
+            <p id="game-unlock-message">Loading game unlock info...</p>
+          </div>
+        <div class="badge-container">
+            <button id="achievement-badges-btn" class="stats-feature-btn achievement-badges-btn">
+                🏅 Achievement Badges <span id="achievement-count-badge" class="achievement-count-badge">0</span>
+            </button>
+            <!-- Badge tooltips set dynamically from MILESTONES constant in statsPanel.js -->
+            <div class="badges">
+                <div class="badge" data-milestone="5" tabindex="0" role="button" aria-haspopup="dialog" aria-expanded="false" aria-label="5 cycles milestone">🔥</div>
+                <div class="badge" data-milestone="25" tabindex="-1" role="button" aria-haspopup="dialog" aria-expanded="false" aria-label="25 cycles milestone">💪</div>
+                <div class="badge" data-milestone="50" tabindex="-1" role="button" aria-haspopup="dialog" aria-expanded="false" aria-label="50 cycles milestone">📚</div>
+                <div class="badge" data-milestone="75" tabindex="-1" role="button" aria-haspopup="dialog" aria-expanded="false" aria-label="75 cycles milestone">🧹</div>
+                <div class="badge" data-milestone="100" tabindex="-1" role="button" aria-haspopup="dialog" aria-expanded="false" aria-label="100 cycles milestone">👑</div>
+            </div>
+          </div>
+
+        <div class="global-stats-container">
+            <p id="all-routines-count">All Routines: <span id="mini-cycle-count">0 Cycles</span></p>
+            <p id="milestone-progress-text">Loading...</p>
+            <div class="progress-container">
+                <div id="stats-progress-bar" class="progress-bar" role="progressbar" aria-label="Progress to next milestone" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+            </div>
+        </div>
+        </div>
+    </section>
+
+    
+</main>
+
+    
+</div>
+
+
+
+<div>
+<footer id="footer-container" role="contentinfo">
+<div id="undo-redo-buttons" class="undo-container">
+<button id="undo-btn" class="undo-redo-btn" hidden title="Undo last action">Undo</button>
+<button id="redo-btn" class="undo-redo-btn" hidden title="Redo last undone action">Redo</button>
+</div>
+
+<nav id="nav-dots" class="navigation-dots" role="tablist" aria-label="Page navigation">
+<!-- Focus task tab — index 0, focus-view-only (hidden outside focus mode via
+     CSS; unreachable during onboarding via the carousel's isEnabled gate).
+     data-tab-label seeds the focus-mode pill text; themeManager re-resolves
+     all three via getLabel() on every theme/routine change. -->
+<button class="dot focus-task-dot" role="tab" aria-selected="false" aria-controls="focus-task-panel" aria-label="Task view" title="Task view" data-tab-label="Task">
+<span class="visually-hidden">Task</span>
+</button>
+<button id="nav-dot-task-view" class="dot active" role="tab" aria-selected="true" aria-controls="task-view" aria-label="Tasks view" title="Tasks view" data-tab-label="Routine">
+<span class="visually-hidden">Tasks</span>
+</button>
+<button class="dot" role="tab" aria-selected="false" aria-controls="stats-panel" aria-label="Statistics view" title="Statistics view" data-tab-label="Stats">
+<span class="visually-hidden">Stats</span>
+</button>
+</nav>
+<ul class="footer-links">
+<li id="copyright">
+  &copy; <span data-copyright-year>2026</span> <a href="https://sparkincreations.com" target="_blank" rel="noopener noreferrer" title="Visit sparkinCreations website">sparkinCreations</a>
+  &bull;
+  <a href="pages/product.html" target="_blank" rel="noopener noreferrer" aria-label="miniCycle product page" title="Open the miniCycle product page">miniCycle<sup>™</sup></a>
+</li>
+<li class="footer-item"><a href="legal/privacy.html" target="_blank" rel="noopener noreferrer" title="Read the Privacy Policy">Privacy Policy</a></li>
+<li class="footer-item"><a href="legal/terms.html" target="_blank" rel="noopener noreferrer" title="Read the Terms of Service">Terms of Service</a></li>
+<li class="footer-item"><a href="legal/accessibility.html" target="_blank" rel="noopener noreferrer" title="Read the Accessibility Statement">Accessibility</a></li>
+<li class="footer-item"><a href="legal/security.html" target="_blank" rel="noopener noreferrer" title="Read the Security Policy">Security</a></li>
+<li class="footer-item"><button id="open-feedback-modal-footer" class="open-feedback-modal-footer" aria-label="Open feedback modal" title="Send us feedback">Feedback</button></li>
+</ul>
+</footer>
+      
+</div>
+
+
+
+
+<div id="live-region" aria-live="polite" style="position: absolute; left: -9999px; top: auto; width: 1px; height: 1px; overflow: hidden;"></div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     § FOOTER SCRIPTS — module entrypoint, about-version sync, late Lite fallback
+     Below the ES5-only region, so modern syntax is fine here. The late fallback
+     is the LAST safety net: it fires 16 s after load and redirects to Lite if the
+     feature gate flagged the browser, or if nothing ever set dataset.appBooted.
+     It must keep working even when everything above it failed — keep it small,
+     self-contained, and dependency-free.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+<!-- Boot File Split (Dec 2025): Load via entrypoint which orchestrates all boot files -->
+ <script type="module" src="main.js?v=0.1.0"></script>
+
+<script>
+// Sync About modal version with meta app-version
+document.addEventListener('DOMContentLoaded', function () {
+  var meta = document.querySelector('meta[name="app-version"]');
+  var aboutSpan = document.getElementById('about-version');
+  if (meta && aboutSpan) {
+    aboutSpan.textContent = meta.getAttribute('content') || '—';
+  }
+  // Populate SW version in About modal
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistration().then(function (reg) {
+      if (!reg || !reg.active) return;
+      var ch = new MessageChannel();
+      ch.port1.onmessage = function (evt) {
+        var swSpan = document.getElementById('about-sw-version');
+        if (swSpan && evt.data) {
+          swSpan.textContent = evt.data.version || 'Unknown';
+        }
+      };
+      try { reg.active.postMessage({ type: 'GET_VERSION' }, [ch.port2]); } catch (e) { /* SW channel unavailable — version display stays 'Unknown' */ }
+    }).catch(function(){ /* no active SW — this only feeds the version display */ });
+  }
+
+  // "Check for Updates" (settings + main menu) is wired by modules/utils/updateCheck.js.
+});
+</script>
+   <script>
+// Late fallback: only redirect if feature gate failed OR full app never even started booting.
+(function () {
+  // Honour BOTH forced-full signals the feature gate honours. Lite's "Try Full
+  // Version" sets the storage flag and navigates with force=1, never mode=full,
+  // so reading only the URL here let the gate admit those users and then
+  // bounced every one of them back to Lite 16 s later as 'fallback' — on every
+  // load (Sep 2026). The 60 s load-timeout net above still catches a boot that
+  // genuinely never finishes, forced or not.
+  var forcedFull = (location.search.indexOf('mode=full') !== -1);
+  try {
+    forcedFull = forcedFull || localStorage.getItem('miniCycleForceFullVersion') === 'true';
+  } catch (e) { /* storage unavailable — keep the URL-derived value */ }
+  if (forcedFull) return; // user forced full
+  setTimeout(function () {
+    var needsLite = !!window.__FeatureGateNeedsLite; // default false if gate script didn't run
+    if (needsLite) {
+      location.replace('./lite/miniCycle-lite.html?mode=lite&src=fallback');
+      return;
+    }
+    // If full app has begun booting, don't redirect even if AppReady isn't set yet (e.g., onboarding).
+    // Uses dataset attribute instead of window.* for zero-globals compliance
+    if (document.documentElement.dataset.appBooted === 'true') {
+      console.warn('Full mode boot started; skipping lite fallback.');
+      return;
+    }
+    // Last resort: no boot detected at all.
+    location.replace('./lite/miniCycle-lite.html?mode=lite&src=no-boot');
+  }, 16000);
+})();
+</script>
+
+
+</body>
+
+</html>
+
+
+
+
+
+
+
+
+
+
+
+

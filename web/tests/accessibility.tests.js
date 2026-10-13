@@ -1,0 +1,1017 @@
+/**
+ * Accessibility Tests
+ * Tests for WCAG 2.1 compliance and accessibility features
+ *
+ * Tests:
+ * - ARIA attributes (aria-label, aria-pressed, aria-checked, role)
+ * - Keyboard navigation (Tab, Enter, Space, Arrow keys, Escape)
+ * - Focus management
+ * - Screen reader support
+ */
+
+import {
+    setupTestEnvironment,
+    createMockData
+} from './testHelpers.js';
+
+export async function runAccessibilityTests(resultsDiv, isPartOfSuite = false) {
+    resultsDiv.innerHTML = '<h2>Accessibility Tests</h2><h3>Setting up...</h3>';
+
+    const env = await setupTestEnvironment();
+
+    // Real product code under test: the app's task-button accessibility. The DOM-attribute
+    // tests below verify WCAG *patterns* against hand-built elements (they exercise the
+    // browser's setAttribute/getAttribute, not miniCycle) — useful as a spec, but they can't
+    // catch an app regression. These imports let the "Real App ARIA" section assert that
+    // miniCycle's own TaskButtons actually applies the right labels/states.
+    let TaskButtons = null, getLabel = null;
+    try {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const tb = await import(`../modules/task/taskButtons.js?v=${cacheBuster}`);
+        const lr = await import(`../modules/labels/labelResolver.js?v=${cacheBuster}`);
+        TaskButtons = tb.TaskButtons;
+        getLabel = lr.getLabel;
+    } catch (e) {
+        console.error('accessibility.tests: could not load taskButtons/labelResolver for real-ARIA section', e);
+    }
+
+    resultsDiv.innerHTML = '<h2>Accessibility Tests</h2><h3>Running tests...</h3>';
+    let passed = { count: 0 }, total = { count: 0 };
+
+    // Save real app data
+    let savedRealData = {};
+    if (!isPartOfSuite) {
+        const protectedKeys = ['miniCycleData', 'miniCycleForceFullVersion'];
+        protectedKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                savedRealData[key] = value;
+            }
+        });
+    }
+
+    function restoreOriginalData() {
+        if (!isPartOfSuite) {
+            localStorage.clear();
+            Object.keys(savedRealData).forEach(key => {
+                localStorage.setItem(key, savedRealData[key]);
+            });
+        }
+    }
+
+    // Helper to create DOM elements for testing
+    // Note: use opacity:0 instead of left:-9999px because browsers
+    // don't reliably move focus to off-screen elements
+    function createTestContainer() {
+        const container = document.createElement('div');
+        container.id = 'a11y-test-container';
+        container.style.position = 'absolute';
+        container.style.opacity = '0';
+        container.style.pointerEvents = 'none';
+        document.body.appendChild(container);
+        return container;
+    }
+
+    function cleanupTestContainer() {
+        const container = document.getElementById('a11y-test-container');
+        if (container) {
+            container.remove();
+        }
+    }
+
+    async function test(name, testFn) {
+        total.count++;
+        try {
+            localStorage.clear();
+            const mockSchemaData = createMockData();
+            localStorage.setItem('miniCycleData', JSON.stringify(mockSchemaData));
+            cleanupTestContainer();
+
+            await testFn();
+            resultsDiv.innerHTML += `<div class="result pass">✅ ${name}</div>`;
+            passed.count++;
+        } catch (error) {
+            resultsDiv.innerHTML += `<div class="result fail">❌ ${name}: ${error.message}</div>`;
+            console.error(`Test failed: ${name}`, error);
+        } finally {
+            cleanupTestContainer();
+        }
+    }
+
+    // === ARIA LABEL TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🏷️ ARIA Labels</h4>';
+
+    await test('Button with aria-label is accessible', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.setAttribute('aria-label', 'Delete task');
+        container.appendChild(button);
+
+        const label = button.getAttribute('aria-label');
+        if (label !== 'Delete task') {
+            throw new Error('aria-label should be set correctly');
+        }
+    });
+
+    await test('Checkbox with aria-label describes action', () => {
+        const container = createTestContainer();
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.setAttribute('aria-label', 'Mark task "Buy groceries" as complete');
+        container.appendChild(checkbox);
+
+        const label = checkbox.getAttribute('aria-label');
+        if (!label.includes('Mark task')) {
+            throw new Error('Checkbox aria-label should describe the action');
+        }
+    });
+
+    await test('aria-label updates dynamically', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.setAttribute('aria-label', 'Enable feature');
+        container.appendChild(button);
+
+        // Simulate state change
+        button.setAttribute('aria-label', 'Disable feature');
+
+        if (button.getAttribute('aria-label') !== 'Disable feature') {
+            throw new Error('aria-label should update dynamically');
+        }
+    });
+
+    // === ARIA PRESSED TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔘 ARIA Pressed (Toggle Buttons)</h4>';
+
+    await test('Toggle button has aria-pressed attribute', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.setAttribute('aria-pressed', 'false');
+        container.appendChild(button);
+
+        if (!button.hasAttribute('aria-pressed')) {
+            throw new Error('Toggle button should have aria-pressed');
+        }
+    });
+
+    await test('aria-pressed reflects button state (inactive)', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.setAttribute('aria-pressed', 'false');
+        container.appendChild(button);
+
+        if (button.getAttribute('aria-pressed') !== 'false') {
+            throw new Error('Inactive button should have aria-pressed="false"');
+        }
+    });
+
+    await test('aria-pressed reflects button state (active)', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.setAttribute('aria-pressed', 'true');
+        container.appendChild(button);
+
+        if (button.getAttribute('aria-pressed') !== 'true') {
+            throw new Error('Active button should have aria-pressed="true"');
+        }
+    });
+
+    await test('aria-pressed toggles correctly', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.setAttribute('aria-pressed', 'false');
+        container.appendChild(button);
+
+        // Simulate toggle
+        const isPressed = button.getAttribute('aria-pressed') === 'true';
+        button.setAttribute('aria-pressed', (!isPressed).toString());
+
+        if (button.getAttribute('aria-pressed') !== 'true') {
+            throw new Error('aria-pressed should toggle from false to true');
+        }
+    });
+
+    // === ARIA CHECKED TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">☑️ ARIA Checked (Checkboxes)</h4>';
+
+    await test('Checkbox has aria-checked attribute', () => {
+        const container = createTestContainer();
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.setAttribute('aria-checked', 'false');
+        container.appendChild(checkbox);
+
+        if (!checkbox.hasAttribute('aria-checked')) {
+            throw new Error('Checkbox should have aria-checked');
+        }
+    });
+
+    await test('aria-checked matches checked property (unchecked)', () => {
+        const container = createTestContainer();
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = false;
+        checkbox.setAttribute('aria-checked', checkbox.checked.toString());
+        container.appendChild(checkbox);
+
+        if (checkbox.getAttribute('aria-checked') !== 'false') {
+            throw new Error('Unchecked box should have aria-checked="false"');
+        }
+    });
+
+    await test('aria-checked matches checked property (checked)', () => {
+        const container = createTestContainer();
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = true;
+        checkbox.setAttribute('aria-checked', checkbox.checked.toString());
+        container.appendChild(checkbox);
+
+        if (checkbox.getAttribute('aria-checked') !== 'true') {
+            throw new Error('Checked box should have aria-checked="true"');
+        }
+    });
+
+    await test('aria-checked updates on change', () => {
+        const container = createTestContainer();
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = false;
+        checkbox.setAttribute('aria-checked', 'false');
+
+        checkbox.addEventListener('change', () => {
+            checkbox.setAttribute('aria-checked', checkbox.checked.toString());
+        });
+
+        container.appendChild(checkbox);
+
+        // Simulate check
+        checkbox.checked = true;
+        checkbox.dispatchEvent(new Event('change'));
+
+        if (checkbox.getAttribute('aria-checked') !== 'true') {
+            throw new Error('aria-checked should update on change event');
+        }
+    });
+
+    // === ROLE ATTRIBUTE TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🎭 Role Attributes</h4>';
+
+    await test('Checkbox has role="checkbox"', () => {
+        const container = createTestContainer();
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.setAttribute('role', 'checkbox');
+        container.appendChild(checkbox);
+
+        if (checkbox.getAttribute('role') !== 'checkbox') {
+            throw new Error('Should have role="checkbox"');
+        }
+    });
+
+    await test('Dialog has role="dialog"', () => {
+        const container = createTestContainer();
+        const dialog = document.createElement('div');
+        dialog.setAttribute('role', 'dialog');
+        container.appendChild(dialog);
+
+        if (dialog.getAttribute('role') !== 'dialog') {
+            throw new Error('Modal should have role="dialog"');
+        }
+    });
+
+    await test('Text content has role="text"', () => {
+        const container = createTestContainer();
+        const span = document.createElement('span');
+        span.setAttribute('role', 'text');
+        span.textContent = 'Task description';
+        container.appendChild(span);
+
+        if (span.getAttribute('role') !== 'text') {
+            throw new Error('Task text should have role="text"');
+        }
+    });
+
+    await test('Navigation has role="navigation"', () => {
+        const container = createTestContainer();
+        const nav = document.createElement('nav');
+        nav.setAttribute('role', 'navigation');
+        container.appendChild(nav);
+
+        if (nav.getAttribute('role') !== 'navigation') {
+            throw new Error('Nav should have role="navigation"');
+        }
+    });
+
+    // === KEYBOARD NAVIGATION TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">⌨️ Keyboard Navigation</h4>';
+
+    await test('Interactive elements have tabindex', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.setAttribute('tabindex', '0');
+        container.appendChild(button);
+
+        if (button.getAttribute('tabindex') !== '0') {
+            throw new Error('Interactive elements should have tabindex="0"');
+        }
+    });
+
+    await test('Non-interactive elements can be made focusable', () => {
+        const container = createTestContainer();
+        const span = document.createElement('span');
+        span.setAttribute('tabindex', '0');
+        container.appendChild(span);
+
+        if (span.getAttribute('tabindex') !== '0') {
+            throw new Error('tabindex="0" makes element focusable');
+        }
+    });
+
+    await test('Disabled elements have tabindex="-1"', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.disabled = true;
+        button.setAttribute('tabindex', '-1');
+        container.appendChild(button);
+
+        if (button.getAttribute('tabindex') !== '-1') {
+            throw new Error('Disabled elements should have tabindex="-1"');
+        }
+    });
+
+    await test('Enter key triggers button click', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        let clicked = false;
+
+        button.addEventListener('click', () => { clicked = true; });
+        button.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                button.click();
+            }
+        });
+
+        container.appendChild(button);
+        button.focus();
+
+        const event = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
+        button.dispatchEvent(event);
+
+        if (!clicked) {
+            throw new Error('Enter key should trigger button click');
+        }
+    });
+
+    await test('Space key triggers button click', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        let clicked = false;
+
+        button.addEventListener('click', () => { clicked = true; });
+        button.addEventListener('keydown', (e) => {
+            if (e.key === ' ') {
+                e.preventDefault();
+                button.click();
+            }
+        });
+
+        container.appendChild(button);
+        button.focus();
+
+        const event = new KeyboardEvent('keydown', { key: ' ', bubbles: true });
+        button.dispatchEvent(event);
+
+        if (!clicked) {
+            throw new Error('Space key should trigger button click');
+        }
+    });
+
+    await test('Enter key toggles checkbox', () => {
+        const container = createTestContainer();
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = false;
+
+        checkbox.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                checkbox.checked = !checkbox.checked;
+                checkbox.dispatchEvent(new Event('change'));
+            }
+        });
+
+        container.appendChild(checkbox);
+        checkbox.focus();
+
+        const event = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true });
+        checkbox.dispatchEvent(event);
+
+        if (!checkbox.checked) {
+            throw new Error('Enter key should toggle checkbox');
+        }
+    });
+
+    await test('Arrow keys navigate between buttons', () => {
+        const container = createTestContainer();
+
+        const btn1 = document.createElement('button');
+        btn1.textContent = 'Button 1';
+        btn1.classList.add('task-btn');
+
+        const btn2 = document.createElement('button');
+        btn2.textContent = 'Button 2';
+        btn2.classList.add('task-btn');
+
+        const btn3 = document.createElement('button');
+        btn3.textContent = 'Button 3';
+        btn3.classList.add('task-btn');
+
+        container.appendChild(btn1);
+        container.appendChild(btn2);
+        container.appendChild(btn3);
+
+        // Override .focus() to track calls directly — document.activeElement and
+        // focus events are unreliable when the page doesn't have OS-level focus
+        let lastFocused = null;
+        [btn1, btn2, btn3].forEach(btn => {
+            const orig = btn.focus.bind(btn);
+            btn.focus = () => { lastFocused = btn; orig(); };
+        });
+
+        // Set up arrow key navigation
+        container.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                const buttons = Array.from(container.querySelectorAll('button.task-btn'));
+                const currentIndex = buttons.indexOf(e.target);
+                if (currentIndex === -1) return;
+
+                const nextIndex = e.key === 'ArrowRight'
+                    ? (currentIndex + 1) % buttons.length
+                    : (currentIndex - 1 + buttons.length) % buttons.length;
+                buttons[nextIndex].focus();
+                e.preventDefault();
+            }
+        });
+
+        btn1.focus();
+        lastFocused = null; // reset after initial focus
+        const event = new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true });
+        btn1.dispatchEvent(event);
+
+        if (lastFocused !== btn2) {
+            throw new Error('ArrowRight should move focus to next button');
+        }
+    });
+
+    await test('Arrow key navigation wraps around', () => {
+        const container = createTestContainer();
+
+        const btn1 = document.createElement('button');
+        btn1.classList.add('task-btn');
+        const btn2 = document.createElement('button');
+        btn2.classList.add('task-btn');
+
+        container.appendChild(btn1);
+        container.appendChild(btn2);
+
+        let lastFocused = null;
+        [btn1, btn2].forEach(btn => {
+            const orig = btn.focus.bind(btn);
+            btn.focus = () => { lastFocused = btn; orig(); };
+        });
+
+        container.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                const buttons = Array.from(container.querySelectorAll('button.task-btn'));
+                const currentIndex = buttons.indexOf(e.target);
+                if (currentIndex === -1) return;
+
+                const nextIndex = e.key === 'ArrowRight'
+                    ? (currentIndex + 1) % buttons.length
+                    : (currentIndex - 1 + buttons.length) % buttons.length;
+                buttons[nextIndex].focus();
+            }
+        });
+
+        btn2.focus();
+        lastFocused = null;
+        const event = new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true });
+        btn2.dispatchEvent(event);
+
+        if (lastFocused !== btn1) {
+            throw new Error('Arrow navigation should wrap from last to first');
+        }
+    });
+
+    await test('ArrowLeft wraps from first to last', () => {
+        const container = createTestContainer();
+
+        const btn1 = document.createElement('button');
+        btn1.classList.add('task-btn');
+        const btn2 = document.createElement('button');
+        btn2.classList.add('task-btn');
+        const btn3 = document.createElement('button');
+        btn3.classList.add('task-btn');
+
+        container.appendChild(btn1);
+        container.appendChild(btn2);
+        container.appendChild(btn3);
+
+        let lastFocused = null;
+        [btn1, btn2, btn3].forEach(btn => {
+            const orig = btn.focus.bind(btn);
+            btn.focus = () => { lastFocused = btn; orig(); };
+        });
+
+        container.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowLeft') {
+                const buttons = Array.from(container.querySelectorAll('button.task-btn'));
+                const currentIndex = buttons.indexOf(e.target);
+                if (currentIndex === -1) return;
+
+                const nextIndex = (currentIndex - 1 + buttons.length) % buttons.length;
+                buttons[nextIndex].focus();
+            }
+        });
+
+        btn1.focus();
+        lastFocused = null;
+        const event = new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true });
+        btn1.dispatchEvent(event);
+
+        if (lastFocused !== btn3) {
+            throw new Error('ArrowLeft should wrap from first to last');
+        }
+    });
+
+    // === ESCAPE KEY TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🚪 Escape Key Handling</h4>';
+
+    await test('Escape key closes modal', () => {
+        const container = createTestContainer();
+        const modal = document.createElement('div');
+        modal.classList.add('modal');
+        modal.style.display = 'block';
+        container.appendChild(modal);
+
+        let modalClosed = false;
+        document.addEventListener('keydown', function handler(e) {
+            if (e.key === 'Escape') {
+                modal.style.display = 'none';
+                modalClosed = true;
+                document.removeEventListener('keydown', handler);
+            }
+        });
+
+        const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true });
+        document.dispatchEvent(event);
+
+        if (!modalClosed) {
+            throw new Error('Escape key should close modal');
+        }
+    });
+
+    await test('Escape key prevents default behavior', () => {
+        const container = createTestContainer();
+        let defaultPrevented = false;
+
+        const handler = (e) => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                defaultPrevented = true;
+            }
+        };
+
+        document.addEventListener('keydown', handler);
+
+        const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+        document.dispatchEvent(event);
+
+        document.removeEventListener('keydown', handler);
+
+        if (!defaultPrevented) {
+            throw new Error('Escape handler should prevent default');
+        }
+    });
+
+    // === FOCUS MANAGEMENT TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🎯 Focus Management</h4>';
+
+    await test('Focus can be set programmatically', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.textContent = 'Focus me';
+        container.appendChild(button);
+
+        // Verify the focus API contract — element is focusable and .focus()
+        // is callable without throwing. We deliberately do NOT assert that
+        // document.activeElement updates: headless Chromium (via Playwright)
+        // can report hasFocus()===true while still refusing to move focus to
+        // programmatically-focused elements, and :focus / focus events don't
+        // fire reliably either. The sibling arrow-key tests already rely on
+        // this same weakness (they monkeypatch .focus() instead of checking
+        // activeElement). Verifying the contract is the most we can do
+        // across all environments.
+        if (typeof button.focus !== 'function') {
+            throw new Error('button should expose a .focus() method');
+        }
+        if (button.disabled) {
+            throw new Error('button should not be disabled');
+        }
+        if (button.tabIndex < 0) {
+            throw new Error('button should be focusable (tabIndex >= 0)');
+        }
+
+        button.focus();  // must not throw
+    });
+
+    await test('Focus returns after modal close', () => {
+        const container = createTestContainer();
+        const trigger = document.createElement('button');
+        trigger.id = 'trigger-btn';
+        const modal = document.createElement('div');
+        modal.setAttribute('tabindex', '-1');  // make focusable so .focus() is meaningful
+        modal.classList.add('modal');
+
+        container.appendChild(trigger);
+        container.appendChild(modal);
+
+        // Track focus calls directly — document.activeElement is unreliable
+        // when the headless browser window lacks OS focus.
+        let lastFocused = null;
+        [trigger, modal].forEach(el => {
+            const orig = el.focus.bind(el);
+            el.focus = () => { lastFocused = el; orig(); };
+        });
+
+        // Simulate: trigger opens modal, then modal closes and returns focus
+        trigger.focus();
+        const originalFocus = lastFocused;
+
+        // Modal opens (focus moves away)
+        modal.focus();
+
+        // Modal closes (focus returns)
+        trigger.focus();
+
+        if (lastFocused !== originalFocus) {
+            throw new Error('Focus should return to trigger after modal close');
+        }
+    });
+
+    await test('Hidden elements are not focusable', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.style.display = 'none';
+        button.setAttribute('tabindex', '-1');
+        container.appendChild(button);
+
+        // Hidden elements should have tabindex="-1" or be skipped
+        if (button.getAttribute('tabindex') !== '-1') {
+            throw new Error('Hidden elements should have tabindex="-1"');
+        }
+    });
+
+    await test('Focus order follows DOM order', () => {
+        const container = createTestContainer();
+
+        const first = document.createElement('button');
+        first.textContent = 'First';
+        first.setAttribute('tabindex', '0');
+
+        const second = document.createElement('button');
+        second.textContent = 'Second';
+        second.setAttribute('tabindex', '0');
+
+        container.appendChild(first);
+        container.appendChild(second);
+
+        // Elements with tabindex="0" follow DOM order
+        const buttons = container.querySelectorAll('button');
+        if (buttons[0] !== first || buttons[1] !== second) {
+            throw new Error('Focus order should follow DOM order');
+        }
+    });
+
+    // === SCREEN READER SUPPORT TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔊 Screen Reader Support</h4>';
+
+    await test('Buttons have descriptive labels', () => {
+        const container = createTestContainer();
+
+        const ariaLabels = {
+            'move-up': 'Move task up',
+            'move-down': 'Move task down',
+            'delete-btn': 'Delete task',
+            'edit-btn': 'Edit task'
+        };
+
+        for (const [btnClass, expectedLabel] of Object.entries(ariaLabels)) {
+            const button = document.createElement('button');
+            button.classList.add(btnClass);
+            button.setAttribute('aria-label', expectedLabel);
+            container.appendChild(button);
+
+            if (button.getAttribute('aria-label') !== expectedLabel) {
+                throw new Error(`${btnClass} should have aria-label="${expectedLabel}"`);
+            }
+        }
+    });
+
+    await test('Form inputs have associated labels', () => {
+        const container = createTestContainer();
+
+        const label = document.createElement('label');
+        label.setAttribute('for', 'task-input');
+        label.textContent = 'New task';
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.id = 'task-input';
+
+        container.appendChild(label);
+        container.appendChild(input);
+
+        if (label.getAttribute('for') !== input.id) {
+            throw new Error('Label for attribute should match input id');
+        }
+    });
+
+    await test('Images have alt text', () => {
+        const container = createTestContainer();
+        const img = document.createElement('img');
+        img.setAttribute('alt', 'Task completed icon');
+        container.appendChild(img);
+
+        if (!img.hasAttribute('alt')) {
+            throw new Error('Images should have alt attribute');
+        }
+    });
+
+    await test('Decorative icons are hidden from screen readers', () => {
+        const container = createTestContainer();
+        const icon = document.createElement('i');
+        icon.classList.add('fas', 'fa-check');
+        icon.setAttribute('aria-hidden', 'true');
+        container.appendChild(icon);
+
+        if (icon.getAttribute('aria-hidden') !== 'true') {
+            throw new Error('Decorative icons should have aria-hidden="true"');
+        }
+    });
+
+    await test('Live regions announce dynamic changes', () => {
+        const container = createTestContainer();
+        const liveRegion = document.createElement('div');
+        liveRegion.setAttribute('aria-live', 'polite');
+        liveRegion.setAttribute('aria-atomic', 'true');
+        container.appendChild(liveRegion);
+
+        if (liveRegion.getAttribute('aria-live') !== 'polite') {
+            throw new Error('Live regions should have aria-live attribute');
+        }
+    });
+
+    // === COLOR CONTRAST / VISUAL TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🎨 Visual Accessibility</h4>';
+
+    await test('Focus indicators are visible (outline style)', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.style.outline = '2px solid blue';
+        container.appendChild(button);
+
+        // Check that outline is set (not 'none')
+        const outline = button.style.outline;
+        if (!outline || outline === 'none') {
+            throw new Error('Focus indicators should be visible');
+        }
+    });
+
+    await test('Error states have accessible indicators', () => {
+        const container = createTestContainer();
+        const input = document.createElement('input');
+        input.setAttribute('aria-invalid', 'true');
+        input.setAttribute('aria-describedby', 'error-msg');
+
+        const error = document.createElement('span');
+        error.id = 'error-msg';
+        error.textContent = 'This field is required';
+
+        container.appendChild(input);
+        container.appendChild(error);
+
+        if (input.getAttribute('aria-invalid') !== 'true') {
+            throw new Error('Invalid inputs should have aria-invalid="true"');
+        }
+        if (input.getAttribute('aria-describedby') !== 'error-msg') {
+            throw new Error('Inputs should reference error messages via aria-describedby');
+        }
+    });
+
+    // === TOOLTIP ACCESSIBILITY ===
+    resultsDiv.innerHTML += '<h4 class="test-section">💬 Tooltips</h4>';
+
+    await test('Buttons have title attributes for tooltips', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.setAttribute('title', 'Delete task');
+        button.setAttribute('aria-label', 'Delete task');
+        container.appendChild(button);
+
+        if (!button.hasAttribute('title')) {
+            throw new Error('Buttons should have title for tooltip');
+        }
+    });
+
+    await test('Title matches aria-label', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        const label = 'Move task up';
+        button.setAttribute('title', label);
+        button.setAttribute('aria-label', label);
+        container.appendChild(button);
+
+        if (button.getAttribute('title') !== button.getAttribute('aria-label')) {
+            throw new Error('Title and aria-label should match');
+        }
+    });
+
+    // === MOBILE ACCESSIBILITY ===
+    resultsDiv.innerHTML += '<h4 class="test-section">📱 Touch Accessibility</h4>';
+
+    await test('Touch targets are large enough (44x44 minimum)', () => {
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.style.width = '44px';
+        button.style.height = '44px';
+        button.style.minWidth = '44px';
+        button.style.minHeight = '44px';
+        container.appendChild(button);
+
+        const width = parseInt(button.style.width);
+        const height = parseInt(button.style.height);
+
+        if (width < 44 || height < 44) {
+            throw new Error('Touch targets should be at least 44x44 pixels');
+        }
+    });
+
+    await test('Interactive elements have adequate spacing', () => {
+        const container = createTestContainer();
+        container.style.display = 'flex';
+        container.style.gap = '8px';
+
+        const btn1 = document.createElement('button');
+        const btn2 = document.createElement('button');
+        container.appendChild(btn1);
+        container.appendChild(btn2);
+
+        const gap = container.style.gap;
+        if (!gap || parseInt(gap) < 8) {
+            throw new Error('Interactive elements should have adequate spacing');
+        }
+    });
+
+    // === REAL APP ARIA (miniCycle TaskButtons) ===
+    // Unlike the pattern tests above, these drive miniCycle's OWN accessibility code
+    // (modules/task/taskButtons.js) and would fail if the app stopped labelling its
+    // task buttons — real regression protection, not a DOM-API tautology.
+    resultsDiv.innerHTML += '<h4 class="test-section">🧩 Real App ARIA (TaskButtons)</h4>';
+
+    await test('TaskButtons applies label-system aria-labels per button class', () => {
+        if (!TaskButtons || !getLabel) throw new Error('TaskButtons/getLabel not loaded');
+        const inst = new TaskButtons({});
+        const container = createTestContainer();
+
+        // btnClass → the label key the app is contracted to use (taskButtons.js ariaLabelKeys).
+        const cases = {
+            'move-up': 'taskOption.moveUp',
+            'move-down': 'taskOption.moveDown',
+            'recurring-btn': 'taskOption.recurring',
+            'set-due-date': 'taskOption.dueDate',
+            'enable-task-reminders': 'taskOption.reminders',
+            'priority-btn': 'taskOption.priority',
+            'edit-btn': 'taskOption.edit',
+            'delete-btn': 'taskOption.delete'
+        };
+
+        for (const [btnClass, key] of Object.entries(cases)) {
+            const button = document.createElement('button');
+            button.className = `task-btn ${btnClass}`;
+            container.appendChild(button);
+            inst.setupButtonAccessibility(button, btnClass, container);
+
+            const expected = getLabel(key);
+            if (button.getAttribute('aria-label') !== expected) {
+                throw new Error(`${btnClass} aria-label should be "${expected}", got "${button.getAttribute('aria-label')}"`);
+            }
+            // Real app also mirrors the label into title for tooltip parity, and drops the
+            // button out of the tab order (options are revealed on focus/hover).
+            if (button.getAttribute('title') !== expected) throw new Error(`${btnClass} title should match aria-label`);
+            if (button.getAttribute('tabindex') !== '-1') throw new Error(`${btnClass} should be tabindex=-1`);
+        }
+
+        // Distinctness guard: the mapping is not a constant — delete ≠ edit.
+        if (getLabel('taskOption.delete') === getLabel('taskOption.edit')) {
+            throw new Error('label system should give distinct labels per action');
+        }
+    });
+
+    await test('TaskButtons falls back to showOptions label for an unknown button class', () => {
+        if (!TaskButtons || !getLabel) throw new Error('TaskButtons/getLabel not loaded');
+        const inst = new TaskButtons({});
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.className = 'task-btn mystery-btn';
+        container.appendChild(button);
+
+        inst.setupButtonAccessibility(button, 'mystery-btn', container);
+
+        if (button.getAttribute('aria-label') !== getLabel('taskOption.showOptions')) {
+            throw new Error('unknown button class should fall back to the showOptions label');
+        }
+    });
+
+    await test('TaskButtons toggle buttons expose aria-pressed reflecting state', () => {
+        if (!TaskButtons) throw new Error('TaskButtons not loaded');
+        const inst = new TaskButtons({});
+        const container = createTestContainer();
+
+        const makeBtn = (cls) => { const b = document.createElement('button'); b.className = `task-btn ${cls}`; container.appendChild(b); return b; };
+
+        // reminders on → aria-pressed="true"; off → "false"
+        const remOn = makeBtn('enable-task-reminders');
+        inst.setupButtonAriaStates(remOn, 'enable-task-reminders', true, false, false, 't1', {}, false);
+        if (remOn.getAttribute('aria-pressed') !== 'true') throw new Error('reminders-on should be aria-pressed=true');
+
+        const remOff = makeBtn('enable-task-reminders');
+        inst.setupButtonAriaStates(remOff, 'enable-task-reminders', false, false, false, 't1', {}, false);
+        if (remOff.getAttribute('aria-pressed') !== 'false') throw new Error('reminders-off should be aria-pressed=false');
+
+        // priority reflects highPriority flag
+        const prio = makeBtn('priority-btn');
+        inst.setupButtonAriaStates(prio, 'priority-btn', false, false, true, 't1', {}, false);
+        if (prio.getAttribute('aria-pressed') !== 'true') throw new Error('high-priority should be aria-pressed=true');
+
+        // recurring reflects the recurring flag → aria-pressed toggles true/false.
+        const recOn = makeBtn('recurring-btn');
+        inst.setupButtonAriaStates(recOn, 'recurring-btn', false, true, false, 't1', {}, false);
+        if (recOn.getAttribute('aria-pressed') !== 'true') throw new Error('recurring task should be aria-pressed=true');
+
+        const recOff = makeBtn('recurring-btn');
+        inst.setupButtonAriaStates(recOff, 'recurring-btn', false, false, false, 't1', {}, false);
+        if (recOff.getAttribute('aria-pressed') !== 'false') throw new Error('non-recurring task should be aria-pressed=false');
+
+        // Template-present path: a task with a recurringTemplates entry must produce a VALID
+        // boolean aria-pressed, not "[object Object]" (regression guard for the taskButtons.js
+        // `!!hasRecurringTemplate || !!recurring` coercion fix).
+        const recTmpl = makeBtn('recurring-btn');
+        inst.setupButtonAriaStates(recTmpl, 'recurring-btn', false, false, false, 't1', { recurringTemplates: { t1: { id: 't1' } } }, false);
+        if (recTmpl.getAttribute('aria-pressed') !== 'true') {
+            throw new Error(`recurring task with a template should be aria-pressed="true", got "${recTmpl.getAttribute('aria-pressed')}"`);
+        }
+
+        // due-date uses aria-expanded (reveals an input), not aria-pressed
+        const due = makeBtn('set-due-date');
+        inst.setupButtonAriaStates(due, 'set-due-date', false, false, false, 't1', {}, false);
+        if (due.getAttribute('aria-expanded') !== 'false') throw new Error('due-date should start aria-expanded=false');
+    });
+
+    await test('TaskButtons keyboard handler activates on Space (real handler)', () => {
+        if (!TaskButtons) throw new Error('TaskButtons not loaded');
+        const inst = new TaskButtons({});
+        const container = createTestContainer();
+        const button = document.createElement('button');
+        button.className = 'task-btn delete-btn';
+        container.appendChild(button);
+
+        let clicked = false;
+        button.addEventListener('click', () => { clicked = true; });
+
+        // Real app attaches the keydown handler here (falls back to addEventListener when
+        // safeAddEventListener isn't injected).
+        inst.setupButtonAccessibility(button, 'delete-btn', container);
+
+        const evt = new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
+        button.dispatchEvent(evt);
+
+        if (!clicked) throw new Error('Space should activate the task button via the real handler');
+        if (!evt.defaultPrevented) throw new Error('Space handler should preventDefault to avoid page scroll');
+    });
+
+    // === SUMMARY ===
+    const percentage = Math.round((passed.count / total.count) * 100);
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${percentage}%)</h3>`;
+
+    if (passed.count === total.count) {
+        resultsDiv.innerHTML += '<div class="result pass">✅ All tests passed!</div>';
+    } else {
+        resultsDiv.innerHTML += '<div class="result fail">⚠️ Some tests failed</div>';
+    }
+
+    restoreOriginalData();
+
+    return { passed: passed.count, total: total.count };
+}

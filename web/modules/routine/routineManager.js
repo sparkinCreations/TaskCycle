@@ -1,0 +1,1058 @@
+/**
+ * @file routineManager.js (DI-Pure)
+ * @description Routine creation and management functionality for miniCycle
+ * @module modules/routineManager
+ * @pattern Resilient Constructor 🛡️
+ *
+ * Handles:
+ * - New cycle creation with modal UI
+ * - Sample cycle preloading
+ * - Fallback cycle creation
+ * - Duplicate name handling
+ * - Onboarding integration
+ */
+
+import { createDIModule, optional } from '../core/diBase.js';
+import { DOM_IDS, DOM_SELECTORS, DOM_CLASSES, APP_VERSION, UI_TIMEOUTS, LIMITS } from '../core/constants.js';
+import { getLabel } from '../labels/labelResolver.js';
+import { announce } from '../utils/announce.js';
+import { getRoutines, setActiveRoutineId } from '../utils/cycleMode.js';
+import { restoreFocusAfterClose, installDialogTabWrap } from '../ui/modalUtils.js';
+
+// ============================================================================
+// DYNAMIC IMPORTS (loaded at init time with version cache-busting)
+// ============================================================================
+
+// Storage utilities - dynamically loaded to avoid ES module cache issues
+let canAddToStorage, getStorageShortageMessage;
+
+// Name utilities
+let getUniqueCycleName;
+
+// Estimated size for a new empty cycle (structure overhead)
+const ESTIMATED_NEW_CYCLE_SIZE = 800; // ~400 chars * 2 bytes
+
+// Cached sample manifest (fetched once per session from manifest.json)
+let _sampleManifestCache = null;
+
+// ============================================================================
+// DEPENDENCY INJECTION SETUP (using diBase.js)
+// ============================================================================
+
+const di = createDIModule('RoutineManager', {
+    helpWindowManager: optional(null),
+    AppState: optional(null),
+    showPromptModal: optional(null),
+    showNotification: optional(null),
+    sanitizeInput: optional(null),
+    completeInitialSetup: optional(null),
+    hideMainMenu: optional(null),
+    updateMainMenuHeader: optional(null),
+    updateProgressBar: optional(null),
+    checkCompleteAllButton: optional(null),
+    autoSave: optional(null),
+    onCycleCreated: optional(null),
+    DEFAULT_TASK_OPTION_BUTTONS: optional(null),
+    AppMeta: optional(null),
+    refreshThemeLabels: optional(null),
+    syncModeFromToggles: optional(null),
+    updateRecurringInfoLink: optional(null),
+    loadMiniCycle: optional(null),
+    getBody: optional(() => document.body),
+});
+
+// Late-binding deps via Proxy
+/** @type {{AppState: Object|null, showPromptModal: Function|null, showNotification: Function|null, sanitizeInput: Function|null, completeInitialSetup: Function|null, hideMainMenu: Function|null, updateMainMenuHeader: Function|null, updateProgressBar: Function|null, checkCompleteAllButton: Function|null, autoSave: Function|null, onCycleCreated: Function|null, DEFAULT_TASK_OPTION_BUTTONS: Object|null, AppMeta: Object|null}} */
+const _deps = new Proxy({}, {
+    get(_, prop) {
+        return di.resolve()[prop];
+    }
+});
+
+/**
+ * Set dependencies for RoutineManager (call before creating instance)
+ * @param {Object} dependencies - { AppState, showNotification, sanitizeInput, etc. }
+ */
+export function setRoutineManagerDependencies(dependencies) {
+    di.setDependencies(dependencies);
+}
+
+/**
+ * Manages routine CRUD operations including creation, renaming, deletion, and reset
+ */
+export class RoutineManager {
+    constructor(dependencies = {}) {
+        // Resolve deps from diBase, with constructor overrides
+        const resolvedDeps = di.resolve(dependencies);
+
+        this.deps = {
+            // State management (required)
+            AppState: resolvedDeps.AppState,
+
+            // UI functions (required)
+            showPromptModal: resolvedDeps.showPromptModal,
+            showNotification: resolvedDeps.showNotification || this.fallbackNotification.bind(this),
+            sanitizeInput: resolvedDeps.sanitizeInput,
+
+            // Lifecycle functions (required)
+            completeInitialSetup: resolvedDeps.completeInitialSetup,
+            hideMainMenu: resolvedDeps.hideMainMenu,
+            updateMainMenuHeader: resolvedDeps.updateMainMenuHeader || (() => {}),
+            updateProgressBar: resolvedDeps.updateProgressBar || (() => {}),
+            checkCompleteAllButton: resolvedDeps.checkCompleteAllButton || (() => {}),
+            autoSave: resolvedDeps.autoSave || (() => {}),
+
+            // Undo system callback (optional)
+            onCycleCreated: resolvedDeps.onCycleCreated || null,
+
+            // Constants (required)
+            DEFAULT_TASK_OPTION_BUTTONS: resolvedDeps.DEFAULT_TASK_OPTION_BUTTONS,
+
+            // Theme
+            refreshThemeLabels: resolvedDeps.refreshThemeLabels || null,
+
+            // Help window — forwarded explicitly. this.deps is rebuilt from this
+            // allow-list, so a dep the manifest DOES deliver is still dropped if
+            // it is not named here (same shape as taskCore's forward-through
+            // list, and the reason declaring it in the manifest alone changed
+            // nothing). Resolved as a factory by _clearHelpWindowTemporary().
+            helpWindowManager: resolvedDeps.helpWindowManager || null,
+
+            // Mode sync (must run before refreshThemeLabels on new routine creation)
+            syncModeFromToggles: resolvedDeps.syncModeFromToggles || null,
+
+            // Recurring info
+            updateRecurringInfoLink: resolvedDeps.updateRecurringInfoLink || null,
+
+            // Load routine (for non-onboarding sample loading)
+            loadMiniCycle: resolvedDeps.loadMiniCycle || null,
+
+            // DOM functions
+            getBody: resolvedDeps.getBody || (() => document.body),
+            getElementById: dependencies.getElementById || ((id) => document.getElementById(id)),
+            querySelector: dependencies.querySelector || ((sel) => document.querySelector(sel)),
+            querySelectorAll: dependencies.querySelectorAll || ((sel) => document.querySelectorAll(sel))
+        };
+
+        // Validate required dependencies
+        this._validateDependencies();
+
+        // Instance version - uses injected AppMeta (no hardcoded fallback)
+        this.version = resolvedDeps.AppMeta?.version;
+    }
+
+    /**
+     * Validate that required dependencies are provided
+     * @private
+     */
+    _validateDependencies() {
+        const required = [
+            'AppState',
+            'showPromptModal',
+            'sanitizeInput',
+            'completeInitialSetup',
+            'hideMainMenu',
+            'DEFAULT_TASK_OPTION_BUTTONS'
+        ];
+
+        const missing = required.filter(dep => !this.deps[dep]);
+
+        if (missing.length > 0) {
+            console.error('❌ RoutineManager missing required dependencies:', missing);
+            throw new Error(`RoutineManager missing required dependencies: ${missing.join(', ')}`);
+        }
+    }
+
+    /**
+     * Ensure AppState is ready, attempting reload if needed
+     * @param {string} operation - Description of the operation (for error logging)
+     * @returns {boolean} True if AppState is ready, false otherwise
+     * @private
+     */
+    _ensureAppStateReady(operation) {
+        const appState = this.deps.AppState;
+        if (!appState?.isReady?.()) {
+            appState?.reload?.();
+        }
+        if (!appState?.isReady?.()) {
+            console.error(`❌ AppState not ready for ${operation}`);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Fallback notification for when showNotification isn't available
+     */
+    fallbackNotification(message, type, duration) {
+    }
+
+    /**
+     * Show cycle creation modal for onboarding
+     */
+    showCycleCreationModal(options = {}) {
+
+        setTimeout(() => {
+            this._buildCreationDialog({
+                title: 'modal.createRoutineTitle',
+                message: 'modal.createRoutineMessage',
+                placeholder: 'modal.createRoutinePlaceholder',
+                isOnboarding: true,
+                // First-run "Load a Sample" choice opens straight to the picker.
+                startInSampleView: options.startInSampleView === true,
+                onCreateBlank: async (inputValue) => {
+                    const newCycleName = this.deps.sanitizeInput(inputValue);
+                    const cycleId = `cycle_${Date.now()}`;
+
+                    const appState = this.deps.AppState;
+
+                    if (!this._ensureAppStateReady('cycle creation')) {
+                        this.deps.showNotification('⚠️ ' + getLabel('notify.appNotReady'), "warning", UI_TIMEOUTS.NOTIFICATION_LONG);
+                        return;
+                    }
+
+                    const existingCycles = getRoutines(appState.get()) || {};
+                    const { name: finalTitle, wasModified } = getUniqueCycleName(newCycleName, existingCycles);
+
+                    if (wasModified) {
+                        this.deps.showNotification('⚠️ ' + getLabel('notify.nameExists', { vars: { name: finalTitle } }), "warning", UI_TIMEOUTS.NOTIFICATION_LONG);
+                    }
+
+                    await appState.update(state => {
+                        getRoutines(state)[finalTitle] = {
+                            id: cycleId,
+                            title: finalTitle,
+                            tasks: [],
+                            autoReset: true,
+                            deleteCheckedTasks: false,
+                            cycleCount: 0,
+                            createdAt: Date.now(),
+                            theme: 'classic',
+                            recurringTemplates: {},
+                            reminders: {
+                                enabled: false,
+                                indefinite: false,
+                                dueDatesReminders: false,
+                                repeatCount: 0,
+                                frequencyValue: 30,
+                                frequencyUnit: "minutes"
+                            }
+                        };
+
+                        setActiveRoutineId(state, finalTitle);
+                        state.metadata.totalRoutinesCreated = (state.metadata.totalRoutinesCreated || 0) + 1;
+                    }, true);
+
+                    if (typeof this.deps.onCycleCreated === 'function') {
+                        // Promise.resolve(): the moduleLoader DI wrapper optional-chains its inner
+                        // call, so it yields undefined when the hook is unwired and `.catch` on
+                        // undefined throws here — inside a UI flow, after state already changed.
+                        Promise.resolve(this.deps.onCycleCreated(finalTitle)).catch(err => {
+                            console.warn('⚠️ Undo system cycle creation notification failed:', err);
+                        });
+                    }
+
+                    const onboardModeSelector = this.deps.getElementById(DOM_IDS.MODE_SELECTOR);
+                    if (onboardModeSelector) {
+                        onboardModeSelector.value = 'auto-cycle';
+                    }
+                    const body = this.deps.getBody();
+                    body.className = body.className.replace(
+                        /\b(auto-cycle-mode|manual-cycle-mode|todo-mode-mode|todo-mode)\b/g, ''
+                    );
+                    body.classList.add(DOM_CLASSES.AUTO_CYCLE_MODE);
+
+                    this.deps.refreshThemeLabels?.();
+
+                    this._clearHelpWindowTemporary();
+                    this.deps.updateRecurringInfoLink?.();
+                    await this.deps.completeInitialSetup(finalTitle, appState.get());
+
+                    // First-run "Create My First Routine" one-shot: now that the
+                    // empty routine has rendered, swap the generic empty hint for
+                    // the friendlier first-step copy. Set LAST so it wins over the
+                    // render's own hint; cleared so later routines are normal.
+                    try {
+                        if (sessionStorage.getItem('miniCycle_firstRunCreate') === '1') {
+                            sessionStorage.removeItem('miniCycle_firstRunCreate');
+                            // Write BOTH home variants: this flow reveals the input
+                            // bar (appInit sets showTaskInput), so the bar-visible
+                            // copy is the one actually on screen — but set the
+                            // hidden-bar copy too in case the user toggles the bar
+                            // off before adding anything.
+                            const firstHint = this.deps.querySelector(DOM_SELECTORS.EMPTY_STATE_HINT);
+                            if (firstHint) firstHint.innerHTML = getLabel('empty.firstStepHint').replace('+', '<strong>+</strong>');
+                            const firstHintVisible = this.deps.querySelector(DOM_SELECTORS.EMPTY_STATE_HINT_VISIBLE);
+                            if (firstHintVisible) firstHintVisible.textContent = getLabel('empty.firstStepHintVisible');
+                        }
+                    } catch (e) { /* private mode — skip the nicety */ }
+
+                    document.dispatchEvent(new Event('onboarding:setup-complete'));
+                }
+            });
+        }, 500);
+    }
+
+    /**
+     * Preload the getting started sample cycle
+     * @param {Object} [options={}] - Options
+     * @param {boolean} [options.silent=false] - When true, suppresses notifications and fallback cycle creation (caller handles messaging)
+     * @returns {Promise<boolean>} True if sample loaded successfully, false on failure
+     */
+    async preloadGettingStartedCycle(_options = {}) {
+        return this.loadSampleRoutine('getting-started.mcyc', { isOnboarding: true, ..._options });
+    }
+
+    /**
+     * Preload the first-run "Your First Routine" cycle from examples/initial-run/.
+     * Used by the focus-first onboarding flow: routine loads, focus view activates,
+     * welcome toast / tour are deferred until first focus-view exit.
+     * Distinct from preloadGettingStartedCycle so the menu-accessible sample
+     * stays untouched.
+     * @returns {Promise<boolean>} True if loaded successfully
+     */
+    async preloadInitialRunCycle() {
+        return this.loadSampleRoutine('Your_First_Routine.mcyc', {
+            folder: 'initial-run',
+            isOnboarding: false,
+            silent: true
+        });
+    }
+
+    /**
+     * Create a basic fallback cycle if sample loading fails
+     */
+    async createBasicFallbackCycle() {
+
+        // ✅ Use AppState as source of truth
+        const appState = this.deps.AppState;
+
+        if (!this._ensureAppStateReady('fallback cycle creation')) {
+            this.deps.showNotification('⚠️ ' + getLabel('notify.failedToCreateCycle'), "error", UI_TIMEOUTS.NOTIFICATION_SLOW);
+            return;
+        }
+
+        const cycleId = `cycle_${Date.now()}`;
+        const fallbackTitle = "Getting Started";
+
+        // ✅ Get unique name (uses centralized utility)
+        const existingCycles = getRoutines(appState.get()) || {};
+        const { name: finalTitle } = getUniqueCycleName(fallbackTitle, existingCycles);
+
+        // ✅ Create fallback cycle via AppState.update() - use title as key
+        await appState.update(state => {
+            getRoutines(state)[finalTitle] = {
+                id: cycleId,
+                title: finalTitle,
+                tasks: [
+                    {
+                        id: "task-welcome",
+                        text: "Welcome to miniCycle! 🎉",
+                        completed: false,
+                        schemaVersion: 2
+                    },
+                    {
+                        id: "task-guide",
+                        text: "Add your first task using the input box above ✏️",
+                        completed: false,
+                        schemaVersion: 2
+                    }
+                ],
+                autoReset: true,
+                deleteCheckedTasks: false,
+                cycleCount: 0,
+                createdAt: Date.now(),
+                theme: 'classic',
+                recurringTemplates: {}
+            };
+
+            setActiveRoutineId(state, finalTitle);
+            state.metadata.totalRoutinesCreated = (state.metadata.totalRoutinesCreated || 0) + 1;
+        }, true); // immediate save
+
+        // ✅ Notify undo system of new cycle (fallback path)
+        if (typeof this.deps.onCycleCreated === 'function') {
+            // Promise.resolve(): the moduleLoader DI wrapper optional-chains its inner
+            // call, so it yields undefined when the hook is unwired and `.catch` on
+            // undefined throws here — inside a UI flow, after state already changed.
+            Promise.resolve(this.deps.onCycleCreated(finalTitle)).catch(err => {
+                console.warn('⚠️ Undo system cycle creation notification failed:', err);
+            });
+        }
+
+        await this.deps.completeInitialSetup(finalTitle, appState.get());
+    }
+
+    /**
+     * Create a new miniCycle from the main menu
+     */
+    /**
+     * Release temporary help-window content when the active routine changes.
+     *
+     * showModeDescription() and showCustomizerTip() both hold
+     * isShowingModeDescription — for 30s and 10s respectively — and
+     * updateConstantMessage() early-returns for as long as it is set. Nothing
+     * released it on a routine change, so changing modes and then creating or
+     * switching a routine left the PREVIOUS routine's message on screen.
+     *
+     * Called from every refresh block in this file. Those blocks are hand-rolled
+     * copies of routineLoader.updateDependentComponents() — only one of the three
+     * reaches it via loadMiniCycle(), which is exactly why fixing it there alone
+     * did not work. Collapsing them is a wider change than this fix.
+     * @private
+     */
+    _clearHelpWindowTemporary() {
+        const mgr = typeof this.deps.helpWindowManager === 'function'
+            ? this.deps.helpWindowManager()
+            : this.deps.helpWindowManager;
+        mgr?.clearTemporaryMessage?.();
+    }
+
+    createNewMiniCycle() {
+
+        // ✅ Use state-based data access
+        if (!this.deps.AppState?.isReady?.()) {
+            console.error('❌ AppState not ready for createNewMiniCycle');
+            this.deps.showNotification('⚠️ ' + getLabel('notify.appNotReady'), "warning", UI_TIMEOUTS.NOTIFICATION_LONG);
+            return;
+        }
+
+        // ✅ Check storage quota before showing modal
+        const storageCheck = canAddToStorage(ESTIMATED_NEW_CYCLE_SIZE);
+        if (!storageCheck.allowed) {
+            console.warn('Storage quota exceeded. Cannot create new routine.');
+            this.deps.showNotification(
+                getStorageShortageMessage(storageCheck.shortfall),
+                'error',
+                UI_TIMEOUTS.NOTIFICATION_SLOW
+            );
+            return;
+        }
+
+        this._buildCreationDialog({
+            title: 'modal.newRoutineTitle',
+            message: 'modal.newRoutineMessage',
+            placeholder: 'modal.newRoutinePlaceholder',
+            isOnboarding: false,
+            onCreateBlank: (inputValue) => {
+                const newCycleName = this.deps.sanitizeInput(inputValue);
+                const cycleId = `cycle_${Date.now()}`;
+
+                const existingCycles = getRoutines(this.deps.AppState.get()) || {};
+                const { name: finalTitle, wasModified } = getUniqueCycleName(newCycleName, existingCycles);
+
+                if (wasModified) {
+                    this.deps.showNotification('⚠️ ' + getLabel('notify.nameExists', { vars: { name: finalTitle } }), "warning", UI_TIMEOUTS.NOTIFICATION_LONG);
+                }
+
+                const storageKey = finalTitle;
+                let finalResult = null;
+
+                this.deps.AppState.update(state => {
+                    getRoutines(state)[storageKey] = {
+                        title: finalTitle,
+                        id: cycleId,
+                        tasks: [],
+                        autoReset: true,
+                        deleteCheckedTasks: false,
+                        cycleCount: 0,
+                        createdAt: Date.now(),
+                        theme: 'classic',
+                        recurringTemplates: {},
+                        taskOptionButtons: { ...this.deps.DEFAULT_TASK_OPTION_BUTTONS }
+                    };
+
+                    setActiveRoutineId(state, storageKey);
+                    state.metadata.totalRoutinesCreated = (state.metadata.totalRoutinesCreated || 0) + 1;
+
+                    finalResult = { storageKey, finalTitle };
+                }, true);
+
+                const taskList = this.deps.getElementById(DOM_IDS.TASK_LIST);
+                const toggleAutoReset = this.deps.getElementById(DOM_IDS.TOGGLE_AUTO_RESET);
+                const deleteCheckedTasks = this.deps.getElementById(DOM_IDS.DELETE_CHECKED_TASKS);
+
+                if (taskList) {
+                    taskList.innerHTML = "";
+                    this.deps.getBody().classList.add(DOM_CLASSES.TASKS_EMPTY);
+                }
+
+                const titleElement = this.deps.getElementById(DOM_IDS.MINI_CYCLE_TITLE);
+                if (titleElement && finalResult) titleElement.textContent = finalResult.finalTitle;
+
+                if (toggleAutoReset) toggleAutoReset.checked = true;
+                if (deleteCheckedTasks) deleteCheckedTasks.checked = false;
+
+                const modeSelector = this.deps.getElementById(DOM_IDS.MODE_SELECTOR);
+                if (modeSelector) {
+                    modeSelector.value = 'auto-cycle';
+                }
+                const body = this.deps.getBody();
+                body.className = body.className.replace(
+                    /\b(auto-cycle-mode|manual-cycle-mode|todo-mode-mode|todo-mode)\b/g, ''
+                );
+                body.classList.add(DOM_CLASSES.AUTO_CYCLE_MODE);
+
+                // Input bar: route through modeManager, never hand-rolled here.
+                //
+                // This used to add .hidden to the container, retitle the toggle
+                // and reset tabIndex itself — three of the FOUR things
+                // _updateTaskInputVisibility() does. The fourth is
+                // `body.input-bar-visible`, which CSS uses to pick between the
+                // four empty-state hints (focus-mode.css). Skipping it left the
+                // class true while the bar was hidden, so a brand-new routine
+                // greeted the user with "Type your first task in the bar above"
+                // pointing at a bar that was not there.
+                //
+                // Routing through syncModeFromToggles() also fixes what the
+                // hide itself broke: a new routine is empty, and
+                // _shouldShowTaskInput() shows the bar on an empty routine
+                // precisely so Focus View is not a dead end (v2.522). Hiding it
+                // here re-created that dead end for every new routine.
+                this.deps.syncModeFromToggles?.();
+
+                this.deps.hideMainMenu();
+                this.deps.updateProgressBar();
+                this.deps.checkCompleteAllButton();
+                this.deps.updateMainMenuHeader();
+                this.deps.refreshThemeLabels?.();
+                this._clearHelpWindowTemporary();
+
+                const recurringLink = this.deps.getElementById(DOM_IDS.RECURRING_INFO_LINK);
+                if (recurringLink) recurringLink.classList.remove(DOM_CLASSES.SHOW);
+
+                const emptyHint = this.deps.querySelector(DOM_SELECTORS.EMPTY_STATE_HINT);
+                if (emptyHint) {
+                    emptyHint.innerHTML = getLabel('empty.noTasksHint').replace('+', '<strong>+</strong>');
+                }
+                // Reset the bar-visible variant too — a new routine must not
+                // inherit the previous one's first-step copy.
+                const emptyHintVisible = this.deps.querySelector(DOM_SELECTORS.EMPTY_STATE_HINT_VISIBLE);
+                if (emptyHintVisible) {
+                    emptyHintVisible.textContent = getLabel('empty.noTasksHintVisible');
+                }
+
+                if (finalResult && typeof this.deps.onCycleCreated === 'function') {
+                    // Promise.resolve(): the moduleLoader DI wrapper optional-chains its inner
+                    // call, so it yields undefined when the hook is unwired and `.catch` on
+                    // undefined throws here — inside a UI flow, after state already changed.
+                    Promise.resolve(this.deps.onCycleCreated(finalResult.storageKey)).catch(err => {
+                        console.warn('⚠️ Undo system cycle creation notification failed:', err);
+                    });
+                }
+
+                if (finalResult) {
+                    this.deps.showNotification(`✅ ${getLabel('notify.routineCreated', { vars: { name: finalResult.finalTitle } })}`, "success", UI_TIMEOUTS.NOTIFICATION_LONG);
+                    // Creating a routine replaces the title AND the entire task
+                    // list. None of that was announced: routineManager had zero
+                    // live-region writes, so a screen-reader user's whole context
+                    // changed in silence (measured Sep 2026). The visible
+                    // notification above does not help — it is not a live region
+                    // this module can rely on for assistive tech.
+                    this._announce('accessibility.routineCreated', finalResult.finalTitle);
+                }
+            }
+        });
+    }
+
+    /**
+     * Speak a routine-level context change into the shared #live-region.
+     *
+     * Routine create / switch / rename each replace the title and the whole task
+     * list, which is the largest context change the app has — and all three were
+     * silent to assistive tech until Sep 2026. Kept as one helper so a new
+     * routine-level action has an obvious place to announce from.
+     *
+     * @param {string} labelKey - accessibility.* label key
+     * @param {string} name - routine name to interpolate
+     */
+    _announce(labelKey, name) {
+        announce(getLabel(labelKey, { vars: { name } }), { getElementById: this.deps.getElementById });
+    }
+
+    /**
+     * Load a sample routine from a configurable examples folder.
+     * @param {string} filename - The .mcyc filename to fetch
+     * @param {Object} [options={}] - Options
+     * @param {boolean} [options.isOnboarding=false] - True = onboarding path (completeInitialSetup), false = menu path (loadMiniCycle)
+     * @param {HTMLDialogElement} [options.dialog=null] - Dialog to close on completion
+     * @param {string} [options.folder='sample-routines'] - Subfolder under examples/ to fetch from
+     * @param {boolean} [options.silent=false] - Suppress the success "sample loaded" toast (menu path)
+     * @returns {Promise<boolean>} True if sample loaded successfully
+     */
+    async loadSampleRoutine(filename, options = {}) {
+        const {
+            isOnboarding = false,
+            dialog = null,
+            folder = 'sample-routines',
+            silent = false
+        } = options;
+
+        try {
+            const response = await fetch(`examples/${folder}/${filename}`);
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const sample = await response.json();
+            const appState = this.deps.AppState;
+
+            if (!this._ensureAppStateReady('sample routine loading')) {
+                throw new Error('AppState not ready');
+            }
+
+            const cycleId = `cycle_${Date.now()}`;
+            const sampleTitle = sample.title || sample.name || 'Sample Routine';
+            const existingCycles = getRoutines(appState.get()) || {};
+            const { name: finalTitle } = getUniqueCycleName(sampleTitle, existingCycles);
+
+            await appState.update(state => {
+                getRoutines(state)[finalTitle] = {
+                    id: cycleId,
+                    title: finalTitle,
+                    tasks: sample.tasks || [],
+                    autoReset: sample.autoReset !== false,
+                    cycleCount: sample.cycleCount || 0,
+                    deleteCheckedTasks: sample.deleteCheckedTasks || false,
+                    showTaskInput: sample.showTaskInput === true,
+                    createdAt: Date.now(),
+                    theme: 'classic',
+                    recurringTemplates: {},
+                    reminders: {
+                        enabled: false,
+                        indefinite: false,
+                        dueDatesReminders: false,
+                        repeatCount: 0,
+                        frequencyValue: 30,
+                        frequencyUnit: "minutes"
+                    }
+                };
+
+                setActiveRoutineId(state, finalTitle);
+                state.metadata.totalRoutinesCreated = (state.metadata.totalRoutinesCreated || 0) + 1;
+            }, true);
+
+            // Close dialog if provided
+            if (dialog?.open) {
+                dialog.close();
+                dialog.remove();
+            }
+
+            // Notify undo system
+            if (typeof this.deps.onCycleCreated === 'function') {
+                // Promise.resolve(): the moduleLoader DI wrapper optional-chains its inner
+                // call, so it yields undefined when the hook is unwired and `.catch` on
+                // undefined throws here — inside a UI flow, after state already changed.
+                Promise.resolve(this.deps.onCycleCreated(finalTitle)).catch(err => {
+                    console.warn('⚠️ Undo system cycle creation notification failed:', err);
+                });
+            }
+
+            // Onboarding path: skip generic toast — onboardingManager shows its own
+            // welcomeSampleLoaded notification with the blank-routine CTA.
+            // Silent path: caller (e.g., first-run focus-view flow) handles all messaging.
+            if (!isOnboarding && !silent) {
+                this.deps.showNotification(
+                    '✨ ' + getLabel('notify.sampleLoaded', { vars: { name: sampleTitle } }),
+                    'success',
+                    UI_TIMEOUTS.NOTIFICATION_SLOW
+                );
+            }
+
+            if (isOnboarding) {
+                await this.deps.completeInitialSetup(finalTitle, appState.get());
+            } else {
+                // Menu path — sync mode, refresh UI, load routine
+                const modeSelector = this.deps.getElementById(DOM_IDS.MODE_SELECTOR);
+                if (modeSelector) modeSelector.value = 'auto-cycle';
+                const body = this.deps.getBody();
+                body.className = body.className.replace(
+                    /\b(auto-cycle-mode|manual-cycle-mode|todo-mode-mode|todo-mode)\b/g, ''
+                );
+                body.classList.add(DOM_CLASSES.AUTO_CYCLE_MODE);
+
+                this.deps.hideMainMenu();
+                this.deps.updateProgressBar();
+                this.deps.checkCompleteAllButton();
+                this.deps.updateMainMenuHeader();
+                this.deps.refreshThemeLabels?.();
+                this._clearHelpWindowTemporary();
+                this.deps.loadMiniCycle?.();
+            }
+
+            return true;
+
+        } catch (err) {
+            console.error('❌ Failed to load sample routine:', err);
+
+            // Close dialog on error too
+            if (dialog?.open) {
+                dialog.close();
+                dialog.remove();
+            }
+
+            if (!options.silent) {
+                this.deps.showNotification(
+                    '❌ ' + getLabel('notify.sampleLoadFailed'),
+                    'error',
+                    UI_TIMEOUTS.NOTIFICATION_LONG
+                );
+            }
+
+            if (isOnboarding && !options.silent) {
+                this.createBasicFallbackCycle();
+            }
+
+            return false;
+        }
+    }
+
+    /**
+     * Fetch the sample routine manifest (cached after first load)
+     * @returns {Promise<Array<{file: string, name: string, emoji: string}>>}
+     * @private
+     */
+    async _fetchSampleManifest() {
+        if (_sampleManifestCache) {
+            return _sampleManifestCache;
+        }
+
+        try {
+            const response = await fetch('/examples/sample-routines/manifest.json');
+            if (!response.ok) {
+                console.warn('⚠️ Failed to load sample manifest:', response.status);
+                return [];
+            }
+            const manifest = await response.json();
+            _sampleManifestCache = manifest;
+            return manifest;
+        } catch (err) {
+            console.warn('⚠️ Failed to load sample manifest:', err.message);
+            return [];
+        }
+    }
+
+    /**
+     * Build a custom creation dialog with name input + sample routine chips
+     * @param {Object} config - Dialog configuration
+     * @param {string} config.title - Dialog title label key
+     * @param {string} config.message - Dialog message label key
+     * @param {string} config.placeholder - Input placeholder label key
+     * @param {boolean} [config.isOnboarding=false] - True for onboarding path
+     * @param {Function} config.onCreateBlank - Callback when user creates a blank routine with name
+     * @private
+     */
+    async _buildCreationDialog(config) {
+        const { title, message, placeholder, isOnboarding = false, onCreateBlank, startInSampleView = false } = config;
+
+        // Fetch sample manifest (cached after first call)
+        const samples = await this._fetchSampleManifest();
+
+        const dialog = document.createElement('dialog');
+        dialog.className = 'miniCycle-prompt-dialog';
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        // Named by the active view's heading (set in showNameView/showSampleView);
+        // the opener is remembered so closing can hand focus back (Oct 2026 audit).
+        dialog.setAttribute('aria-labelledby', DOM_IDS.ROUTINE_CREATION_TITLE);
+        dialog._previousFocus = document.activeElement;
+
+        const box = document.createElement('div');
+        box.className = 'miniCycle-prompt-box';
+
+        // =====================================================================
+        // VIEW 1: Name input view
+        // =====================================================================
+        const nameView = document.createElement('div');
+        nameView.className = 'creation-view active';
+
+        // A real heading, with an id the dialog is labelled by.
+        const titleEl = document.createElement('h2');
+        titleEl.id = DOM_IDS.ROUTINE_CREATION_TITLE;
+        titleEl.className = 'miniCycle-prompt-title';
+        titleEl.textContent = getLabel(title);
+        nameView.appendChild(titleEl);
+
+        // The instruction IS the field's label: a <label for>, so the name
+        // survives when the placeholder disappears on typing.
+        const messageEl = document.createElement('label');
+        messageEl.className = 'miniCycle-prompt-message';
+        messageEl.htmlFor = DOM_IDS.SAMPLE_CREATION_INPUT;
+        messageEl.textContent = getLabel(message);
+        nameView.appendChild(messageEl);
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.id = DOM_IDS.SAMPLE_CREATION_INPUT;
+        input.className = 'miniCycle-prompt-input';
+        input.placeholder = getLabel(placeholder);
+        nameView.appendChild(input);
+
+        // "Load Sample" button (hidden if no samples available)
+        const loadSampleBtn = document.createElement('button');
+        loadSampleBtn.type = 'button';
+        loadSampleBtn.className = 'load-sample-btn';
+        loadSampleBtn.textContent = getLabel('button.loadSample');
+        if (samples.length > 0) {
+            nameView.appendChild(loadSampleBtn);
+        }
+
+        // Buttons row
+        const buttons = document.createElement('div');
+        buttons.className = 'miniCycle-prompt-buttons';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'miniCycle-btn-cancel';
+        cancelBtn.textContent = getLabel('button.cancel');
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.type = 'button';
+        confirmBtn.className = 'miniCycle-btn-confirm';
+        confirmBtn.textContent = getLabel('button.create');
+
+        buttons.appendChild(cancelBtn);
+        buttons.appendChild(confirmBtn);
+        nameView.appendChild(buttons);
+
+        box.appendChild(nameView);
+
+        // =====================================================================
+        // VIEW 2: Sample list view (only if samples are available)
+        // =====================================================================
+        let sampleView = null;
+        let backBtn = null;
+        let sampleList = null;
+
+        if (samples.length > 0) {
+            sampleView = document.createElement('div');
+            sampleView.className = 'creation-view';
+
+            // Header row: back button + title
+            const header = document.createElement('div');
+            header.className = 'sample-list-header';
+
+            backBtn = document.createElement('button');
+            backBtn.type = 'button';
+            backBtn.className = 'sample-back-btn';
+            backBtn.textContent = getLabel('button.back');
+            header.appendChild(backBtn);
+
+            const sampleTitle = document.createElement('h2');
+            sampleTitle.id = DOM_IDS.SAMPLE_CREATION_TITLE;
+            sampleTitle.className = 'sample-list-title';
+            sampleTitle.textContent = getLabel('modal.chooseSample');
+            header.appendChild(sampleTitle);
+
+            sampleView.appendChild(header);
+
+            // Sample items list
+            sampleList = document.createElement('div');
+            sampleList.id = DOM_IDS.SAMPLE_CREATION_GRID;
+            sampleList.className = 'sample-list';
+
+            for (const sample of samples) {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.className = 'sample-item';
+                item.dataset.filename = sample.file;
+
+                const emojiSpan = document.createElement('span');
+                emojiSpan.className = 'sample-item-emoji';
+                emojiSpan.textContent = sample.emoji;
+                item.appendChild(emojiSpan);
+
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'sample-item-name';
+                nameSpan.textContent = sample.name;
+                item.appendChild(nameSpan);
+
+                sampleList.appendChild(item);
+            }
+            sampleView.appendChild(sampleList);
+
+            box.appendChild(sampleView);
+        }
+
+        dialog.appendChild(box);
+        document.body.appendChild(dialog);
+
+        // =====================================================================
+        // View switching helpers (only needed when samples exist)
+        // =====================================================================
+        const showNameView = () => {
+            if (sampleView) sampleView.classList.remove(DOM_CLASSES.ACTIVE);
+            nameView.classList.add(DOM_CLASSES.ACTIVE);
+            dialog.setAttribute('aria-labelledby', DOM_IDS.ROUTINE_CREATION_TITLE);
+            input.focus();
+        };
+
+        const showSampleView = () => {
+            nameView.classList.remove(DOM_CLASSES.ACTIVE);
+            if (sampleView) sampleView.classList.add(DOM_CLASSES.ACTIVE);
+            dialog.setAttribute('aria-labelledby', DOM_IDS.SAMPLE_CREATION_TITLE);
+            // The view changed under the keyboard user: land on Back, the first
+            // control, rather than leaving focus on <body> (Oct 2026 audit).
+            backBtn?.focus();
+        };
+
+        // Every way out hands focus to a visible control: the opener when it is
+        // still rendered (the first-run choice screen is gone by then, the quick
+        // action may be too), else the shared fallbacks.
+        const closeDialog = () => {
+            dialog.close();
+            dialog.remove();
+            restoreFocusAfterClose(dialog);
+        };
+
+        // =====================================================================
+        // Event handlers
+        // =====================================================================
+        const handleConfirm = () => {
+            const value = input.value.trim();
+            if (!value) {
+                // Colour alone is not feedback: mark the field invalid for
+                // assistive tech and say why (warning notifications carry
+                // role="alert", so this is announced). Cleared on next input.
+                input.classList.add(DOM_CLASSES.MINICYCLE_INPUT_ERROR);
+                input.setAttribute('aria-invalid', 'true');
+                this.deps.showNotification('⚠️ ' + getLabel('notify.routineNameEmpty'), "warning", UI_TIMEOUTS.NOTIFICATION_SHORT);
+                input.focus();
+                return;
+            }
+
+            // onCreateBlank sanitizes (clamps) the name, so the only place the
+            // RAW length is still known is here. Say so, as the rename path does;
+            // otherwise a long name is silently cut to the limit.
+            const nameLimit = LIMITS.CYCLE_NAME_CHARACTER;
+            if (value.length > nameLimit) {
+                this.deps.showNotification('⚠️ ' + getLabel('notify.titleTruncated', { vars: { limit: nameLimit } }), "warning", UI_TIMEOUTS.NOTIFICATION_SHORT);
+            }
+
+            cleanup();
+            closeDialog();
+            onCreateBlank(value);
+        };
+
+        // Typing again clears the empty-name error state.
+        const handleInput = () => {
+            input.classList.remove(DOM_CLASSES.MINICYCLE_INPUT_ERROR);
+            input.removeAttribute('aria-invalid');
+        };
+
+        const handleCancel = () => {
+            cleanup();
+            closeDialog();
+
+            if (isOnboarding) {
+                this.preloadGettingStartedCycle();
+            }
+        };
+
+        const handleSampleClick = (e) => {
+            const item = e.target.closest('.sample-item');
+            if (!item) return;
+            const filename = item.dataset.filename;
+            cleanup();
+            this.loadSampleRoutine(filename, { isOnboarding, dialog });
+        };
+
+        const handleKeydown = (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                handleConfirm();
+            }
+        };
+
+        const handleDialogCancel = (e) => {
+            e.preventDefault();
+            handleCancel();
+        };
+
+        // Close on backdrop click (click on dialog element itself = backdrop)
+        const handleBackdropClick = (e) => {
+            if (e.target === dialog) {
+                handleCancel();
+            }
+        };
+
+        // Wire listeners
+        confirmBtn.addEventListener('click', handleConfirm);
+        cancelBtn.addEventListener('click', handleCancel);
+        input.addEventListener('keydown', handleKeydown);
+        input.addEventListener('input', handleInput);
+        dialog.addEventListener('cancel', handleDialogCancel);
+        dialog.addEventListener('click', handleBackdropClick);
+
+        // Sample-specific listeners (only when samples exist)
+        if (samples.length > 0) {
+            loadSampleBtn.addEventListener('click', showSampleView);
+            backBtn.addEventListener('click', showNameView);
+            sampleList.addEventListener('click', handleSampleClick);
+        }
+
+        // Cleanup — removes ALL listeners
+        const cleanup = () => {
+            confirmBtn.removeEventListener('click', handleConfirm);
+            cancelBtn.removeEventListener('click', handleCancel);
+            input.removeEventListener('keydown', handleKeydown);
+            input.removeEventListener('input', handleInput);
+            dialog.removeEventListener('cancel', handleDialogCancel);
+            dialog.removeEventListener('click', handleBackdropClick);
+
+            if (samples.length > 0) {
+                loadSampleBtn.removeEventListener('click', showSampleView);
+                backBtn.removeEventListener('click', showNameView);
+                sampleList.removeEventListener('click', handleSampleClick);
+            }
+        };
+
+        // Show dialog. Open straight to the sample picker when requested (the
+        // first-run "Load a Sample" choice) and samples exist; else the name view.
+        installDialogTabWrap(dialog);
+        dialog.showModal();
+        if (startInSampleView && samples.length > 0) {
+            showSampleView();
+        } else {
+            input.focus();
+        }
+    }
+}
+
+// Create global instance
+let routineManager = null;
+
+// Phase 3 - No window.* exports (main script handles exposure)
+
+/**
+ * Initialize the RoutineManager module
+ * Dynamically imports utilities with version cache-busting before creating instance
+ * @param {Object} dependencies - Dependency injection object
+ * @returns {Promise<RoutineManager>} The initialized RoutineManager instance
+ */
+export async function initRoutineManager(dependencies) {
+    // Dynamically import utilities with version for cache-busting
+    const version = APP_VERSION;
+
+    // Import storage utilities
+    const storageUtils = await import(`../utils/storageUtils.js?v=${version}`);
+    canAddToStorage = storageUtils.canAddToStorage;
+    getStorageShortageMessage = storageUtils.getStorageShortageMessage;
+
+    // Import name utilities
+    const nameUtils = await import(`../utils/nameUtils.js?v=${version}`);
+    getUniqueCycleName = nameUtils.getUniqueCycleName;
+
+    // Now create the instance
+    routineManager = new RoutineManager(dependencies);
+    return routineManager;
+}
+
+/**
+ * Get the singleton RoutineManager instance
+ * @returns {RoutineManager|null} The initialized instance or null
+ */
+export function getRoutineManager() {
+    return routineManager;
+}

@@ -1,0 +1,2208 @@
+/**
+ * @file moduleLoader.js
+ * @description Module loader that uses manifests for loading
+ * @module modules/boot/moduleLoader
+ *
+ * This module provides utilities for loading modules based on their manifests.
+ * It handles:
+ * - Loading modules by phase
+ * - Calling setDependencies functions
+ * - Initializing modules
+ * - Registering provides into the deps container and building the grouped API
+ *   objects (featureBoot does the appContext registration)
+ *
+ * USAGE:
+ * ```javascript
+ * import { loadPhase, loadAllModules } from './moduleLoader.js';
+ *
+ * // Load a specific phase
+ * await loadPhase(deps, coreResult, PHASES.CORE_UTILS);
+ *
+ * // Or load all phases
+ * await loadAllModules(deps, coreResult);
+ * ```
+ */
+
+// moduleManifests.js is deliberately NOT a static import: loadManifests() below
+// imports it through withV() so its URL carries the version (content-hashed in the
+// release build, ?v= in dev) and a stale manifest can't pair with a fresh loader.
+import { DOM_IDS, DOM_SELECTORS } from '../core/constants.js';
+import { featureAvailability } from '../utils/featureAvailability.js';
+
+let MODULE_MANIFESTS = {};
+let PHASES = {};
+let getModulesByPhase = () => [];
+let getLoadOrder = () => [];
+let validateCrossPhaseDeps = () => ({ valid: true, warnings: [] });
+
+// Re-export for consumers (will be populated after loadManifests())
+export { MODULE_MANIFESTS, PHASES, getLoadOrder };
+
+let _manifestsLoaded = false;
+let _depMappingKeys = null; // Populated after loadAllModules — used by DI wiring tests
+
+// ============================================================================
+// APPCONTEXT DYNAMIC IMPORT
+// ============================================================================
+// IMPORTANT: Must use versioned import to match coreBoot's instance
+// (unversioned and versioned imports are different modules with separate state)
+let _appContextModule = null;
+let _withV = null;
+let registerApi = () => { console.warn('⚠️ registerApi not loaded yet'); };
+
+// Late-bound appContext reads: completeInitialSetup is a context value,
+// hideMainMenu comes from the grouped ui API
+const getCompleteInitialSetup = () => _appContextModule?.getContextValue?.('completeInitialSetup') || null;
+const getHideMainMenu = () => _appContextModule?.getUiApi?.()?.hideMainMenu || null;
+
+async function loadAppContext(withV) {
+    // Store withV for future use if provided
+    if (withV) _withV = withV;
+
+    if (!_appContextModule && _withV) {
+        // Use versioned import to match coreBoot's appContext instance
+        _appContextModule = await import(_withV('../core/appContext.js'));
+        registerApi = _appContextModule.registerApi;
+    }
+    return _appContextModule;
+}
+
+// Note: Early non-blocking import removed - must wait for withV from coreBoot
+// to ensure we get the same appContext instance where completeInitialSetup is set
+
+/**
+ * Load moduleManifests with version cache-busting
+ * @param {Function} withV - Version-appending function from coreBoot (dev: `${path}?v=<APP_VERSION>`; release build: the content-hashed URL from the module map)
+ */
+export async function loadManifests(withV) {
+    if (_manifestsLoaded) return;
+
+    const manifestModule = await import(withV('./moduleManifests.js'));
+    MODULE_MANIFESTS = manifestModule.MODULE_MANIFESTS;
+    PHASES = manifestModule.PHASES;
+    getModulesByPhase = manifestModule.getModulesByPhase;
+    getLoadOrder = manifestModule.getLoadOrder;
+    validateCrossPhaseDeps = manifestModule.validateCrossPhaseDeps;
+
+    // Load shared constants from versioned manifest (single source of truth)
+    CORE_DEPS = manifestModule.CORE_DEPS;
+    ALIAS_MAP = manifestModule.ALIAS_MAP;
+    resolveAlias = manifestModule.resolveAlias;
+
+    _manifestsLoaded = true;
+
+    // Also load appContext with versioning (must match coreBoot's instance)
+    await loadAppContext(withV);
+
+}
+
+// ============================================================================
+// MODULE LOADING STATE
+// ============================================================================
+// ⚠️ The registries MUST be shared across ALL moduleLoader instances. On boot
+// retry the orchestrator imports moduleLoader with a DIFFERENT ?v= suffix
+// (?v=X.r2 online; offline, bare in dev or ?v=retry on the hashed build), which
+// creates a separate ES module instance —
+// module-level Maps there would start empty, so destroyAllModules() would
+// iterate nothing and attempt 1's listeners/timers would survive into attempt 2
+// (July 2026 boot audit, finding C1). Anchoring the Maps on globalThis gives
+// one registry per page, the same cross-instance strategy as featureBoot's
+// HTML event bridge. This is deliberate boot infrastructure — NOT a precedent
+// for window.* globals in feature modules.
+
+const _registryHost = globalThis.__miniCycleModuleRegistry =
+    globalThis.__miniCycleModuleRegistry || {
+        loadedModules: new Map(),
+        moduleInstances: new Map()
+    };
+const loadedModules = _registryHost.loadedModules;
+const moduleInstances = _registryHost.moduleInstances;
+
+// ============================================================================
+// BOOT GENERATION GUARD
+// ============================================================================
+// A phase that times out is NOT cancelled — withTimeout() only rejects the
+// race. The zombie attempt keeps importing/wiring modules concurrently with
+// the retry, writing stale instances into the shared deps container (July 2026
+// boot audit, finding C2). The orchestrator bumps
+// globalThis.__miniCycleBootGeneration at the start of every boot attempt;
+// loaders capture their generation and abort at the next checkpoint once
+// superseded. All checks no-op when the global is undefined (unit tests).
+
+let _bootGeneration; // generation captured by loadAllModules for this instance
+
+// Exported for tests (moduleLoader.tests.js pins the supersede contract).
+export function assertBootGenerationCurrent(myGeneration) {
+    const current = globalThis.__miniCycleBootGeneration;
+    if (current !== undefined && myGeneration !== undefined && current !== myGeneration) {
+        throw new Error(
+            `Boot attempt superseded (generation ${myGeneration} → ${current}) — aborting stale boot work`
+        );
+    }
+}
+
+// ============================================================================
+// DEFERRED (ON-DEMAND) MODULE LOADING
+// ============================================================================
+// Modules with `deferred: true` in their manifest are SKIPPED at boot and
+// loaded lazily on first use via ensureModuleLoaded(). This keeps their parse +
+// init() off the critical boot path. loadAllModules() captures the boot context
+// (deps + coreResult) here so on-demand loads after boot can reuse it.
+let _bootDeps = null;
+let _bootCoreResult = null;
+
+// ============================================================================
+// SHARED CONSTANTS (loaded from versioned moduleManifests.js)
+// ============================================================================
+// These are populated by loadManifests() to avoid versioned/unversioned cache mismatches.
+// The constants live in moduleManifests.js as the single source of truth.
+let CORE_DEPS = new Set();  // Will be populated from manifest
+let ALIAS_MAP = new Map();  // Will be populated from manifest
+let resolveAlias = (apiName) => apiName;  // Will be populated from manifest
+
+// ============================================================================
+// DI VALIDATION FLAGS
+// ============================================================================
+
+/**
+ * Enable strict mode for lazy validation (throws instead of warns).
+ * Set to true during development to catch missing providers early.
+ */
+const STRICT_LAZY_VALIDATION = false;
+
+/**
+ * True on the deployed hosts. Mirrors orchestrator.js's production guard
+ * (`location.hostname.includes('minicycle.app')`) plus the product-page domain,
+ * rather than importing it — orchestrator is not a versioned import here and a
+ * static import would risk a second module instance.
+ *
+ * Staging (test.minicycle.app) counts as production on purpose: it is a real
+ * deploy, and the dev-only diagnostics below should not add work to it.
+ * @returns {boolean}
+ */
+function isProductionHost() {
+    try {
+        const host = globalThis.location?.hostname || '';
+        return host.includes('minicycle.app') || host.includes('minicycleapp.com');
+    } catch (_) {
+        // No location (worker / test harness) — treat as dev so diagnostics stay on.
+        return false;
+    }
+}
+
+/**
+ * Warn when a module READS a dependency its manifest never declared.
+ *
+ * This is the runtime net for ENFORCE_REQUIRES' own failure mode. Under strict
+ * mode an undeclared dep is simply absent, and absence is silent: `deps.foo?.()`
+ * no-ops, `if (deps.foo)` takes the false branch. Nothing throws, nothing logs —
+ * the recurring button's listener just never gets attached.
+ *
+ * Replaces AUDIT_UNDECLARED_DEPS (removed Aug 2026), which could not do this job
+ * for two reasons:
+ *  1. It only ran on the `!ENFORCE_REQUIRES` branch — it audited the broad-assign
+ *     path, i.e. exactly the mode that has no failure mode to audit.
+ *  2. Its Proxy `get` trap fired during WIRING, where something enumerates the
+ *     built deps object once per module. With all ~230 depMappings keys present as
+ *     own keys, that enumeration touched every one of them and attributed the lot
+ *     to whichever module was mid-wire (achievementsManager "accessing"
+ *     TaskRenderer, UIOrchestrator, the whole catalogue).
+ *
+ * Both are fixed by inverting what is instrumented. Warners are attached to the
+ * names that are ABSENT from the built deps object, as NON-ENUMERABLE accessors:
+ *  - Absent-only means a delivered dep is a plain data property with no trap, so
+ *    the common path is untouched and costs nothing.
+ *  - Non-enumerable means `Object.keys` / spread / `for…in` / `JSON.stringify`
+ *    skip them, so the wiring-time enumeration that poisoned the old audit cannot
+ *    see them at all. That is what removes the false positives — not the boot gate.
+ *  - `Object.getOwnPropertyDescriptors` DOES see non-enumerable accessors, and
+ *    that is the copy diBase's `setDependencies` performs. So a warner survives
+ *    into the module's own `_injected`, and `resolve()` carries it through to
+ *    `this.deps` for any name in the module's DI schema. The warning therefore
+ *    fires at the REAL access site with the RIGHT module attributed — the
+ *    "attribute at the consumer's deps-getter" fix the old audit's note called for.
+ *
+ * Facade forward-through is covered for free: facades copy descriptors down to
+ * their dynamically imported sub-modules, so a sub-module reading an undeclared
+ * name warns against the facade's manifest path — which is the manifest that
+ * actually needs the entry. That is the taskDOM / taskCore class that cost v2.418.
+ *
+ * Timed by the boot-interactive mark (see `bootIsInteractive`). Reads after it warn
+ * immediately. Reads before it are BUFFERED, not dropped, and flushed with a
+ * " during boot" suffix once the mark lands — facades such as taskDOM snapshot deps
+ * in their constructors, so the only read of an undeclared name can happen during
+ * boot (see reportUndeclaredDepAccess). Every read is recorded as seen when first
+ * made, buffered or not, so each module+dep pair is reported exactly once.
+ *
+ * Dev only. Production pays nothing: the attach loop is skipped outright.
+ */
+const WARN_ON_UNDECLARED_DEP_ACCESS = !isProductionHost();
+
+/**
+ * When true, a module receives ONLY the dependencies its manifest declares
+ * (`requires` + `optionalDeps` + `lazyRequires`) plus CORE_DEPS. When false, the
+ * broad `Object.assign(result, depMappings)` below hands every module the entire
+ * ~230-entry catalogue, so an undeclared dep still works and the manifest is
+ * decorative.
+ *
+ * ON since Aug 2026. What that took, because the failures were all silent — an
+ * absent dep makes `deps.foo?.()` no-op rather than throw:
+ *
+ *  - Facade forward-through. taskDOM and taskCore hand deps to dynamically
+ *    imported sub-modules that are deliberately absent from the manifest. Those
+ *    deps were never declared, so strict mode stopped routing them. taskCore's
+ *    task-creation chain (validateAndSanitizeTaskInput → loadTaskContext → … →
+ *    finalizeTaskCreation) is a series of early-return guards: one missing link
+ *    killed every task add, surfacing only as journey timeouts.
+ *  - Self-routed names. taskDOM both PROVIDES and consumes handleTaskButtonClick /
+ *    revealTaskButtons / setupRecurringButtonHandler. Safe to declare because each
+ *    depMappings entry is a late-binding wrapper. Missing setupRecurringButtonHandler
+ *    meant the recurring button's listener was never attached — the click did
+ *    nothing, with no error and no warning anywhere.
+ *
+ * Guard rails, in order of usefulness:
+ *  - `npm run validate:di` gates used-but-undeclared, declared-but-undeliverable
+ *    and facade forward-through at 0. It only sees the dep-accessor shapes it
+ *    models; `_rawDeps` and the `resolvedDeps = di.resolve(...)` alias both had to
+ *    be taught to it. A NEW accessor shape is a new blind spot.
+ *  - `WARN_ON_UNDECLARED_DEP_ACCESS` (above) is the runtime cover for exactly that
+ *    blind spot: it warns when a module READS a name it never declared, at the
+ *    access site, whatever accessor shape got it there. Added Aug 2026 — until
+ *    then strict mode had no runtime signal for its own failure mode, and the
+ *    module test suite structurally cannot supply one (only a couple of test
+ *    files import the loader; the rest hand modules their deps directly, bypassing
+ *    wiring).
+ *  - `npm run test:journey` is the backstop that actually caught these, and it
+ *    now forwards DI-shaped console warnings so a starved dep does not read as a
+ *    bare 10s timeout — including the undeclared-access warnings above, since
+ *    journeys drive real interactions after boot.
+ *
+ * To revert: set this to false. That restores the broad assign and is behaviour-
+ * neutral — every declaration added for strict mode is inert under it.
+ */
+const ENFORCE_REQUIRES = true;
+
+/**
+ * When true, log a warning at boot for any dep declared in a manifest's
+ * `requires`/`optionalDeps`/`lazyRequires` that is NOT in `depMappings` and NOT
+ * in `CORE_DEPS`. This catches the silent-failure bug class where a consumer's
+ * `optional()` default sentinel is used forever because nothing wired the dep.
+ *
+ * High-signal: each warning corresponds to a real missing wiring entry. This is
+ * the SUPPLY side — declared but undeliverable. WARN_ON_UNDECLARED_DEP_ACCESS
+ * above covers the demand side (used but not declared). Together they close both
+ * directions of the manifest/consumer mismatch at runtime.
+ *
+ * ON on every host, production included — unlike WARN_ON_UNDECLARED_DEP_ACCESS,
+ * which is dev only. Set false to suppress.
+ */
+const WARN_ON_UNMAPPED_DECLARED_DEPS = true;
+// Dedupe DI-gap warnings — buildModuleDependencies runs twice per module at boot
+// (Stage 2 wiring + initializeModule) and again on deferred loads, so without this
+// each gap would warn once per wiring pass.
+const _warnedDIGaps = new Set();
+
+// ============================================================================
+// UNDECLARED DEP ACCESS AUDIT (dev only — see WARN_ON_UNDECLARED_DEP_ACCESS)
+// ============================================================================
+
+/**
+ * Performance mark orchestrator.js emits when the app becomes interactive
+ * (`BOOT_MARKS.INTERACTIVE`). Coupled by NAME, not by import: orchestrator
+ * already reads this file's `mc:subphase:*` measures by prefix for exactly the
+ * same reason — moduleLoader is loaded through a versioned dynamic import, so a
+ * static import in either direction would create a second module instance with
+ * its own state. Keep this string in sync with BOOT_MARKS.INTERACTIVE.
+ * @type {string}
+ */
+const BOOT_INTERACTIVE_MARK = 'mc:boot:interactive';
+
+/** @type {boolean} Latched once the interactive mark is observed. */
+let _bootInteractive = false;
+
+/** @type {Set<string>} `path::dep` pairs already recorded, so each is reported once. */
+const _warnedUndeclaredAccess = new Set();
+
+/** @type {string[]} Reads seen before boot finished, held for the post-boot flush. */
+let _pendingUndeclaredAccess = [];
+
+/** @type {PerformanceObserver|null} Watches for the interactive mark to flush the buffer. */
+let _bootMarkObserver = null;
+
+/**
+ * Has boot reached "interactive"?
+ *
+ * Latches on first true so the steady-state cost is one boolean read. A boot
+ * RETRY clears the mark (orchestrator's clearBootTiming) but does not un-latch
+ * this — deliberate: after a retry the app is still past the point where these
+ * warnings are meaningful, and re-arming would only silence real findings.
+ *
+ * The transition also flushes any buffered reads, which is the fallback path when
+ * PerformanceObserver is unavailable: the next read after boot drains the buffer.
+ * @returns {boolean}
+ */
+function bootIsInteractive() {
+    if (_bootInteractive) return true;
+    try {
+        if (performance.getEntriesByName(BOOT_INTERACTIVE_MARK, 'mark').length > 0) {
+            _bootInteractive = true;
+            flushPendingUndeclaredAccess();
+        }
+    } catch (_) { /* Performance API unavailable — buffer just never drains */ }
+    return _bootInteractive;
+}
+
+/**
+ * Watch for the interactive mark so buffered reads surface even if nothing reads a
+ * dep again after boot. Event-driven rather than polled; installed lazily, on the
+ * first buffered read, so a clean boot never constructs an observer at all.
+ * @returns {void}
+ */
+function ensureBootMarkObserver() {
+    if (_bootInteractive || _bootMarkObserver || typeof PerformanceObserver !== 'function') return;
+    try {
+        _bootMarkObserver = new PerformanceObserver((list) => {
+            if (list.getEntriesByName(BOOT_INTERACTIVE_MARK).length === 0) return;
+            _bootInteractive = true;
+            flushPendingUndeclaredAccess();
+            try { _bootMarkObserver.disconnect(); } catch (_) { /* already gone */ }
+            _bootMarkObserver = null;
+        });
+        _bootMarkObserver.observe({ entryTypes: ['mark'] });
+    } catch (_) {
+        // No mark observation available — bootIsInteractive()'s lazy check still drains.
+        _bootMarkObserver = null;
+    }
+}
+
+/**
+ * Emit one warning line.
+ * @param {string} key - `path::dep`
+ * @param {string} [when] - Optional phase note appended to the message
+ * @returns {void}
+ */
+function emitUndeclaredDepWarning(key, when = '') {
+    const sep = key.lastIndexOf('::');
+    const modulePath = key.slice(0, sep);
+    const dep = key.slice(sep + 2);
+    // Prefix is "DI access" to pair with the "DI gap" supply-side warning, and
+    // because run-journey-tests.cjs surfaces page warnings matching /DI /i — the
+    // journeys are where these are meant to be read.
+    console.warn(
+        `⚠️ DI access: ${modulePath} read undeclared dep "${dep}"${when} — it resolved to undefined. ` +
+        `Under ENFORCE_REQUIRES a module only receives what its manifest declares, so ` +
+        `calls through this dep silently no-op. Add "${dep}" to this module's requires ` +
+        `(or optionalDeps / lazyRequires) in moduleManifests.js.`
+    );
+}
+
+/**
+ * Drain reads that happened before boot finished.
+ * @returns {void}
+ */
+function flushPendingUndeclaredAccess() {
+    if (_pendingUndeclaredAccess.length === 0) return;
+    const pending = _pendingUndeclaredAccess;
+    _pendingUndeclaredAccess = [];
+    for (const key of pending) emitUndeclaredDepWarning(key, ' during boot');
+}
+
+/**
+ * Record one undeclared dep read, reported once per module+dep pair.
+ *
+ * Boot-time reads are BUFFERED, not dropped. The first cut of this audit
+ * suppressed them outright, on the theory that reads happen at access time and
+ * anything earlier was `di.resolve()` probing markers. Measured against the real
+ * app, that was wrong and it made the audit blind to its headline case: taskDOM
+ * snapshots `resolvedDeps.setupRecurringButtonHandler` into `this.deps` inside its
+ * CONSTRUCTOR, so the only read of the undeclared name happens during boot. The
+ * snapshot-at-construction shape is common across the facades, so suppressing boot
+ * reads would have shipped an audit that could not see the bug class it exists for.
+ *
+ * Buffering costs nothing in signal and keeps the console quiet while boot is still
+ * printing: the wiring-time enumeration that poisoned the old audit is already
+ * neutralised by the warners being non-enumerable, not by this gate.
+ *
+ * @param {string} modulePath - Manifest path of the module that owns the deps object
+ * @param {string} dep - Dependency name that was read but never declared
+ * @returns {void}
+ */
+function reportUndeclaredDepAccess(modulePath, dep) {
+    const key = `${modulePath}::${dep}`;
+    if (_warnedUndeclaredAccess.has(key)) return;
+    _warnedUndeclaredAccess.add(key);
+    if (bootIsInteractive()) {
+        emitUndeclaredDepWarning(key);
+        return;
+    }
+    _pendingUndeclaredAccess.push(key);
+    ensureBootMarkObserver();
+}
+
+/**
+ * Read the undeclared accesses seen so far. Test/debug hook.
+ * @returns {string[]} `path::dep` pairs, in the order they were first read (includes boot-time reads still buffered)
+ */
+export function getUndeclaredDepAccesses() {
+    return [..._warnedUndeclaredAccess];
+}
+
+/**
+ * Clear the audit's dedupe set so a pair can warn again. Test hook.
+ * @returns {void}
+ */
+export function resetUndeclaredDepAudit() {
+    _warnedUndeclaredAccess.clear();
+    _pendingUndeclaredAccess = [];
+}
+
+/**
+ * Attach warn-on-read accessors for every depMappings name this module did NOT
+ * receive. See WARN_ON_UNDECLARED_DEP_ACCESS for the full rationale.
+ *
+ * Only ABSENT names get an accessor, so delivered deps keep their plain data
+ * property and the hot path is untouched. Each accessor is NON-ENUMERABLE, which
+ * is what keeps it invisible to `Object.keys` / spread / `for…in` while still
+ * being carried by the `Object.getOwnPropertyDescriptors` copy that diBase's
+ * `setDependencies` performs.
+ *
+ * Behaviour-neutral: the getter returns `undefined`, which is exactly what
+ * reading an absent key already yielded. Under ENFORCE_REQUIRES=false the broad
+ * assign has already delivered every depMappings key, so the loop attaches
+ * nothing at all.
+ *
+ * @param {Object} result - Built dependency object (mutated in place)
+ * @param {Object} manifest - Module manifest (`path` is used for attribution)
+ * @param {Object} depMappings - Map of dep name → resolver; its keys are the audit universe
+ * @returns {Object} the same `result`, for chaining
+ */
+export function attachUndeclaredDepWarnings(result, manifest, depMappings) {
+    const modulePath = manifest?.path || '(unknown module)';
+    for (const dep of Object.keys(depMappings)) {
+        // Delivered — declared, or a CORE_DEP. Nothing to warn about.
+        if (dep in result) continue;
+        defineUndeclaredDepWarner(result, dep, modulePath);
+    }
+    return result;
+}
+
+/**
+ * Define a single non-enumerable warn-on-read accessor.
+ *
+ * The setter is NOT optional. Modules are ES modules, so they run in strict mode,
+ * where assigning to an accessor that has only a getter throws a TypeError. A
+ * getter-only warner would therefore convert a harmless late assignment
+ * (`_deps.foo = fn`, injectDependency, a test stub) into a hard crash. The setter
+ * makes a real assignment win by replacing the accessor with a normal data
+ * property — and uses `this`, not the captured object, because the descriptor is
+ * copied onto OTHER objects (`_injected`, sub-module deps) and must define on
+ * whichever receiver is actually being written to.
+ *
+ * @param {Object} target - Object to define the accessor on
+ * @param {string} dep - Dependency name
+ * @param {string} modulePath - Manifest path used for attribution in the warning
+ * @returns {void}
+ */
+function defineUndeclaredDepWarner(target, dep, modulePath) {
+    Object.defineProperty(target, dep, {
+        get() {
+            reportUndeclaredDepAccess(modulePath, dep);
+            return undefined;
+        },
+        set(value) {
+            if (!this || (typeof this !== 'object' && typeof this !== 'function')) return;
+            try {
+                Object.defineProperty(this, dep, {
+                    value,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true
+                });
+            } catch (_) {
+                // Frozen/sealed receiver — a plain assignment would have thrown here
+                // too. Swallow so the audit can never be the reason boot breaks.
+            }
+        },
+        enumerable: false,
+        configurable: true
+    });
+}
+
+/**
+ * Create a validated lazy wrapper that warns/throws on null provider access.
+ * This catches missing dependencies at call time instead of silently returning undefined.
+ *
+ * @param {string} apiName - Name of the API for logging
+ * @param {Function} getter - Function that returns the actual implementation
+ * @returns {Function} - Wrapper that validates before calling
+ */
+function createValidatedWrapper(apiName, getter) {
+    let hasWarned = false;
+
+    return (...args) => {
+        const impl = getter();
+
+        if (impl === undefined || impl === null) {
+            if (!hasWarned) {
+                const msg = `Lazy dep '${apiName}' resolved to null at call time`;
+                if (STRICT_LAZY_VALIDATION) {
+                    throw new Error(msg);
+                }
+                console.warn(`⚠️ ${msg}`);
+                hasWarned = true;
+            }
+            return undefined;
+        }
+
+        return impl(...args);
+    };
+}
+
+// ============================================================================
+// CIRCULAR DEPENDENCY DETECTION
+// ============================================================================
+
+/**
+ * Find which module provides a given API
+ * @param {string} apiName - API name to find
+ * @param {Object} manifests - MODULE_MANIFESTS object
+ * @returns {string|null} - Module name that provides this API, or null
+ */
+function findProviderModule(apiName, manifests) {
+    // First resolve any alias to canonical name
+    const canonical = resolveAlias(apiName);
+
+    for (const [name, manifest] of Object.entries(manifests)) {
+        if (manifest.provides?.includes(canonical)) {
+            return name;
+        }
+        // Also check provideInstance
+        if (manifest.provideInstance === canonical) {
+            return name;
+        }
+    }
+    return null;
+}
+
+/**
+ * Build a dependency graph from module manifests
+ * @param {Object} manifests - MODULE_MANIFESTS object
+ * @returns {Map<string, Set<string>>} - Adjacency list of dependencies
+ */
+function buildDependencyGraph(manifests) {
+    const graph = new Map();
+
+    for (const [name, manifest] of Object.entries(manifests)) {
+        const deps = new Set();
+
+        // Build dependencies from 'requires' field (maps API names to module names)
+        if (manifest.requires && Array.isArray(manifest.requires)) {
+            manifest.requires.forEach(apiName => {
+                // Skip core deps - they're always available from coreBoot
+                if (CORE_DEPS.has(apiName)) return;
+
+                const provider = findProviderModule(apiName, manifests);
+                if (provider && provider !== name) {
+                    deps.add(provider);
+                }
+            });
+        }
+
+        // Also include explicit 'after' constraints
+        if (manifest.after && Array.isArray(manifest.after)) {
+            manifest.after.forEach(dep => deps.add(dep));
+        }
+
+        graph.set(name, deps);
+    }
+
+    return graph;
+}
+
+/**
+ * Detect circular dependencies using DFS with cycle detection
+ * @param {Map<string, Set<string>>} graph - Dependency graph
+ * @returns {Array<Array<string>>} - Array of cycles found (each cycle is an array of module names)
+ */
+function findCycles(graph) {
+    const cycles = [];
+    const visited = new Set();
+    const recursionStack = new Set();
+    const path = [];
+
+    function dfs(node) {
+        if (recursionStack.has(node)) {
+            // Found a cycle - extract it from the path
+            const cycleStart = path.indexOf(node);
+            const cycle = path.slice(cycleStart).concat(node);
+            cycles.push(cycle);
+            return;
+        }
+
+        if (visited.has(node)) {
+            return;
+        }
+
+        visited.add(node);
+        recursionStack.add(node);
+        path.push(node);
+
+        const deps = graph.get(node) || new Set();
+        for (const dep of deps) {
+            if (graph.has(dep)) { // Only check deps that are in our manifest
+                dfs(dep);
+            }
+        }
+
+        path.pop();
+        recursionStack.delete(node);
+    }
+
+    // Run DFS from each node
+    for (const node of graph.keys()) {
+        if (!visited.has(node)) {
+            dfs(node);
+        }
+    }
+
+    return cycles;
+}
+
+/**
+ * Detect and report circular dependencies in module manifests
+ * Should be called before loading modules
+ * @param {Object} manifests - MODULE_MANIFESTS object
+ * @returns {boolean} - True if no cycles found, false if cycles exist
+ */
+export function detectCircularDeps(manifests) {
+
+    const graph = buildDependencyGraph(manifests);
+    const cycles = findCycles(graph);
+
+    if (cycles.length > 0) {
+        console.error('🔄 Circular dependencies detected!');
+        cycles.forEach((cycle, i) => {
+            console.error(`  Cycle ${i + 1}: ${cycle.join(' → ')}`);
+        });
+        console.warn('⚠️ Circular dependencies may cause initialization issues.');
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// CORE LOADER
+// ============================================================================
+
+/**
+ * Load a single module by name
+ * @param {string} name - Module name from manifests
+ * @param {Object} deps - Dependencies container
+ * @param {Object} coreResult - Results from coreBoot
+ * @param {Function} withV - Version-appending function for cache busting
+ * @param {boolean} [wire=true] - Build deps and call setDependencies now; loadPhase passes
+ *   false and wires in its sequential Stage 2 instead
+ * @returns {Promise<Object|null>} Loaded module or null if failed
+ */
+export async function loadModule(name, deps, coreResult, withV, wire = true) {
+    // ✅ Ensure manifests are loaded (idempotent - only loads once)
+    if (!_manifestsLoaded) {
+        await loadManifests(withV);
+    }
+
+    if (loadedModules.has(name)) {
+        return loadedModules.get(name);
+    }
+
+    const manifest = MODULE_MANIFESTS[name];
+    if (!manifest) {
+        console.warn(`⚠️ Unknown module: ${name}`);
+        return null;
+    }
+
+    try {
+
+        // Import the module.
+        // ⏱️ Per-module import measure (`mc:module:<name>:import`). NOTE: within a
+        // phase these awaits run in Promise.all, so durations OVERLAP in wall-clock
+        // (each includes main-thread parse of whichever module evaluates first) —
+        // rank with them, don't sum them. The `:init` measure below is the exact one.
+        const importStartMark = `mc:module:${name}:import:start`;
+        try { performance.mark(importStartMark); } catch (_) { /* perf API unavailable */ }
+        const mod = await import(withV(manifest.path));
+        try { performance.measure(`mc:module:${name}:import`, importStartMark); } catch (_) { /* mark missing */ }
+        loadedModules.set(name, mod);
+
+        // Wire dependencies (setDependencies). Skipped when wire=false: loadPhase defers
+        // wiring to its sequential init stage, because BUILDING the deps object captures
+        // values eagerly: injectDeclaredDeps reads every depMappings entry, which runs
+        // getters (e.g. TaskOptionsVisibilityController) and copies plain entries (e.g.
+        // showNotification) as they are at that moment. So a module must wire AFTER
+        // same-phase providers' init() has registered them, not during parallel load.
+        if (wire) {
+            const setDepsFn = findSetDependenciesFunction(mod, name);
+            if (setDepsFn) {
+                const moduleDeps = buildModuleDependencies(manifest, deps, coreResult);
+                setDepsFn(moduleDeps);
+            }
+        }
+
+        return mod;
+    } catch (error) {
+        if (manifest.optional) {
+            console.warn(`⚠️ Optional module ${name} failed to load:`, error.message);
+            featureAvailability.markFailed(name, error);
+            return null;
+        }
+        console.error(`❌ Failed to load ${name}:`, error);
+        throw error;
+    }
+}
+
+/**
+ * Initialize a loaded module
+ * @param {string} name - Module name
+ * @param {Object} mod - Loaded module
+ * @param {Object} deps - Dependencies container
+ * @param {Object} coreResult - Results from coreBoot
+ * @returns {Promise<Object|null>} Initialized instance or null
+ */
+export async function initializeModule(name, mod, deps, coreResult) {
+    if (moduleInstances.has(name)) {
+        return moduleInstances.get(name);
+    }
+
+    const manifest = MODULE_MANIFESTS[name];
+    if (!manifest) return null;
+
+    try {
+        // Look for init function
+        const initFn = findInitFunction(mod, name);
+        if (initFn) {
+            const initDeps = buildModuleDependencies(manifest, deps, coreResult);
+            const instance = await initFn(initDeps);
+            moduleInstances.set(name, instance);
+
+            // Register provides in deps container
+            // Pass both instance and raw module - instance is checked first, then module exports as fallback
+            if (manifest.provides && instance) {
+                registerProvides(name, manifest, instance, deps, mod);
+            }
+
+            // Register instance itself if provideInstance is specified
+            if (manifest.provideInstance && instance) {
+                const category = getDepsCategoryForModule(manifest);
+                if (deps[category]) {
+                    deps[category][manifest.provideInstance] = instance;
+                }
+            }
+
+            return instance;
+        }
+
+        // No init function - module is just a collection of exports
+        // Still register provides from the raw module exports
+        if (manifest.provides) {
+            registerProvides(name, manifest, mod, deps);
+        }
+
+        // Register the instance under provideInstance for no-init modules too —
+        // previously only the init-fn branch did this, so a no-init module's
+        // provideInstance silently never registered (July 2026 boot audit, C3).
+        if (manifest.provideInstance && mod[manifest.provideInstance]) {
+            const category = getDepsCategoryForModule(manifest);
+            if (deps[category]) {
+                deps[category][manifest.provideInstance] = mod[manifest.provideInstance];
+            }
+        }
+
+        // Check for exported instances that have init() methods. Only reached by modules
+        // with NO init-function export — one exporting init*/initialize* (e.g.
+        // onboardingManager's initOnboardingManager) takes the branch above instead.
+        // These are pre-created singletons that need initialization after dependencies are set.
+        // Any singleton exposing destroy() is registered in moduleInstances so
+        // destroy-on-retry reaches its listeners/timers — previously no-init modules
+        // (e.g. dailyResetManager) were invisible to destroyAllModules() (audit C3).
+        if (manifest.provides || manifest.provideInstance) {
+            const probeNames = [...(manifest.provides || [])];
+            if (manifest.provideInstance) probeNames.push(manifest.provideInstance);
+            const destroyables = [];
+            for (const provided of new Set(probeNames)) {
+                const exportedInstance = mod[provided];
+                if (!exportedInstance || typeof exportedInstance !== 'object') continue;
+                if (typeof exportedInstance.init === 'function' && !exportedInstance.initialized) {
+                    try {
+                        await exportedInstance.init();
+                    } catch (initError) {
+                        // Record the failure, don't just log it: a swallowed
+                        // singleton init() (e.g. a dead dailyResetManager timer)
+                        // otherwise looks healthy to App Diagnostics and every
+                        // getStatus-style probe. Deliberately NOT rethrown for
+                        // required modules yet — first find out which modules
+                        // actually flow through this branch in the wild.
+                        featureAvailability.markFailed(name, initError);
+                        console.warn(`⚠️ ${name}.${provided}.init() failed:`, initError.message);
+                    }
+                }
+                if (typeof exportedInstance.destroy === 'function' && !destroyables.includes(exportedInstance)) {
+                    destroyables.push(exportedInstance);
+                }
+            }
+            if (destroyables.length && !moduleInstances.has(name)) {
+                moduleInstances.set(
+                    name,
+                    destroyables.length === 1 ? destroyables[0] : {
+                        destroy() {
+                            for (const d of destroyables) {
+                                try { d.destroy(); } catch (e) { console.warn(`[moduleLoader] destroy() failed for ${name} singleton:`, e); }
+                            }
+                        }
+                    }
+                );
+            }
+        }
+
+        return mod;
+    } catch (error) {
+        if (manifest.optional) {
+            console.warn(`⚠️ Optional module ${name} failed to initialize:`, error.message);
+            featureAvailability.markFailed(name, error);
+            return null;
+        }
+        console.error(`❌ Failed to initialize ${name}:`, error);
+        throw error;
+    }
+}
+
+// ============================================================================
+// PHASE LOADING
+// ============================================================================
+
+/**
+ * Load all modules in a specific phase
+ * @param {Object} deps - Dependencies container
+ * @param {Object} coreResult - Results from coreBoot
+ * @param {number} phase - Phase number to load
+ * @returns {Promise<Map<string, Object>>} Map of loaded modules
+ */
+export async function loadPhase(deps, coreResult, phase) {
+    const { withV } = coreResult;
+    const myGeneration = globalThis.__miniCycleBootGeneration;
+
+    // ✅ Ensure manifests are loaded (idempotent - only loads once)
+    if (!_manifestsLoaded) {
+        await loadManifests(withV);
+    }
+    const modules = getModulesByPhase(phase);
+    const results = new Map();
+
+    // Non-deferred modules, in the manifest's dependency order. Deferred modules
+    // load on-demand via ensureModuleLoaded().
+    const active = modules.filter(([, manifest]) => !manifest.deferred);
+
+    // ⚡ Stage 1 — FETCH (import + parse) in parallel. This is the boot-time win: it
+    // collapses N sequential fetch/parse round-trips into one batch. NO wiring here —
+    // import() is order-independent/idempotent, but wiring is NOT (building the deps
+    // object eagerly captures cross-module deps — see loadModule), so wiring is
+    // deferred to Stage 2.
+    // A non-optional import failure rejects here, aborting boot exactly as before
+    // (optional modules resolve to null inside loadModule).
+    await Promise.all(
+        active.map(([name]) => loadModule(name, deps, coreResult, withV, /* wire */ false))
+    );
+
+    // ⚡ Stage 2 — WIRE + INITIALIZE sequentially, in dependency order. setDependencies
+    // runs HERE (after each earlier module's init() has registered its provides), so a
+    // module captures same-phase providers correctly — identical semantics to the
+    // original per-module sequential loop, with ONLY the import parallelized.
+    for (const [name, manifest] of active) {
+        // Checkpoint: if a retry superseded this attempt while we were awaiting
+        // the previous module's init, stop before wiring anything else stale.
+        assertBootGenerationCurrent(myGeneration);
+
+        const mod = loadedModules.get(name);
+        if (!mod) continue; // optional import failed → skip
+
+        // ⏱️ Per-module wire+init measure (`mc:module:<name>:init`). Stage 2 is
+        // sequential, so these ARE additive — they include buildModuleDependencies
+        // (the DI-wiring cost) plus the module's init(). getBootTiming() ranks them.
+        const initStartMark = `mc:module:${name}:init:start`;
+        try { performance.mark(initStartMark); } catch (_) { /* perf API unavailable */ }
+
+        const setDepsFn = findSetDependenciesFunction(mod, name);
+        if (setDepsFn) {
+            setDepsFn(buildModuleDependencies(manifest, deps, coreResult));
+        }
+
+        const instance = await initializeModule(name, mod, deps, coreResult);
+        try { performance.measure(`mc:module:${name}:init`, initStartMark); } catch (_) { /* mark missing */ }
+        results.set(name, instance || mod);
+    }
+
+    return results;
+}
+
+/**
+ * Load all modules in correct order
+ * @param {Object} deps - Dependencies container
+ * @param {Object} coreResult - Results from coreBoot
+ * @returns {Promise<Object>} All loaded modules and instances
+ */
+export async function loadAllModules(deps, coreResult) {
+    const { appInit, withV } = coreResult;
+
+    // Capture boot context so deferred modules can be loaded on-demand after boot.
+    _bootDeps = deps;
+    _bootCoreResult = coreResult;
+    _bootGeneration = globalThis.__miniCycleBootGeneration;
+
+    // ✅ FIX: Load manifests with version cache-busting BEFORE using any manifest data
+    // This prevents stale cached manifests from causing 404s on moved/renamed modules
+    await loadManifests(withV);
+
+    // ✅ Check for circular dependencies before loading
+    detectCircularDeps(MODULE_MANIFESTS);
+
+    // ✅ Validate cross-phase dependencies (warns about undeclared lazyRequires)
+    validateCrossPhaseDeps();
+
+    // Ensure core systems (AppState, Schema 2.5 data) are ready before loading modules
+    if (appInit && !appInit.isCoreReady()) {
+        await appInit.waitForCore();
+    }
+
+    const results = {
+        modules: new Map(),
+        instances: new Map(),
+        apis: {}
+    };
+
+    // Load each phase in order.
+    // ⏱️ Per-phase timing: emit a `mc:subphase:<NAME>` performance measure for each
+    // phase so getBootTiming() can rank which phase dominates the features window
+    // (the bulk of boot when profiled). Measures are read by name in orchestrator.js —
+    // see clearBootTiming()/getBootTiming() for the matching prefix scan.
+    for (const [phaseName, phase] of Object.entries(PHASES)) {
+        // Checkpoint: abort between phases if a retry superseded this attempt.
+        assertBootGenerationCurrent(_bootGeneration);
+        const startMark = `mc:subphase:${phaseName}:start`;
+        try { performance.mark(startMark); } catch (_) { /* perf API unavailable */ }
+        const phaseResults = await loadPhase(deps, coreResult, phase);
+        // 2-arg measure: startMark → now. Swallows if the mark is missing.
+        try { performance.measure(`mc:subphase:${phaseName}`, startMark); } catch (_) { /* mark missing */ }
+        for (const [name, result] of phaseResults) {
+            results.modules.set(name, loadedModules.get(name));
+            results.instances.set(name, result);
+        }
+    }
+
+    // Build grouped APIs
+    results.apis = buildGroupedApis(deps);
+
+    // Cross-module injections (run at boot; re-run after each on-demand load).
+    runPostInitInjections(deps);
+
+    return results;
+}
+
+/**
+ * Cross-module injections that must run after the relevant modules exist.
+ * Called once at the end of boot, and again after each on-demand (deferred)
+ * module load, so a late-arriving provider gets wired into already-loaded
+ * consumers. Each injection is guarded on its consumer and primary provider, so it
+ * no-ops until both exist (reapplyActiveFilter rides on updateSearchVisibility's guard).
+ * @param {Object} deps - Dependencies container
+ */
+function runPostInitInjections(deps) {
+    // Inject taskOptionsCustomizer into taskDOMManager (required for three-dots menu)
+    if (deps.task?.taskDOMManager && deps.ui?.taskOptionsCustomizer) {
+        if (typeof deps.task.taskDOMManager.injectDependency === 'function') {
+            deps.task.taskDOMManager.injectDependency('taskOptionsCustomizer', deps.ui.taskOptionsCustomizer);
+        }
+    }
+
+    // Inject enableDragAndDropOnTask into taskDOMManager (required for long-press after refresh)
+    if (deps.task?.taskDOMManager && deps.task?.enableDragAndDropOnTask) {
+        if (typeof deps.task.taskDOMManager.injectDependency === 'function') {
+            deps.task.taskDOMManager.injectDependency('enableDragAndDropOnTask', deps.task.enableDragAndDropOnTask);
+        }
+    }
+
+    // Inject updateSearchVisibility into TaskRenderer (for task search visibility)
+    if (deps.task?.taskDOMManager?.renderer && deps.ui?.updateSearchVisibility) {
+        if (typeof deps.task.taskDOMManager.renderer.injectDependency === 'function') {
+            deps.task.taskDOMManager.renderer.injectDependency('updateSearchVisibility', deps.ui.updateSearchVisibility);
+            deps.task.taskDOMManager.renderer.injectDependency('reapplyActiveFilter', deps.ui.reapplyActiveFilter);
+        }
+    }
+
+    // Inject completed-tasks wiring into TaskRenderer.
+    // - completedTasksManager instance: lets renderTasks project BOTH lists from state during
+    //   the atomic swap (isEnabled / prepareCompletedNode / updateCount) — render-path unification.
+    // - organizeCompletedTasks: retained for patch renders (undo/redo) that move nodes in place.
+    if (deps.task?.taskDOMManager?.renderer && deps.ui?.completedTasksManager) {
+        if (typeof deps.task.taskDOMManager.renderer.injectDependency === 'function') {
+            deps.task.taskDOMManager.renderer.injectDependency('completedTasksManager',
+                deps.ui.completedTasksManager
+            );
+            deps.task.taskDOMManager.renderer.injectDependency('organizeCompletedTasks',
+                () => deps.ui.completedTasksManager.organize?.()
+            );
+        }
+    }
+}
+
+/**
+ * Load a DEFERRED module on-demand (after boot) and register its provides.
+ * Idempotent — a module loaded once is cached and never re-fetched. Any deferred
+ * prerequisites (manifest `after` + deferred `requires` providers) are loaded
+ * first so this module's setDependencies sees them populated. Consumers reach
+ * the new provides through the existing lazy depMappings wrappers, so nothing
+ * needs rewiring.
+ * @param {string} name - Module name from manifests
+ * @returns {Promise<Object|null>} The module instance (or raw module), or null.
+ */
+export async function ensureModuleLoaded(name) {
+    if (moduleInstances.has(name)) return moduleInstances.get(name);
+    // A stale moduleLoader instance from a superseded boot attempt must not
+    // wire a deferred module with its outdated _bootDeps/_bootCoreResult.
+    assertBootGenerationCurrent(_bootGeneration);
+    if (!_bootDeps || !_bootCoreResult) {
+        console.warn(`⚠️ ensureModuleLoaded('${name}') called before boot captured context`);
+        return null;
+    }
+    const manifest = MODULE_MANIFESTS[name];
+    if (!manifest) {
+        console.warn(`⚠️ ensureModuleLoaded: unknown module '${name}'`);
+        return null;
+    }
+
+    // Resolve deferred prerequisites first (explicit `after` + providers of `requires`).
+    const prereqs = new Set(manifest.after || []);
+    for (const req of manifest.requires || []) {
+        const provider = findDeferredProvider(req);
+        if (provider) prereqs.add(provider);
+    }
+    for (const dep of prereqs) {
+        if (dep !== name && MODULE_MANIFESTS[dep]?.deferred && !moduleInstances.has(dep)) {
+            await ensureModuleLoaded(dep);
+        }
+    }
+
+    const { withV } = _bootCoreResult;
+    const mod = await loadModule(name, _bootDeps, _bootCoreResult, withV);
+    if (!mod) return null;
+    // ⏱️ Same `mc:module:<name>:init` measure as loadPhase Stage 2, so on-demand
+    // (deferred) loads rank alongside boot loads in getBootTiming().moduleTimings —
+    // their import `at_ms` places them after boot-interactive.
+    const initStartMark = `mc:module:${name}:init:start`;
+    try { performance.mark(initStartMark); } catch (_) { /* perf API unavailable */ }
+    const instance = await initializeModule(name, mod, _bootDeps, _bootCoreResult);
+    try { performance.measure(`mc:module:${name}:init`, initStartMark); } catch (_) { /* mark missing */ }
+    // Wire the new provider into already-loaded consumers.
+    runPostInitInjections(_bootDeps);
+    return instance ?? mod;
+}
+
+/**
+ * Find which module provides a given API name (provides[] or provideInstance).
+ * Used by ensureModuleLoaded to resolve deferred prerequisites.
+ * @param {string} apiName
+ * @returns {string|null} Module name, or null if no manifest provides it.
+ */
+function findDeferredProvider(apiName) {
+    const canonical = resolveAlias(apiName);
+    for (const [mName, m] of Object.entries(MODULE_MANIFESTS)) {
+        if (m.provideInstance === canonical) return mName;
+        if (m.provides?.includes(canonical)) return mName;
+    }
+    return null;
+}
+
+/**
+ * Invoke a provide from a DEFERRED module, loading the module first if needed.
+ * Used inside depMappings for entry points triggered purely via DI (e.g.
+ * gamesManager.unlockMiniGame from a cycle milestone). If the provide already
+ * resolves it's called synchronously (return value preserved). Otherwise the
+ * module loads on-demand and the call runs after — fire-and-forget friendly
+ * (returns a Promise callers may ignore).
+ *
+ * Only use this for entry points that represent genuine user-intent moments —
+ * NOT for hot-path or boot-time calls, or the module would load eagerly anyway.
+ * @param {string} moduleName - Deferred module to ensure
+ * @param {Function} resolve - Returns the resolved provide fn (or undefined)
+ * @param {Array} args - Arguments to pass to the provide
+ */
+function deferredInvoke(moduleName, resolve, args) {
+    const fn = resolve();
+    if (typeof fn === 'function') return fn(...args);
+    return ensureModuleLoaded(moduleName).then(() => {
+        const f = resolve();
+        return typeof f === 'function' ? f(...args) : undefined;
+    });
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Find the setDependencies function for a module
+ * @param {Object} mod - Loaded module
+ * @param {string} name - Module name
+ * @returns {Function|null}
+ */
+function findSetDependenciesFunction(mod, name) {
+    // Try common naming patterns
+    const patterns = [
+        `set${capitalize(name)}Dependencies`,
+        'setDependencies',
+        'setModuleDependencies'
+    ];
+
+    for (const pattern of patterns) {
+        if (typeof mod[pattern] === 'function') {
+            return mod[pattern];
+        }
+    }
+
+    // Look for any function starting with 'set' and ending with 'Dependencies'
+    for (const key of Object.keys(mod)) {
+        if (key.startsWith('set') && key.endsWith('Dependencies') && typeof mod[key] === 'function') {
+            return mod[key];
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Find the init function for a module
+ * @param {Object} mod - Loaded module
+ * @param {string} name - Module name
+ * @returns {Function|null}
+ */
+function findInitFunction(mod, name) {
+    // Try common naming patterns
+    const patterns = [
+        `init${capitalize(name)}`,
+        `initialize${capitalize(name)}`,
+        'init',
+        'initialize'
+    ];
+
+    for (const pattern of patterns) {
+        if (typeof mod[pattern] === 'function') {
+            return mod[pattern];
+        }
+    }
+
+    // Also search for any exported function starting with 'init' or 'initialize'
+    // This handles cases like initTaskValidator for module taskValidation
+    for (const key of Object.keys(mod)) {
+        if ((key.startsWith('init') || key.startsWith('initialize')) &&
+            typeof mod[key] === 'function' &&
+            key !== 'initDependencies') {  // Skip dependency setters
+            return mod[key];
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Inject a module's declared dependencies into `result`.
+ *
+ * All three declaration buckets — requires, optionalDeps, lazyRequires — are
+ * resolved identically (from depMappings, falling back to coreResult) so they
+ * all survive ENFORCE_REQUIRES mode (on by default since Aug 2026). With the flag
+ * false they're also supplied by the broad `Object.assign(result, depMappings)`,
+ * but that assign is skipped while ENFORCE_REQUIRES is true, so this is the only
+ * path — omitting optionalDeps here (as the loader previously did) makes every
+ * optional dep silently resolve to undefined.
+ *
+ * The assignment READS each depMappings entry, so a getter entry is invoked here
+ * and stored as a plain value: the built deps object never carries depMappings
+ * getters through to the module.
+ *
+ * Caller validates requires/lazyRequires separately; optionalDeps are not
+ * validated (they're allowed to be absent). Exported for unit testing the
+ * strict-mode injection path.
+ *
+ * @param {Object} result - Dependency object being assembled (mutated in place)
+ * @param {Object} manifest - Module manifest (reads requires/optionalDeps/lazyRequires)
+ * @param {Object} depMappings - Map of dep name → resolver
+ * @param {Object} coreResult - Phase-1 boot results, used as a fallback source
+ * @returns {Object} the same `result`, for chaining
+ */
+export function injectDeclaredDeps(result, manifest, depMappings, coreResult) {
+    const declared = [
+        ...(manifest.requires || []),
+        ...(manifest.optionalDeps || []),
+        ...(manifest.lazyRequires || []),
+    ];
+    for (const dep of declared) {
+        if (dep in depMappings) {
+            result[dep] = depMappings[dep];
+        } else if (coreResult && dep in coreResult) {
+            result[dep] = coreResult[dep];
+        }
+    }
+    return result;
+}
+
+/**
+ * Inject framework-level CORE_DEPS into `result`.
+ *
+ * CORE_DEPS are always available and never declared in a manifest. They come
+ * from two sources: a handful (AppState, appInit, GlobalUtils, AppGlobalState,
+ * FeatureFlags, AppMeta) are set directly on `result` by the Phase-1 prologue of
+ * buildModuleDependencies; the rest (DOM helpers, sanitizeInput, generateId, the
+ * safe* utilities, …) are entries in `depMappings`. With ENFORCE_REQUIRES false the
+ * latter arrive via the broad `Object.assign(result, depMappings)`, but that
+ * assign is skipped under ENFORCE_REQUIRES (the default) — so without this loop every
+ * depMappings-sourced CORE_DEP (e.g. getElementById) would be undefined in strict
+ * mode and modules using it would break.
+ *
+ * Only CORE_DEPS that are depMappings keys are touched; the Phase-1 ones are NOT
+ * depMappings keys, so this never overwrites the AppState Proxy or its siblings.
+ * Behavior-neutral under ENFORCE_REQUIRES=false (the broad assign re-applies the
+ * identical values immediately after). Exported for unit testing.
+ *
+ * @param {Object} result - Dependency object being assembled (mutated in place)
+ * @param {Set<string>|Iterable<string>} coreDeps - The CORE_DEPS set
+ * @param {Object} depMappings - Map of dep name → resolver
+ * @returns {Object} the same `result`, for chaining
+ */
+export function injectCoreDeps(result, coreDeps, depMappings) {
+    for (const coreDep of coreDeps) {
+        if (coreDep in depMappings) {
+            result[coreDep] = depMappings[coreDep];
+        }
+        // CORE_DEPS not in depMappings are Phase-1 boot deps (AppState, appInit,
+        // …) already set on `result` before this runs — intentionally left alone.
+    }
+    return result;
+}
+
+/**
+ * Build dependencies object for a module based on its manifest
+ * @param {Object} manifest - Module manifest
+ * @param {Object} deps - Dependencies container
+ * @param {Object} coreResult - Results from coreBoot
+ * @returns {Object}
+ */
+function buildModuleDependencies(manifest, deps, coreResult) {
+    const { GlobalUtils, appInit, AppGlobalState, FeatureFlags } = coreResult;
+    const result = {};
+
+    // Add core dependencies
+    result.appInit = appInit;
+    result.GlobalUtils = GlobalUtils;
+    result.AppGlobalState = AppGlobalState;
+    result.FeatureFlags = FeatureFlags;
+    result.AppMeta = deps.core?.AppMeta;
+    // AppState: callable Proxy that works both as function and object
+    // - this.deps.AppState() returns the AppState object (for settingsManager, etc.)
+    // - this.deps.AppState?.isReady?.() works via property access (for taskCore, etc.)
+    // - this.deps.AppState.data = x works via property assignment (the set trap forwards it)
+    const appStateGetter = () => deps.core?.AppState;
+    // Methods the codebase calls on AppState. When the underlying manager is not
+    // yet available (boot retry / teardown), accessing any of these must yield a
+    // SAFE NO-OP function rather than `undefined` — otherwise `AppState?.get()`
+    // throws "AppState?.get is not a function" (the `?.` can't short-circuit a
+    // truthy Proxy), which crashes the boot-error renderer and the global error
+    // handler and produces a blank white screen. Returning `() => undefined`
+    // honors the `if (!state) ...` guards that already exist at ~50 call sites.
+    const APPSTATE_SAFE_METHODS = new Set([
+        'get', 'update', 'subscribe', 'unsubscribe', 'isReady', 'forceSave',
+        'set', 'reload', 'init', 'destroy', 'save', '_initializeInternal'
+    ]);
+    result.AppState = new Proxy(appStateGetter, {
+        get(target, prop) {
+            if (prop === 'apply' || prop === 'call' || prop === 'bind') {
+                return target[prop].bind(target);
+            }
+            // Proxy property access to the actual AppState
+            // Must bind methods to preserve 'this' context when called
+            const appState = deps.core?.AppState;
+            if (!appState) {
+                // Not ready: method-style access becomes a safe no-op (returns
+                // undefined when called); property reads (data, saveTimeout, …)
+                // resolve to undefined, which all consumers treat as falsy.
+                return APPSTATE_SAFE_METHODS.has(prop) ? () => undefined : undefined;
+            }
+            const value = appState[prop];
+            if (typeof value === 'function') {
+                return value.bind(appState);
+            }
+            return value;
+        },
+        set(target, prop, value) {
+            // Proxy property assignment to the actual AppState
+            const appState = deps.core?.AppState;
+            if (appState) {
+                appState[prop] = value;
+                return true;
+            }
+            // Fix #46: Return true to avoid TypeError in strict mode
+            // Log warning since AppState isn't ready yet
+            console.warn(`⚠️ AppState proxy: Cannot set "${prop}" - AppState not initialized yet`);
+            return true;
+        },
+        apply(target, thisArg, args) {
+            // Allow function call: this.deps.AppState()
+            return target();
+        }
+    });
+
+    // Map common dependencies from deps container
+    const depMappings = {
+        // Core
+        autoSave: () => deps.core?.autoSave?.(),
+        updateCycleData: (...args) => deps.core?.updateCycleData?.(...args),
+        assignCycleVariables: () => deps.core?.assignCycleVariables?.(),
+
+        // Utils
+        showNotification: deps.utils?.showNotification,
+        showNotificationWithTip: deps.utils?.showNotificationWithTip,
+        notifications: deps.utils?.notifications,
+        showConfirmationModal: deps.utils?.showConfirmationModal,
+        showChoiceModal: deps.utils?.showChoiceModal,
+        showPromptModal: deps.utils?.showPromptModal,
+        sanitizeInput: deps.utils?.sanitizeInput || GlobalUtils?.sanitizeInput,
+        generateId: deps.utils?.generateId,
+        generateHashId: deps.utils?.generateHashId,
+        escapeHtml: deps.utils?.escapeHtml,
+        safeAddEventListener: GlobalUtils?.safeAddEventListener,
+        safeAddEventListenerById: GlobalUtils?.safeAddEventListenerById,
+        isTouchDevice: (...args) => deps.utils?.isTouchDevice?.(...args),
+
+        // Debug mode (from versioned debugMode via deps.utils)
+        enableDebug: (...args) => deps.utils?.enableDebug?.(...args),
+        disableDebug: (...args) => deps.utils?.disableDebug?.(...args),
+        isDebug: () => deps.utils?.isDebug?.(),
+
+        // Constants
+        DEFAULT_TASK_OPTION_BUTTONS: deps.utils?.DEFAULT_TASK_OPTION_BUTTONS,
+
+        // DOM helpers
+        getElementById: (id) => document.getElementById(id),
+        querySelector: (sel) => document.querySelector(sel),
+        querySelectorAll: (sel) => document.querySelectorAll(sel),
+        getBody: () => document.body,
+        getRootElement: () => document.documentElement,
+        getActiveElement: () => document.activeElement,
+        getTaskList: () => document.getElementById(DOM_IDS.TASK_LIST),
+        getProgressBar: () => document.getElementById(DOM_IDS.PROGRESS_BAR),
+
+        // Loading overlay (registered by uiBoot in Phase 3 — lazy wrapper functions)
+        showLoader: (...args) => deps.ui?.showLoader?.(...args),
+        hideLoader: (...args) => deps.ui?.hideLoader?.(...args),
+
+        // Modal registry
+        getModal: (...args) => deps.ui?.getModal?.(...args),
+        invalidateModal: (...args) => deps.ui?.invalidateModal?.(...args),
+        clearModalCache: (...args) => deps.ui?.clearModalCache?.(...args),
+
+        // Safe storage
+        safeLocalStorageGet: GlobalUtils?.safeLocalStorageGet,
+        safeLocalStorageSet: GlobalUtils?.safeLocalStorageSet,
+        safeJSONParse: GlobalUtils?.safeJSONParse,
+        safeJSONStringify: GlobalUtils?.safeJSONStringify,
+
+        // Console capture (from deps.utils) - use getter for lazy resolution
+        get consoleCapture() { return deps.utils?.consoleCapture; },
+
+        // Backup manager (from deps.storage) - use getter for lazy resolution
+        get backupManager() { return deps.storage?.backupManager; },
+
+        // From appContext (registered by coreBoot/featureBoot) - wrapper functions for lazy resolution
+        completeInitialSetup: (...args) => getCompleteInitialSetup()?.(...args),
+
+        // UI functions (from appContext or deps.ui) - validated lazy wrappers
+        hideMainMenu: createValidatedWrapper('hideMainMenu',
+            () => getHideMainMenu() || deps.ui?.hideMainMenu),
+        // Provided by menuManager — focusMode menu calls these for "uncheck all" / "delete all"
+        clearAllTasks: (...args) => deps.ui?.clearAllTasks?.(...args),
+        deleteAllTasks: (...args) => deps.ui?.deleteAllTasks?.(...args),
+        updateProgressBar: createValidatedWrapper('updateProgressBar',
+            () => deps.progress?.updateProgressBar),
+        checkCompleteAllButton: createValidatedWrapper('checkCompleteAllButton',
+            () => deps.ui?.checkCompleteAllButton),
+        applyCustomColors: createValidatedWrapper('applyCustomColors',
+            () => deps.ui?.applyCustomColors),
+
+        // Theme manager instance (from deps.features) - returns instance when called as function
+        themeManager: () => deps.features?.themeManager,
+
+        // Theme functions (from themeManager in deps.features)
+        setupDarkModeToggle: (...args) => deps.features?.setupDarkModeToggle?.(...args),
+        setupQuickDarkToggle: (...args) => deps.features?.setupQuickDarkToggle?.(...args),
+        updateThemeColor: (...args) => deps.features?.updateThemeColor?.(...args),
+        initThemesPanel: (...args) => deps.features?.initThemesPanel?.(...args),
+        refreshThemeToggles: (...args) => deps.features?.refreshThemeToggles?.(...args),
+        setupThemesPanel: (...args) => deps.features?.setupThemesPanel?.(...args),
+        renderVocabThemes: (...args) => deps.features?.renderVocabThemes?.(...args),
+        refreshThemeLabels: (...args) => deps.features?.themeManager?.refreshThemeLabels?.(...args),
+
+        // Games functions (from gamesManager instance in deps.ui).
+        // gamesManager is DEFERRED — unlockMiniGame (fired by a cycle milestone)
+        // auto-loads it so the unlock persists. checkGamesUnlock stays a plain
+        // lazy no-op: menuManager calls it once at boot setup, and forcing a load
+        // there would defeat deferral. Menu-open loads gamesManager via the stub
+        // in uiBoot.setupDeferredFeatureTriggers, whose init runs checkGamesUnlock.
+        unlockMiniGame: (...args) => deferredInvoke('gamesManager', () => {
+            const g = deps.ui?.gamesManager;
+            return g?.unlockMiniGame ? g.unlockMiniGame.bind(g) : undefined;
+        }, args),
+        checkGamesUnlock: (...args) => deps.ui?.gamesManager?.checkGamesUnlock?.(...args),
+
+        // Task functions (from task modules in deps.task) - lazy resolution for cross-phase deps
+        validateAndSanitizeTaskInput: (...args) => deps.task?.validateAndSanitizeTaskInput?.(...args),
+        loadTaskContext: (...args) => deps.task?.loadTaskContext?.(...args),
+        createOrUpdateTaskData: (...args) => deps.task?.createOrUpdateTaskData?.(...args),
+        createTaskDOMElements: (...args) => deps.task?.createTaskDOMElements?.(...args),
+        setupTaskInteractions: (...args) => deps.task?.setupTaskInteractions?.(...args),
+        finalizeTaskCreation: (...args) => deps.task?.finalizeTaskCreation?.(...args),
+        refreshTaskListUI: (...args) => deps.task?.refreshTaskListUI?.(...args),
+        renderTasks: (...args) => deps.task?.renderTasks?.(...args),
+        // Repaints priority accents after a vocab theme change (themeManager) —
+        // they are the task's level under the ACTIVE theme, not a stored hex
+        refreshTaskPriorityColors: (...args) => deps.task?.refreshTaskPriorityColors?.(...args),
+        addTask: (...args) => deps.task?.addTask?.(...args),
+        resetTasks: (...args) => deps.task?.resetTasks?.(...args),
+        handleTaskCompletionChange: (...args) => deps.task?.handleTaskCompletionChange?.(...args),
+        saveTaskToSchema25: (...args) => deps.task?.saveTaskToSchema25?.(...args),
+        taskToAddTaskOptions: (...args) => deps.task?.taskToAddTaskOptions?.(...args),
+
+        // Task button container and click handler (from taskDOM)
+        createTaskButtonContainer: (...args) => deps.task?.createTaskButtonContainer?.(...args),
+        handleTaskButtonClick: (...args) => deps.task?.handleTaskButtonClick?.(...args),
+        setupRecurringButtonHandler: (...args) => deps.task?.setupRecurringButtonHandler?.(...args),
+        revealTaskButtons: (...args) => deps.task?.revealTaskButtons?.(...args),
+
+        // TaskCore instance (for editTask, deleteTask, toggleTaskPriority) - lazy proxy
+        taskCore: new Proxy({}, {
+            get(target, prop) {
+                return deps.task?.taskCore?.[prop];
+            }
+        }),
+
+        // Task list rendering (loads from AppState then renders)
+        renderTaskList: () => deps.task?.refreshTaskListUI?.(),
+
+        // Mode sync (from GlobalUtils)
+        syncAllTasksWithMode: (...args) => GlobalUtils?.syncAllTasksWithMode?.(...args),
+
+        // Drag & drop functions (from deps.task)
+        enableDragAndDropOnTask: (...args) => deps.task?.enableDragAndDropOnTask?.(...args),
+        updateMoveArrowsVisibility: (...args) => deps.task?.updateMoveArrowsVisibility?.(...args),
+        updateArrowsInDOM: (...args) => deps.task?.updateArrowsInDOM?.(...args),
+
+        // Cycle functions (from cycle modules in deps.cycle) - lazy resolution
+        switchMiniCycle: (...args) => deps.cycle?.switchMiniCycle?.(...args),
+        renameMiniCycle: (...args) => deps.cycle?.renameMiniCycle?.(...args),
+        deleteMiniCycle: (...args) => deps.cycle?.deleteMiniCycle?.(...args),
+        loadMiniCycle: (...args) => deps.cycle?.loadMiniCycle?.(...args),
+        showCycleCreationModal: (...args) => deps.cycle?.showCycleCreationModal?.(...args),
+        createNewMiniCycle: (...args) => deps.cycle?.createNewMiniCycle?.(...args),
+        preloadGettingStartedCycle: (...args) => deps.cycle?.preloadGettingStartedCycle?.(...args),
+        preloadInitialRunCycle: (...args) => deps.cycle?.preloadInitialRunCycle?.(...args),
+        checkMiniCycle: (...args) => deps.progress?.checkMiniCycle?.(...args),
+        incrementCycleCount: (...args) => deps.progress?.incrementCycleCount?.(...args),
+        showCompletionAnimation: (...args) => deps.progress?.showCompletionAnimation?.(...args),
+        showClearAnimation: (...args) => deps.progress?.showClearAnimation?.(...args),
+        animateProgressBarFill: (...args) => deps.progress?.animateProgressBarFill?.(...args),
+        animateProgressBarEmpty: (...args) => deps.progress?.animateProgressBarEmpty?.(...args),
+        showMilestoneCelebrationOverlay: (...args) => deps.progress?.showMilestoneCelebrationOverlay?.(...args),
+
+        // UI functions (from deps.ui) - validated lazy wrappers for critical functions
+        refreshUIFromState: createValidatedWrapper('refreshUIFromState',
+            () => deps.task?.refreshUIFromState),
+        closeAllModals: createValidatedWrapper('closeAllModals',
+            () => deps.ui?.modalManager?.closeAllModals),
+        isModalOpen: () => deps.ui?.modalManager?.isModalOpen?.(),
+        // Overlay-active check (provided by uiBoot.js) — covers any open <dialog>,
+        // visible main menu, notifications, onboarding modal, etc. Used by
+        // gesturePanelManager, statsPanel + recurringIntegration to suppress swipes/gestures
+        // while a modal/overlay is up. Falls back to false if uiBoot hasn't run.
+        isOverlayActive: () => deps.ui?.isOverlayActive?.() ?? false,
+        updateMainMenuHeader: createValidatedWrapper('updateMainMenuHeader',
+            () => deps.ui?.updateMainMenuHeader),
+        organizeCompletedTasks: (...args) => deps.ui?.completedTasksManager?.organize?.(...args),
+        initCompletedTasksSection: (...args) => deps.ui?.completedTasksManager?.init?.(...args),
+        handleTaskListMovement: (...args) => deps.ui?.completedTasksManager?.handleMovement?.(...args),
+        updateCompletedTasksCount: (...args) => deps.ui?.completedTasksManager?.updateCount?.(...args),
+        // Returns the completedTasksManager INSTANCE when called (matches statsPanelManager pattern)
+        completedTasksManager: () => deps.ui?.completedTasksManager,
+        updateStatsPanel: (...args) => deps.ui?.updateStatsPanel?.(...args),
+        exportMiniCycleData: (...args) => deps.ui?.exportMiniCycleData?.(...args),
+        shareCurrentRoutine: (...args) => deps.ui?.shareCurrentRoutine?.(...args),
+        startGuidedTour: (...args) => deps.ui?.startGuidedTour?.(...args),
+        markTourWelcomeShown: (...args) => deps.ui?.markTourWelcomeShown?.(...args),
+        // Provided by taskUI module (api: 'ui' — registered under deps.ui, not deps.task)
+        hideTaskButtons: (...args) => deps.ui?.hideTaskButtons?.(...args),
+        // Provided by taskSearch module — toggles search row visibility
+        updateSearchVisibility: (...args) => deps.ui?.updateSearchVisibility?.(...args),
+        // Provided by taskSearch module — restores filter/sort after a render
+        reapplyActiveFilter: (...args) => deps.ui?.reapplyActiveFilter?.(...args),
+        // Provided by basicPluginSystem module — instance accessor
+        pluginManager: () => deps.plugins?.pluginManager,
+        // Provided by dataValidator module — utils API category
+        DataValidator: () => deps.utils?.DataValidator,
+        // Registered by coreBoot at deps.core (migration module export) — utils/cycle kept as legacy fallbacks
+        createInitialSchema25Data: (...args) => (deps.core?.createInitialSchema25Data || deps.utils?.createInitialSchema25Data || deps.cycle?.createInitialSchema25Data)?.(...args),
+
+        // ─── Boot/init helpers ───
+        // Method on appInit instance — modules use it as a top-level dep instead of accessing appInit.waitForCore()
+        waitForCore: (...args) => deps.core?.appInit?.waitForCore?.(...args),
+
+        // ─── Recurring system functions (provided by recurringCore / recurringPanel) ───
+        applyRecurringToTaskSchema25: (...args) => deps.recurring?.core?.applyRecurringToTaskSchema25?.(...args),
+        openRecurringSettingsPanelForTask: (...args) => deps.recurring?.panel?.openRecurringSettingsPanelForTask?.(...args),
+        calculateNextOccurrence: (...args) => deps.recurring?.core?.calculateNextOccurrence?.(...args),
+
+        // ─── Task DOM helpers ───
+        syncRecurringStateToDOM: (...args) => deps.task?.syncRecurringStateToDOM?.(...args),
+        toggleHoverTaskOptions: (...args) => deps.task?.toggleHoverTaskOptions?.(...args),
+
+        // ─── Feature modules ───
+        setupDueDateButtonInteraction: (...args) => deps.features?.dueDates?.setupDueDateButtonInteraction?.(...args),
+
+        // ─── Storage / backup ───
+        // Returns the backupManager INSTANCE (matches statsPanelManager / completedTasksManager pattern)
+        BackupManager: () => deps.storage?.backupManager,
+
+        // ─── Settings ───
+        resetDefaultRecurringSettings: (...args) => deps.ui?.settingsManager?.resetDefaultRecurringSettings?.(...args),
+
+        // ─── Global state checks ───
+        // Returns the boolean flag (call-as-function for consistency with other depMappings)
+        isPerformingUndoRedo: () => deps.core?.AppGlobalState?.isPerformingUndoRedo ?? false,
+        // Notification drag state — used by gesture / swipe handlers to skip while dragging a toast
+        isDraggingNotification: () => deps.utils?.notifications?.isDraggingNotification ?? false,
+
+        // ─── Constants injected via deps.core (set by coreBoot) ───
+        // Direct value access (not a function wrapper) — depMappings is built per-module
+        // inside buildModuleDependencies, so deps.core is already populated by this point.
+        DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS: deps.core?.DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS,
+        enableTourPrompts: (...args) => deps.ui?.enableTourPrompts?.(...args),
+        showStatsTourNotification: (...args) => deps.ui?.showStatsTourNotification?.(...args),
+        showPersonalizationTourNotification: (...args) => deps.ui?.showPersonalizationTourNotification?.(...args),
+        showTaskOptionsTourNotification: (...args) => deps.ui?.showTaskOptionsTourNotification?.(...args),
+        showRemindersTourNotification: (...args) => deps.ui?.showRemindersTourNotification?.(...args),
+        showMenuTourNotification: (...args) => deps.ui?.showMenuTourNotification?.(...args),
+        showSettingsTourNotification: (...args) => deps.ui?.showSettingsTourNotification?.(...args),
+        showRoutineSwitcherTourNotification: (...args) => deps.ui?.showRoutineSwitcherTourNotification?.(...args),
+        showRecurringListTourNotification: (...args) => deps.ui?.showRecurringListTourNotification?.(...args),
+        showRecurringSettingsTourNotification: (...args) => deps.ui?.showRecurringSettingsTourNotification?.(...args),
+        showHistoryTourNotification: (...args) => deps.ui?.showHistoryTourNotification?.(...args),
+        showClearedTasksTourNotification: (...args) => deps.ui?.showClearedTasksTourNotification?.(...args),
+        showAchievementsTourNotification: (...args) => deps.ui?.showAchievementsTourNotification?.(...args),
+        hasActiveNotifications: (...args) => deps.ui?.hasActiveNotifications?.(...args),
+        triggerLogoBackground: (...args) => deps.ui?.triggerLogoBackground?.(...args),
+        triggerLogoScan: (...args) => deps.ui?.triggerLogoScan?.(...args),
+        showTaskOptions: (...args) => deps.ui?.showTaskOptions?.(...args),
+        hideTaskOptions: (...args) => deps.ui?.hideTaskOptions?.(...args),
+        get TaskOptionsVisibilityController() { return deps.ui?.TaskOptionsVisibilityController; },
+        attachKeyboardTaskOptionToggle: (...args) => deps.ui?.attachKeyboardTaskOptionToggle?.(...args),
+        // taskOptionsCustomizer is an object - use Proxy for lazy resolution since it loads after taskDOM
+        taskOptionsCustomizer: new Proxy({}, {
+            get(target, prop) {
+                return deps.ui?.taskOptionsCustomizer?.[prop];
+            }
+        }),
+
+        // Undo/redo functions (api: 'undo' maps to deps.ui via apiToCategory) - validated
+        captureStateSnapshot: createValidatedWrapper('captureStateSnapshot',
+            () => deps.ui?.captureStateSnapshot),
+        performStateBasedUndo: createValidatedWrapper('performStateBasedUndo',
+            () => deps.ui?.performStateBasedUndo),
+        performStateBasedRedo: createValidatedWrapper('performStateBasedRedo',
+            () => deps.ui?.performStateBasedRedo),
+        enableUndoSystemOnFirstInteraction: createValidatedWrapper('enableUndoSystemOnFirstInteraction',
+            () => deps.ui?.enableUndoSystemOnFirstInteraction),
+        updateUndoRedoButtons: createValidatedWrapper('updateUndoRedoButtons',
+            () => deps.ui?.updateUndoRedoButtons),
+        clearAllUndoHistory: (...args) => deps.ui?.clearAllUndoHistory?.(...args),
+        closeUndoIndexedDB: (...args) => deps.ui?.closeUndoIndexedDB?.(...args),
+        initUndoIndexedDB: (...args) => deps.ui?.initUndoIndexedDB?.(...args),
+        // Undo cycle lifecycle hooks (called by routineSwitcher when cycles change)
+        onCycleSwitched: (...args) => deps.ui?.onCycleSwitched?.(...args),
+        onCycleCreated: (...args) => deps.ui?.onCycleCreated?.(...args),
+        onCycleDeleted: (...args) => deps.ui?.onCycleDeleted?.(...args),
+        onCycleRenamed: (...args) => deps.ui?.onCycleRenamed?.(...args),
+
+        // Reminders (from deps.features)
+        startReminders: (...args) => deps.features?.startReminders?.(...args),
+        stopReminders: (...args) => deps.features?.stopReminders?.(...args),
+        updateReminderButtons: (...args) => deps.features?.updateReminderButtons?.(...args),
+        setupReminderButtonHandler: (...args) => deps.features?.setupReminderButtonHandler?.(...args),
+        loadRemindersSettings: (...args) => deps.features?.loadRemindersSettings?.(...args),
+
+        // Due dates (from deps.features)
+        checkOverdueTasks: (...args) => deps.features?.checkOverdueTasks?.(...args),
+        createDueDateInput: (...args) => deps.features?.createDueDateInput?.(...args),
+
+        // History manager (from deps.features) - use Proxy for lazy resolution
+        historyManager: new Proxy({}, {
+            get(target, prop) {
+                const manager = deps.features?.historyManager;
+                const value = manager?.[prop];
+                // Bind methods to preserve 'this' context
+                return typeof value === 'function' ? value.bind(manager) : value;
+            }
+        }),
+        logHistoryEvent: (...args) => deps.features?.historyManager?.logEvent?.(...args),
+        getHistory: (...args) => deps.features?.historyManager?.getHistory?.(...args),
+        clearHistory: (...args) => deps.features?.historyManager?.clearHistory?.(...args),
+        openHistoryModal: (...args) => deps.features?.historyManager?.openModal?.(...args),
+        refreshHistoryIfOpen: (...args) => deps.features?.historyManager?.refreshIfOpen?.(...args),
+
+        // Cleared tasks manager (from deps.features) - use Proxy for lazy resolution
+        clearedTasksManager: new Proxy({}, {
+            get(target, prop) {
+                const manager = deps.features?.clearedTasksManager;
+                const value = manager?.[prop];
+                // Bind methods to preserve 'this' context
+                return typeof value === 'function' ? value.bind(manager) : value;
+            }
+        }),
+        recordClearedTask: (...args) => deps.features?.clearedTasksManager?.recordClearedTask?.(...args),
+        recordMultipleClearedTasks: (...args) => deps.features?.clearedTasksManager?.recordMultipleClearedTasks?.(...args),
+        getClearedTasks: (...args) => deps.features?.clearedTasksManager?.getClearedTasks?.(...args),
+        clearClearedTasks: (...args) => deps.features?.clearedTasksManager?.clearAll?.(...args),
+        openClearedTasksModal: (...args) => deps.features?.clearedTasksManager?.openModal?.(...args),
+
+        // Tip archive (from deps.features) — same lazy shape as the modal openers
+        // above. A provideInstance name is NOT automatically injectable: without
+        // an entry here the dep resolves to undefined and the caller's `?.`
+        // silently drops the feature.
+        openTipArchive: (...args) => deps.features?.tipArchive?.openModal?.(...args),
+
+        // Achievements manager (from deps.features) - use Proxy for lazy resolution
+        achievementsManager: new Proxy({}, {
+            get(target, prop) {
+                const manager = deps.features?.achievementsManager;
+                const value = manager?.[prop];
+                // Bind methods to preserve 'this' context
+                return typeof value === 'function' ? value.bind(manager) : value;
+            }
+        }),
+        checkAchievements: (...args) => deps.features?.achievementsManager?.checkAchievements?.(...args),
+        getAchievements: (...args) => deps.features?.achievementsManager?.getAchievements?.(...args),
+        isAchievementUnlocked: (...args) => deps.features?.achievementsManager?.isUnlocked?.(...args),
+        openAchievementsModal: (...args) => deps.features?.achievementsManager?.openModal?.(...args),
+
+        // Backup reminder (from deps.features)
+        checkBackupReminderOnBoot: (...args) => deps.features?.checkBackupReminderOnBoot?.(...args),
+        checkBackupReminderOnCycleComplete: (...args) => deps.features?.checkBackupReminderOnCycleComplete?.(...args),
+        checkBackupReminderOnTaskClear: (...args) => deps.features?.checkBackupReminderOnTaskClear?.(...args),
+
+        // Backup file download (from deps.ui via settingsManager)
+        downloadBackupFile: (...args) => deps.ui?.downloadBackupFile?.(...args),
+        saveBackupFileAs: (...args) => deps.ui?.saveBackupFileAs?.(...args),
+
+        // Vocabulary theme manager (from deps.features) - use Proxy for lazy resolution
+        vocabThemeManager: new Proxy({}, {
+            get(target, prop) {
+                const manager = deps.features?.vocabThemeManager;
+                const value = manager?.[prop];
+                return typeof value === 'function' ? value.bind(manager) : value;
+            }
+        }),
+
+        // Recurring task activation/deactivation (from recurringCore via deps.recurring.core)
+        handleRecurringTaskActivation: (...args) => deps.recurring?.core?.handleRecurringTaskActivation?.(...args),
+        handleRecurringTaskDeactivation: (...args) => deps.recurring?.core?.handleRecurringTaskDeactivation?.(...args),
+
+        // Recurring (from deps.recurring) - use Proxy for lazy evaluation
+        // Proxy allows property access (e.g., recurringPanel.updateRecurringPanelButtonVisibility)
+        // to be resolved lazily after the module loads
+        // Note: manifest provides ['panel', 'core'], so keys are deps.recurring.panel / deps.recurring.core
+        recurringPanel: new Proxy({}, {
+            get(target, prop) {
+                return deps.recurring?.panel?.[prop];
+            }
+        }),
+        recurringCore: new Proxy({}, {
+            get(target, prop) {
+                return deps.recurring?.core?.[prop];
+            }
+        }),
+        updateRecurringPanel: (...args) => deps.recurring?.panel?.updateRecurringPanel?.(...args),
+        updateRecurringPanelButtonVisibility: (...args) => deps.recurring?.panel?.updateRecurringPanelButtonVisibility?.(...args),
+        updateRecurringInfoLink: (...args) => deps.recurring?.panel?.updateRecurringInfoLink?.(...args),
+        catchUpMissedRecurringTasks: (...args) => deps.recurring?.core?.catchUpMissedRecurringTasks?.(...args),
+        watchRecurringTasks: (...args) => deps.recurring?.core?.watchRecurringTasks?.(...args),
+        removeRecurringTasksFromCycle: (...args) => {
+            // Try multiple paths for compatibility
+            const fn = deps.recurring?.core?.removeRecurringTasksFromCycle
+                    || deps.recurring?.removeTasksFromCycle;
+            return fn?.(...args);
+        },
+
+        // Mode manager (from deps.cycle)
+        modeManager: new Proxy({}, {
+            get(target, prop) {
+                return deps.cycle?.modeManager?.[prop];
+            }
+        }),
+        refreshTaskButtonsForModeChange: (...args) => deps.cycle?.refreshTaskButtonsForModeChange?.(...args),
+        initializeModeSelector: (...args) => deps.cycle?.setupModeSelector?.(...args),
+        setupModeSelector: (...args) => deps.cycle?.setupModeSelector?.(...args),
+        updateCycleModeDescription: (...args) => deps.cycle?.updateCycleModeDescription?.(...args),
+        syncModeFromToggles: (...args) => deps.cycle?.modeManager?.syncModeFromToggles?.(...args),
+
+        // Help window manager (from deps.ui) - returns instance when called as function
+        helpWindowManager: () => deps.ui?.helpWindowManager,
+        updateHelpWindow: (...args) => deps.ui?.helpWindowManager?.refreshLabels?.(...args),
+        showCustomizerTip: (...args) => deps.ui?.helpWindowManager?.showCustomizerTip?.(...args),
+
+        // Focus-mode action button refresh — called by themeManager when
+        // vocab theme changes so the button's data-label / aria pick up
+        // new theme values without waiting for the next mode toggle.
+        refreshFocusActionButton: (...args) => deps.ui?.focusMode?.refreshActionButton?.(...args),
+        activateFocusMode: (...args) => deps.ui?.focusMode?.activate?.(...args),
+
+        // Task View Layout reset — called from settings "Reset Task View
+        // Layout" button to clear all customized positions.
+        resetTaskViewLayout: (...args) => deps.ui?.taskViewLayoutManager?.resetTaskViewLayout?.(...args),
+
+        // Task View Layout refresh — called by undoRedoManager after a
+        // snapshot restore so dragged elements visually follow the state
+        // change. Reconciles inline drag styles to the just-restored
+        // state.settings.taskViewLayout.positions map.
+        refreshTaskViewLayout: (...args) => deps.ui?.taskViewLayoutManager?.refreshTaskViewLayout?.(...args),
+
+        // Stats panel manager (from deps.ui) - returns instance when called as function
+        statsPanelManager: () => deps.ui?.statsPanelManager,
+
+        // Quick actions tracking (from quickActionsManager in deps.ui)
+        trackAction: (...args) => deps.ui?.trackAction?.(...args),
+
+        // Stats panel navigation (direct access for quickActionsManager and others)
+        showStatsPanel: (...args) => deps.ui?.showStatsPanel?.(...args),
+        showTaskView: (...args) => deps.ui?.statsPanelManager?.showTaskView?.(...args),
+
+        // Gesture panel callbacks (for gesturePanelManager to call when gestures detected)
+        // onNavigate: indexed carousel navigation — returns {id,index} on move,
+        // null on clamp, undefined when statsPanel/carousel is unavailable
+        // (gesturePanelManager treats undefined as "fall back to the legacy
+        // binary path below"). Do NOT append ?.() semantics that would turn a
+        // missing method into undefined-silently-meaning-clamped.
+        onNavigate: (direction) => deps.ui?.statsPanelManager?.navigatePanels?.(direction),
+        onShowStatsPanel: () => deps.ui?.statsPanelManager?.showStatsPanel?.(),
+        onShowTaskView: () => deps.ui?.statsPanelManager?.showTaskView?.(),
+
+        // Gesture panel manager (from deps.ui) - returns instance when called as function
+        gesturePanelManager: () => deps.ui?.gesturePanelManager,
+
+        // Focus task panel instance accessor (deferred module — undefined until
+        // focusMode.activate() runs ensureModuleLoaded('focusTaskPanel'))
+        focusTaskPanel: () => deps.ui?.focusTaskPanel,
+
+        // On-demand loader for deferred modules (from the boot-captured context)
+        ensureModuleLoaded: (...args) => deps.core?.ensureModuleLoaded?.(...args),
+
+        // UIOrchestrator (from deps.ui) - lazy resolution for UI update coalescing
+        // Note: Use getUIOrchestrator() to get the instance, not the class
+        // Methods must be bound to preserve 'this' context
+        UIOrchestrator: new Proxy({}, {
+            get(target, prop) {
+                const instance = deps.ui?.getUIOrchestrator?.();
+                const value = instance?.[prop];
+                // Bind methods to preserve 'this' context
+                if (typeof value === 'function') {
+                    return value.bind(instance);
+                }
+                return value;
+            }
+        }),
+        requestUIUpdate: (...args) => deps.ui?.requestUIUpdate?.(...args),
+        flushUIUpdates: (...args) => deps.ui?.flushUIUpdates?.(...args),
+        getUIOrchestrator: () => deps.ui?.getUIOrchestrator?.(),
+        ui: new Proxy({}, {
+            get(target, prop) {
+                return deps.ui?.ui?.[prop];
+            }
+        }),
+
+        // Additional dependencies for UIOrchestrator
+        // Methods must be bound to preserve 'this' context
+        TaskDOMManager: new Proxy({}, {
+            get(target, prop) {
+                const instance = deps.task?.taskDOMManager;
+                const value = instance?.[prop];
+                if (typeof value === 'function') {
+                    return value.bind(instance);
+                }
+                return value;
+            }
+        }),
+        TaskRenderer: new Proxy({}, {
+            get(target, prop) {
+                // renderTasks is exported as a standalone function, not on an instance
+                if (prop === 'renderTasks') {
+                    return deps.task?.renderTasks;
+                }
+                return undefined;
+            }
+        }),
+        setArrowsEnabled: (...args) => deps.task?.setArrowsEnabled?.(...args),
+        updateFirstLastMarkers: (...args) => deps.task?.updateFirstLastMarkers?.(...args),
+
+    };
+
+    // Store keys for test verification (populated once on first module)
+    if (!_depMappingKeys) {
+        _depMappingKeys = new Set(Object.keys(depMappings));
+    }
+
+    // Inject declared deps: requires + lazyRequires + optionalDeps, all resolved
+    // the same way (depMappings, falling back to coreResult). optionalDeps MUST be
+    // injected here too — under ENFORCE_REQUIRES the broad Object.assign below is
+    // skipped, so this loop is their only source; without it every optionalDeps
+    // dep would silently be undefined.
+    injectDeclaredDeps(result, manifest, depMappings, coreResult);
+
+    // Inject framework-level CORE_DEPS (DOM helpers, sanitizeInput, safe* utils,
+    // …) that live in depMappings, so they survive ENFORCE_REQUIRES mode where the
+    // broad Object.assign below is skipped. The Phase-1 CORE_DEPS (AppState, …) are
+    // not depMappings keys, so the AppState Proxy set above is left untouched.
+    injectCoreDeps(result, CORE_DEPS, depMappings);
+
+    // Validate required dependencies (warning-only)
+    // This helps catch manifest errors where a module requires an API that doesn't exist
+    // Skip validation for optional modules - they're expected to have potentially missing deps
+    if (!manifest.optional) {
+        for (const req of [...(manifest.requires || []), ...(manifest.lazyRequires || [])]) {
+            const value = result[req];
+            if (value === undefined) {
+                // Skip core deps that are provided differently (e.g., AppState via Proxy)
+                if (!CORE_DEPS.has(req)) {
+                    console.warn(`⚠️ ${manifest.path}: Required dep '${req}' is undefined (not provided by any module)`);
+                }
+            }
+        }
+    }
+
+    // Audit: warn for any declared dep (incl. optionalDeps) that has no
+    // depMappings entry and isn't a core dep. This catches the silent-failure
+    // bug class where consumers fall back to their `optional()` default forever.
+    // Runs for optional modules too — dep declarations are static regardless of
+    // module optionality, and skipping them hid real gaps (July 2026 boot audit).
+    // See WARN_ON_UNMAPPED_DECLARED_DEPS at top of file for context.
+    if (WARN_ON_UNMAPPED_DECLARED_DEPS) {
+        const allDeclared = [
+            ...(manifest.requires || []),
+            ...(manifest.optionalDeps || []),
+            ...(manifest.lazyRequires || [])
+        ];
+        for (const dep of allDeclared) {
+            if (!(dep in depMappings) && !CORE_DEPS.has(dep)) {
+                const gapKey = `${manifest.path}::${dep}`;
+                if (!_warnedDIGaps.has(gapKey)) {
+                    _warnedDIGaps.add(gapKey);
+                    console.warn(
+                        `⚠️ DI gap: ${manifest.path} declares "${dep}" but no depMappings entry exists. ` +
+                        `Consumer will fall back to its optional() default — function calls will silently no-op.`
+                    );
+                }
+            }
+        }
+    }
+
+    // ENFORCE_REQUIRES (true by default): only declared dependencies are provided.
+    // When set false: provide ALL deps via this broad assign (pre-Aug-2026 behaviour)
+    if (!ENFORCE_REQUIRES) {
+        Object.assign(result, depMappings);
+    }
+
+    // Runtime net for ENFORCE_REQUIRES' own failure mode: attach warn-on-read
+    // accessors for the depMappings names this module did NOT receive, so a read
+    // of an undeclared dep says so instead of silently yielding undefined.
+    // MUST run last — it keys off which names are absent from `result`, so it has
+    // to see the finished object (after the declared/core injections above, and
+    // after the broad assign, under which nothing is absent and nothing attaches).
+    if (WARN_ON_UNDECLARED_DEP_ACCESS && ENFORCE_REQUIRES) {
+        attachUndeclaredDepWarnings(result, manifest, depMappings);
+    }
+
+    return result;
+}
+
+/**
+ * Register a module's provided APIs in the deps container
+ * @param {string} name - Module name
+ * @param {Object} manifest - Module manifest
+ * @param {Object} instance - Module instance (from init function)
+ * @param {Object} deps - Dependencies container
+ * @param {Object} mod - Raw module exports (optional fallback for wrapper functions)
+ */
+function registerProvides(name, manifest, instance, deps, mod = null) {
+    if (!manifest.provides) return;
+
+    // Determine which deps category to use
+    const category = getDepsCategoryForModule(manifest);
+
+    for (const provided of manifest.provides) {
+        // Look for the provided function/property on instance first
+        let value = findProvidedValue(instance, provided);
+
+        // Fallback to raw module exports if not found on instance
+        // This handles cases where init returns an instance but wrapper functions are module-level exports
+        if (value === undefined && mod) {
+            value = findProvidedValue(mod, provided);
+        }
+
+        if (value !== undefined) {
+            // Add to appropriate deps category
+            if (deps[category]) {
+                deps[category][provided] = value;
+            }
+        }
+    }
+}
+
+/**
+ * Get the deps category for a module
+ * @param {Object} manifest - Module manifest
+ * @returns {string}
+ */
+function getDepsCategoryForModule(manifest) {
+    const apiToCategory = {
+        state: 'core',
+        task: 'task',
+        cycle: 'cycle',
+        ui: 'ui',
+        undo: 'ui',
+        features: 'features',
+        recurring: 'recurring',
+        utils: 'utils',
+        labels: 'labels',
+        testing: 'testing',
+        storage: 'storage',
+        plugins: 'plugins',
+        progress: 'progress'
+    };
+
+    return apiToCategory[manifest.api] || 'features';
+}
+
+/**
+ * Find a provided value from a module instance
+ * @param {Object} instance - Module instance
+ * @param {string} name - Name to find
+ * @returns {*}
+ */
+function findProvidedValue(instance, name) {
+    const value = instance[name];
+
+    if (typeof value === 'function') {
+        // Check if this is a class (ES6 class or constructor function with static methods)
+        // Classes should NOT be bound because .bind() strips away static methods
+        const isClass = /^class\s/.test(value.toString()) ||
+                        (value.prototype && value.prototype.constructor === value &&
+                         Object.getOwnPropertyNames(value).some(prop =>
+                             prop !== 'length' && prop !== 'name' && prop !== 'prototype' &&
+                             typeof value[prop] === 'function'));
+
+        if (isClass) {
+            // Return class as-is to preserve static methods
+            return value;
+        }
+
+        // Regular function - bind to preserve 'this' context
+        return value.bind(instance);
+    }
+
+    // Direct property (non-function)
+    if (value !== undefined) {
+        return value;
+    }
+
+    // Getter
+    const descriptor = Object.getOwnPropertyDescriptor(instance, name);
+    if (descriptor?.get) {
+        return descriptor.get.call(instance);
+    }
+
+    return undefined;
+}
+
+/**
+ * Build grouped APIs from loaded modules
+ * @param {Object} deps - Dependencies container
+ * @returns {Object}
+ */
+function buildGroupedApis(deps) {
+    return {
+        state: {
+            AppState: deps.core?.AppState,
+            AppGlobalState: deps.core?.AppGlobalState,
+            AppMeta: deps.core?.AppMeta,
+            autoSave: deps.core?.autoSave
+        },
+        task: {
+            add: deps.task?.addTask,
+            delete: deps.task?.deleteTask,
+            handleCompleteAll: deps.task?.handleCompleteAllTasks,
+            loadContext: deps.task?.loadTaskContext,
+            createDOM: deps.task?.createTaskDOMElements,
+            updateMoveArrows: deps.task?.updateMoveArrowsVisibility,
+            refresh: deps.task?.refreshTaskListUI
+        },
+        cycle: {
+            load: deps.cycle?.loadMiniCycle,
+            create: deps.cycle?.showCycleCreationModal,
+            switch: deps.cycle?.switchMiniCycle,
+            rename: deps.cycle?.renameMiniCycle,
+            delete: deps.cycle?.deleteMiniCycle,
+            check: deps.progress?.checkMiniCycle,
+            initializeModeSelector: deps.cycle?.setupModeSelector,
+            setupModeSelector: deps.cycle?.setupModeSelector,
+            modeManager: deps.cycle?.modeManager
+        },
+        ui: {
+            showNotification: deps.utils?.showNotification,
+            showConfirmationModal: deps.utils?.showConfirmationModal,
+            showPromptModal: deps.utils?.showPromptModal,
+            hideMainMenu: deps.ui?.hideMainMenu,
+            updateMainMenuHeader: deps.ui?.updateMainMenuHeader,
+            closeAllModals: (...args) => deps.ui?.modalManager?.closeAllModals?.(...args),
+            resetNotificationPosition: deps.utils?.resetNotificationPosition
+        },
+        undo: {
+            capture: deps.ui?.captureStateSnapshot,
+            undo: deps.ui?.performStateBasedUndo,
+            redo: deps.ui?.performStateBasedRedo,
+            updateButtons: deps.ui?.updateUndoRedoButtons,
+            enableOnFirstInteraction: deps.ui?.enableUndoSystemOnFirstInteraction
+        },
+        reminder: {
+            manager: deps.features?.reminderManager,
+            start: deps.features?.startReminders,
+            stop: deps.features?.stopReminders,
+            updateButtons: deps.features?.updateReminderButtons,
+            loadSettings: deps.features?.loadRemindersSettings
+        },
+        recurring: {
+            panel: deps.recurring?.panel,
+            core: deps.recurring?.core,
+            openForTask: deps.recurring?.openForTask
+        },
+        utils: {
+            GlobalUtils: deps.utils?.GlobalUtils,
+            DataValidator: deps.utils?.DataValidator,
+            sanitizeInput: deps.utils?.sanitizeInput,
+            generateId: deps.utils?.generateId,
+            generateHashId: deps.utils?.generateHashId,
+            safeAddEventListener: deps.utils?.safeAddEventListener,
+            isTouchDevice: deps.utils?.isTouchDevice
+        }
+    };
+}
+
+/**
+ * Capitalize first letter
+ * @param {string} str
+ * @returns {string}
+ */
+function capitalize(str) {
+    return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
+/**
+ * Get the set of depMappings keys (for DI wiring tests)
+ * @returns {Set<string>|null} Keys available in depMappings, or null if boot hasn't run
+ */
+export function getDepMappingKeys() {
+    return _depMappingKeys;
+}
+
+/**
+ * Populate and return the depMappings key set WITHOUT a full app boot.
+ *
+ * The DI wiring tests (diWiring.tests.js) need the real depMappings keys, but
+ * `_depMappingKeys` is only captured the first time `buildModuleDependencies()`
+ * runs during `loadAllModules()`. The CLI/Playwright harness never boots the app,
+ * so the keys stay null and the wiring battery self-skips.
+ *
+ * Most depMappings values are closures over `deps` that are not invoked at build
+ * time; the rest are plain `deps.x?.y` reads, getters, and Proxy constructions,
+ * all of which only optional-chain through `deps` when evaluated. So building it
+ * once with empty stubs is side-effect-free and yields the exact same keys the real boot
+ * would. This keeps the test honest: keys come from the real object literal, so
+ * adding/removing a depMappings entry is reflected automatically.
+ *
+ * @returns {Set<string>} The depMappings key set (never null).
+ */
+export function ensureDepMappingKeys() {
+    if (!_depMappingKeys) {
+        buildModuleDependencies(
+            { path: 'di-wiring-test', requires: [], optionalDeps: [], lazyRequires: [] },
+            {},
+            {}
+        );
+    }
+    return _depMappingKeys || new Set();
+}
+
+/**
+ * Get a loaded module by name
+ * @param {string} name - Module name
+ * @returns {Object|null}
+ */
+export function getLoadedModule(name) {
+    return loadedModules.get(name) || null;
+}
+
+/**
+ * Get a module instance by name
+ * @param {string} name - Module name
+ * @returns {Object|null}
+ */
+export function getModuleInstance(name) {
+    return moduleInstances.get(name) || null;
+}
+
+/**
+ * Check if a module is loaded
+ * @param {string} name - Module name
+ * @returns {boolean}
+ */
+export function isModuleLoaded(name) {
+    return loadedModules.has(name);
+}
+
+/**
+ * Destroy all module instances that implement destroy().
+ * Called before clearLoadedModules() on boot retry.
+ */
+export function destroyAllModules() {
+    for (const [name, instance] of moduleInstances) {
+        if (instance && typeof instance.destroy === 'function') {
+            try {
+                instance.destroy();
+            } catch (e) {
+                console.warn(`[moduleLoader] destroy() failed for ${name}:`, e);
+            }
+        }
+    }
+}
+
+/**
+ * Clear all loaded modules (for retry/testing).
+ * Call destroyAllModules() first to clean up listeners and timers.
+ */
+export function clearLoadedModules() {
+    loadedModules.clear();
+    moduleInstances.clear();
+}

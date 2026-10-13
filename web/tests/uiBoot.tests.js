@@ -1,0 +1,299 @@
+/**
+ * uiBoot.js Browser Tests
+ * Tests for UI boot module - verifies exports and UI helpers
+ *
+ * @module tests/uiBoot.tests
+ * @version 2.2.0 - Standalone tests (Dec 2025)
+ *
+ * NOTE: These tests are standalone and do not import testHelpers to avoid
+ * triggering module side effects that can cause hangs in the test environment.
+ */
+
+// Simple test helper (inline to avoid testHelpers import)
+function createTest(resultsDiv, passed, total) {
+    return async function test(name, testFn) {
+        total.count++;
+        try {
+            const result = testFn();
+            if (result instanceof Promise) await result;
+            resultsDiv.innerHTML += `<div class="result pass">✅ ${name}</div>`;
+            passed.count++;
+        } catch (error) {
+            resultsDiv.innerHTML += `<div class="result fail">❌ ${name}: ${error.message}</div>`;
+            console.error(`Test failed: ${name}`, error);
+        }
+    };
+}
+
+export async function runUIBootTests(resultsDiv) {
+    resultsDiv.innerHTML = '<h2>📱 uiBoot Tests</h2><h3>Running tests...</h3>';
+
+    let passed = { count: 0 };
+    let total = { count: 0 };
+    const test = createTest(resultsDiv, passed, total);
+
+    // ===== MODULE STRUCTURE TESTS =====
+    resultsDiv.innerHTML += '<h4 class="test-section">📁 Module Structure</h4>';
+
+    await test('uiBoot.js file is accessible', async () => {
+        const response = await fetch((globalThis.__MC_MODULE_MAP || {})['/modules/boot/uiBoot.js'] || '../modules/boot/uiBoot.js');
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+    });
+
+    await test('uiBoot.js exports loader functions', async () => {
+        // Import-based (not a source grep): works on source AND the minified bundle.
+        const m = await import(((globalThis.__MC_MODULE_MAP || {})['/modules/boot/uiBoot.js'] || '../modules/boot/uiBoot.js') + '?v=' + Date.now());
+        if (typeof m.showLoader !== 'function') throw new Error('showLoader not found');
+        if (typeof m.hideLoader !== 'function') throw new Error('hideLoader not found');
+    });
+
+    await test('uiBoot.js exports device detection', async () => {
+        const m = await import(((globalThis.__MC_MODULE_MAP || {})['/modules/boot/uiBoot.js'] || '../modules/boot/uiBoot.js') + '?v=' + Date.now());
+        if (typeof m.isTouchDevice !== 'function') throw new Error('isTouchDevice not found');
+        if (typeof m.detectDeviceType !== 'function') throw new Error('detectDeviceType not found');
+    });
+
+    // ===== LOADER (real uiBoot exports) =====
+    // Replaced a cluster of tests that exercised DOM classList / dispatchEvent /
+    // navigator.maxTouchPoints / querySelector PLATFORM behavior on local elements —
+    // none of which called uiBoot. (The main-menu hygiene tests below are the real ones.)
+    resultsDiv.innerHTML += '<h4 class="test-section">⏳ Loader</h4>';
+
+    await test('showLoader reveals #app-loader and hideLoader fades it out', async () => {
+        const { showLoader, hideLoader } = await import(((globalThis.__MC_MODULE_MAP || {})['/modules/boot/uiBoot.js'] || '../modules/boot/uiBoot.js') + '?v=' + Date.now());
+        const loader = document.createElement('div');
+        loader.id = 'app-loader';                 // DOM_IDS.APP_LOADER
+        loader.style.display = 'none';
+        loader.classList.add('fade-out');         // DOM_CLASSES.FADE_OUT
+        document.body.appendChild(loader);
+        try {
+            showLoader('Working...');
+            if (loader.style.display === 'none') throw new Error('showLoader should reveal the app loader');
+            if (loader.classList.contains('fade-out')) throw new Error('showLoader should clear the fade-out class');
+
+            hideLoader();
+            if (!loader.classList.contains('fade-out')) throw new Error('hideLoader should add the fade-out class');
+        } finally {
+            loader.remove();
+        }
+    });
+
+    // ===== MAIN-MENU LISTENER LEAK / FOCUS-STEAL (July 2026 boot audit M3) =====
+    resultsDiv.innerHTML += '<h4 class="test-section">🍔 Main-menu listener hygiene</h4>';
+
+    // Build the fixture the module's global querySelectors expect: a .menu-button
+    // and a .menu-container. The handlers look these up from the document, so the
+    // classes matter, not the wiring.
+    const buildMenuFixture = () => {
+        const host = document.createElement('div');
+        host.id = 'm3-fixture';
+        host.innerHTML = `
+            <button class="menu-button" aria-expanded="false">Menu</button>
+            <nav class="menu-container"><button class="menu-item">Item</button></nav>
+        `;
+        document.body.appendChild(host);
+        return {
+            host,
+            menuButton: host.querySelector('.menu-button'),
+            menu: host.querySelector('.menu-container'),
+        };
+    };
+
+    await test('reopening after an external close does not leak document keydown listeners', async () => {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const { attachMenuButtonListener } = await import(`../modules/boot/uiBoot.js?v=${cacheBuster}`);
+        const { menuButton, menu, host } = buildMenuFixture();
+        try {
+            attachMenuButtonListener(null, menuButton, menu);
+
+            let added = 0, removed = 0;
+            const origAdd = document.addEventListener.bind(document);
+            const origRemove = document.removeEventListener.bind(document);
+            document.addEventListener = (t, f, o) => { if (t === 'keydown') added++; return origAdd(t, f, o); };
+            document.removeEventListener = (t, f, o) => { if (t === 'keydown') removed++; return origRemove(t, f, o); };
+            try {
+                for (let i = 0; i < 5; i++) {
+                    menuButton.click();               // open — attaches esc via stored key
+                    menu.classList.remove('visible'); // simulate menuManager.hideMainMenu (external close)
+                    document.body.classList.remove('main-menu-open');
+                }
+            } finally {
+                document.addEventListener = origAdd;
+                document.removeEventListener = origRemove;
+            }
+            // Steady state is exactly ONE live esc listener (the last open's) —
+            // replaceStoredEventListener removes the prior one before adding the
+            // next, so the count never grows with cycles. The pre-fix code left
+            // one per cycle (net 5), which is the leak this guards against.
+            const netLeak = added - removed;
+            if (netLeak > 1) {
+                throw new Error(`Leaked ${netLeak} document keydown listeners over 5 open/external-close cycles (expected ≤1 live)`);
+            }
+            // Clean up the one live listener the last open left attached.
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+        } finally {
+            host.remove();
+        }
+    });
+
+    await test('outside click after external close self-heals without stealing focus', async () => {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const { attachMenuButtonListener } = await import(`../modules/boot/uiBoot.js?v=${cacheBuster}`);
+        const { menuButton, menu, host } = buildMenuFixture();
+        const sink = document.createElement('input');
+        document.body.appendChild(sink);
+        try {
+            attachMenuButtonListener(null, menuButton, menu);
+            menuButton.click();                   // open
+            menu.classList.remove('visible');     // external close (hideMainMenu)
+            document.body.classList.remove('main-menu-open');
+
+            sink.focus();
+            const before = document.activeElement;
+            document.body.click();                // outside click → self-healing guard runs
+
+            if (document.activeElement !== before) {
+                throw new Error('Focus was stolen by a stale click-outside handler after external close');
+            }
+            if (typeof document.__miniCycleUiBootMenuCloseOutsideHandler === 'function') {
+                throw new Error('Self-healing guard did not detach the click-outside handler');
+            }
+        } finally {
+            sink.remove();
+            host.remove();
+        }
+    });
+
+    await test('Escape closes the menu and restores focus to the opener', async () => {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const { attachMenuButtonListener } = await import(`../modules/boot/uiBoot.js?v=${cacheBuster}`);
+        const { menuButton, menu, host } = buildMenuFixture();
+        try {
+            attachMenuButtonListener(null, menuButton, menu);
+            menuButton.focus();
+            menuButton.click();                   // open (records _previousFocus = menuButton)
+            if (!menu.classList.contains('visible')) throw new Error('Menu did not open');
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+            if (menu.classList.contains('visible')) throw new Error('Escape did not close the menu');
+            if (document.activeElement !== menuButton) throw new Error('Focus not restored to opener on Escape');
+        } finally {
+            host.remove();
+        }
+    });
+
+    // Summary
+    // ===== COPYRIGHT YEAR =====
+    resultsDiv.innerHTML += '<h4 class="test-section">\u00A9 Copyright Year</h4>';
+
+    // Undo starts disabled and is switched on by the user's first REAL input
+    // (STATE_TRUTH_MIGRATION #13). Page scripts can only dispatch untrusted events,
+    // so these pin the ignore-scripted and no-stacking halves; the
+    // "first gesture after load can be undone" journey covers real input.
+    await test('armUndoOnFirstInput ignores scripted pointerdown/keydown', async () => {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const { armUndoOnFirstInput, disarmUndoOnFirstInput } = await import(`../modules/boot/uiBoot.js?v=${cacheBuster}`);
+        let calls = 0;
+        armUndoOnFirstInput(() => { calls++; });
+        try {
+            document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
+            if (calls !== 0) throw new Error(`scripted events enabled undo (${calls} call(s)) — boot dispatches could switch it on early`);
+        } finally {
+            disarmUndoOnFirstInput();
+        }
+    });
+
+    await test('re-arming replaces the first-input listener instead of stacking another', async () => {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const { armUndoOnFirstInput, disarmUndoOnFirstInput } = await import(`../modules/boot/uiBoot.js?v=${cacheBuster}`);
+        const added = [];
+        const removed = [];
+        const origAdd = document.addEventListener;
+        const origRemove = document.removeEventListener;
+        document.addEventListener = function (type, fn, opts) { if (type === 'pointerdown') added.push(fn); return origAdd.call(this, type, fn, opts); };
+        document.removeEventListener = function (type, fn, opts) { if (type === 'pointerdown') removed.push(fn); return origRemove.call(this, type, fn, opts); };
+        try {
+            armUndoOnFirstInput(() => {});
+            armUndoOnFirstInput(() => {});
+            disarmUndoOnFirstInput();
+        } finally {
+            document.addEventListener = origAdd;
+            document.removeEventListener = origRemove;
+        }
+        if (added.length !== 2) throw new Error(`expected 2 arms, saw ${added.length}`);
+        if (removed.length !== 2 || removed[0] !== added[0] || removed[1] !== added[1]) {
+            throw new Error('each arm must remove the previous listener, and disarm the current one');
+        }
+    });
+
+    // ===== ADD-TASK INPUT (measured Oct 2026) =====
+    resultsDiv.innerHTML += '<h4 class="test-section">⌨️ Add-task input</h4>';
+
+    await test('REGRESSION: a REJECTED add leaves the typed text in the input (button and Enter)', async () => {
+        // The handlers cleared the input unconditionally after calling add().
+        // When validation rejected the text (over the character limit) the
+        // warning fired AND the input was wiped, so the user had to retype
+        // everything to trim one word. Success clears via finalizeTaskCreation.
+        const m = await import(((globalThis.__MC_MODULE_MAP || {})['/modules/boot/uiBoot.js'] || '../modules/boot/uiBoot.js') + '?v=' + Date.now());
+        if (typeof m.attachTaskInputListeners !== 'function') throw new Error('attachTaskInputListeners not exported');
+
+        const input = document.createElement('input');
+        const button = document.createElement('button');
+        document.body.append(input, button);
+        const addCalls = [];
+        const appContextMod = {
+            getTaskApi: () => ({ add: (text) => { addCalls.push(text); return undefined; } }), // rejected
+            getUndoApi: () => null,
+            getStateApi: () => null
+        };
+        try {
+            m.attachTaskInputListeners(null, input, button, appContextMod);
+            const longText = 'x'.repeat(150);
+
+            input.value = longText;
+            button.click();
+            await new Promise(r => setTimeout(r, 20));
+            if (addCalls.length !== 1) throw new Error(`add should be called once via the button, got ${addCalls.length}`);
+            if (input.value !== longText) throw new Error(`button path wiped the input (value now "${input.value.slice(0, 20)}…")`);
+
+            input.value = longText;
+            input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', bubbles: true, cancelable: true }));
+            await new Promise(r => setTimeout(r, 20));
+            if (addCalls.length !== 2) throw new Error(`add should be called via Enter, got ${addCalls.length} calls`);
+            if (input.value !== longText) throw new Error(`Enter path wiped the input (value now "${input.value.slice(0, 20)}…")`);
+        } finally {
+            input.remove();
+            button.remove();
+        }
+    });
+
+    await test('stampCopyrightYear fills every [data-copyright-year] with the CURRENT year', async () => {
+        const { stampCopyrightYear } = await import(
+            ((globalThis.__MC_MODULE_MAP || {})['/modules/boot/uiBoot.js'] || '../modules/boot/uiBoot.js') + '?v=' + Date.now());
+        // The markup ships a literal year as its no-JS fallback, so a broken stamp
+        // is invisible — the page just keeps showing last year's number. Inject a
+        // different year so the assertion cannot pass on the fallback.
+        const host = document.createElement('div');
+        host.innerHTML = '<span data-copyright-year>1999</span><span data-copyright-year>1999</span>';
+        document.body.appendChild(host);
+
+        const RealDate = Date;
+        try {
+            globalThis.Date = class extends RealDate { getFullYear() { return 2031; } };
+            stampCopyrightYear();
+            const values = [...host.querySelectorAll('[data-copyright-year]')].map(el => el.textContent);
+            if (values.some(v => v !== '2031')) {
+                throw new Error(`expected every element to read 2031, got ${JSON.stringify(values)}`);
+            }
+        } finally {
+            globalThis.Date = RealDate;
+            host.remove();
+        }
+    });
+
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${Math.round(passed.count/total.count*100)}%)</h3>`;
+
+    return { passed: passed.count, total: total.count };
+}

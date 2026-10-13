@@ -1,0 +1,975 @@
+/**
+ * 🧪 RoutineSwitcher Tests
+ * Tests for modules/routine/routineSwitcher.js
+ * Pattern: Resilient Constructor 🛡️
+ *
+ * Updated for Phase 3 DI Pattern - uses shared testHelpers
+ *
+ * Tests routine switching functionality:
+ * - Opening switch modal
+ * - Renaming routines
+ * - Deleting routines
+ * - Confirming routine switch
+ * - Routine list management
+ * - Preview generation
+ */
+
+import {
+    setupTestEnvironment,
+    createMockAppState,
+    createMockNotification,
+    waitForAsyncOperations
+} from './testHelpers.js';
+
+// Dynamic import to avoid circular dependency issues
+let RoutineSwitcher = null;
+let setRoutineSwitcherDependencies = null;
+let initRoutineSwitcher = null;
+
+export async function runRoutineSwitcherTests(resultsDiv, isPartOfSuite = false) {
+    resultsDiv.innerHTML = '<h2>🔄 RoutineSwitcher Tests</h2><h3>Loading module...</h3>';
+
+    // Dynamic import of the module
+    try {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const module = await import(`../modules/routine/routineSwitcher.js?v=${cacheBuster}`);
+        RoutineSwitcher = module.RoutineSwitcher;
+        setRoutineSwitcherDependencies = module.setRoutineSwitcherDependencies;
+        initRoutineSwitcher = module.initRoutineSwitcher;
+    } catch (e) {
+        resultsDiv.innerHTML = `<h2>🔄 RoutineSwitcher Tests</h2><div class="result fail">❌ Failed to import module: ${e.message}</div>`;
+        return { passed: 0, total: 1 };
+    }
+
+    resultsDiv.innerHTML = '<h2>🔄 RoutineSwitcher Tests</h2><h3>Setting up mocks...</h3>';
+
+    // =====================================================
+    // Use shared testHelpers for comprehensive mock setup
+    // =====================================================
+    const env = await setupTestEnvironment();
+
+    // Set up RoutineSwitcher module dependencies
+    setRoutineSwitcherDependencies({
+        safeAddEventListener: env.deps.safeAddEventListener,
+        getModal: () => document.querySelector('.mini-cycle-switch-modal')
+    });
+
+    // Initialize RoutineSwitcher to trigger dynamic imports (loads getObjectSizeBytes, name utils, etc.)
+    // This populates module-level variables that are otherwise only set via initRoutineSwitcher at runtime.
+    await initRoutineSwitcher({
+        safeAddEventListener: env.deps.safeAddEventListener,
+        getModal: () => document.querySelector('.mini-cycle-switch-modal')
+    });
+
+    // Make RoutineSwitcher available for tests (fallback compatibility)
+    window.RoutineSwitcher = RoutineSwitcher;
+
+    resultsDiv.innerHTML = '<h2>🔄 RoutineSwitcher Tests</h2><h3>Running tests...</h3>';
+    let passed = { count: 0 }, total = { count: 0 };
+
+    // 🔒 SAVE REAL APP DATA ONCE before all tests run (only when running individually)
+    let savedRealData = {};
+    if (!isPartOfSuite) {
+        const protectedKeys = ['miniCycleData', 'miniCycleForceFullVersion'];
+        protectedKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                savedRealData[key] = value;
+            }
+        });
+        console.log('🔒 Saved original localStorage for individual routineSwitcher test');
+    }
+
+    // Helper to restore original data after all tests (only when running individually)
+    function restoreOriginalData() {
+        if (!isPartOfSuite) {
+            localStorage.clear();
+            Object.keys(savedRealData).forEach(key => {
+                localStorage.setItem(key, savedRealData[key]);
+            });
+            console.log('✅ Individual routineSwitcher test completed - original localStorage restored');
+        }
+    }
+
+    // Check if class is available (already imported dynamically above)
+    if (!RoutineSwitcher) {
+        resultsDiv.innerHTML += '<div class="result fail">❌ RoutineSwitcher class not found. Make sure the module is properly loaded.</div>';
+        return { passed: 0, total: 1 };
+    }
+
+    async function test(name, testFn) {
+        total.count++;
+        try {
+            // Reset environment before each test
+            localStorage.clear();
+
+            // Mock Schema 2.5 data with multiple cycles
+            const mockSchemaData = {
+                metadata: {
+                    version: "2.5",
+                    lastModified: Date.now()
+                },
+                settings: {},
+                data: { routine: {
+                        'Morning Routine': {
+                            title: 'Morning Routine',
+                            id: 'cycle-morning',
+                            tasks: [
+                                { id: 'task-1', text: 'Wake up', completed: false },
+                                { id: 'task-2', text: 'Exercise', completed: true },
+                                { id: 'task-3', text: 'Breakfast', completed: false }
+                            ],
+                            cycleCount: 5,
+                            autoReset: true,
+                            deleteCheckedTasks: false
+                        },
+                        'Evening Routine': {
+                            title: 'Evening Routine',
+                            id: 'cycle-evening',
+                            tasks: [
+                                { id: 'task-4', text: 'Dinner', completed: false },
+                                { id: 'task-5', text: 'Read', completed: false }
+                            ],
+                            cycleCount: 3,
+                            autoReset: false,
+                            deleteCheckedTasks: false
+                        },
+                        'Work Tasks': {
+                            title: 'Work Tasks',
+                            id: 'cycle-work',
+                            tasks: [
+                                { id: 'task-6', text: 'Check emails', completed: true }
+                            ],
+                            cycleCount: 10,
+                            autoReset: false,
+                            deleteCheckedTasks: true
+                        }
+                    }
+                },
+                appState: {
+                    activeRoutineId: 'Morning Routine',
+                    currentMode: 'auto-cycle'
+                },
+                userProgress: {
+                    cyclesCompleted: 18,
+                    totalTasksCompleted: 120
+                }
+            };
+            localStorage.setItem('miniCycleData', JSON.stringify(mockSchemaData));
+
+            // Reset DOM state
+            document.body.className = '';
+
+            // Clear existing modal elements
+            const existingModals = document.querySelectorAll('.mini-cycle-switch-modal, #miniCycleList, #switch-preview-window, #switch-items-row');
+            existingModals.forEach(el => el.remove());
+
+            // Clear global state
+            delete window.AppState;
+
+            await testFn();
+            resultsDiv.innerHTML += `<div class="result pass">✅ ${name}</div>`;
+            passed.count++;
+        } catch (error) {
+            resultsDiv.innerHTML += `<div class="result fail">❌ ${name}: ${error.message}</div>`;
+            console.error(`Test failed: ${name}`, error);
+        }
+    }
+
+    // === INITIALIZATION TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔧 Initialization Tests</h4>';
+
+    await test('creates instance successfully', async () => {
+        const instance = new RoutineSwitcher();
+        if (!instance || typeof instance.switchMiniCycle !== 'function') {
+            throw new Error('RoutineSwitcher not properly initialized');
+        }
+    });
+
+    await test('accepts dependency injection', async () => {
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => JSON.parse(localStorage.getItem('miniCycleData'))
+            },
+            showNotification: (msg) => console.log(msg),
+            hideMainMenu: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        if (!instance.deps.AppState) {
+            throw new Error('Dependency injection failed');
+        }
+    });
+
+
+    await test('initializes with empty dependencies object', async () => {
+        const instance = new RoutineSwitcher({});
+        if (!instance.deps) {
+            throw new Error('Should initialize with empty dependencies');
+        }
+    });
+
+    // === CORE FUNCTIONALITY TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">⚡ Core Functionality</h4>';
+
+    await test('switchMiniCycle with valid AppState', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        // Create mock DOM elements (dialog for native showModal/close API)
+        const modal = document.createElement('dialog');
+        modal.className = 'mini-cycle-switch-modal';
+        document.body.appendChild(modal);
+
+        const switchRow = document.createElement('div');
+        switchRow.id = 'switch-items-row';
+        document.body.appendChild(switchRow);
+
+        const duplicateBtn = document.createElement('button');
+        duplicateBtn.id = 'switch-duplicate';
+        document.body.appendChild(duplicateBtn);
+
+        const renameBtn = document.createElement('button');
+        renameBtn.id = 'switch-rename';
+        document.body.appendChild(renameBtn);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.id = 'switch-delete';
+        document.body.appendChild(deleteBtn);
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.id = 'miniCycleSwitchConfirm';
+        document.body.appendChild(confirmBtn);
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.id = 'miniCycleSwitchCancel';
+        document.body.appendChild(cancelBtn);
+
+        const listContainer = document.createElement('div');
+        listContainer.id = 'miniCycleList';
+        document.body.appendChild(listContainer);
+
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            querySelector: (sel) => document.querySelector(sel),
+            getElementById: (id) => document.getElementById(id),
+            hideMainMenu: () => {},
+            showNotification: () => {},
+            getModal: () => modal
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.switchMiniCycle();
+
+        // Modal should be open (native dialog API)
+        if (!modal.open) {
+            throw new Error('Modal should be displayed');
+        }
+    });
+
+    await test('switchMiniCycle handles no cycles gracefully', async () => {
+        // Empty cycles
+        const emptyData = {
+            metadata: { version: "2.5" },
+            data: { routine: {} },
+            appState: { activeRoutineId: null }
+        };
+        localStorage.setItem('miniCycleData', JSON.stringify(emptyData));
+
+        let notificationMsg = null;
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => emptyData
+            },
+            querySelector: () => ({ style: {} }),
+            getElementById: () => ({}),
+            showNotification: (msg) => {
+                notificationMsg = msg;
+            },
+            hideMainMenu: () => {},
+            getModal: () => document.createElement('dialog')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.switchMiniCycle();
+
+        if (!notificationMsg) {
+            throw new Error('Should notify user of no cycles');
+        }
+    });
+
+    await test('hideSwitchMiniCycleModal hides modal', async () => {
+        const modal = document.createElement('dialog');
+        modal.className = 'mini-cycle-switch-modal';
+        document.body.appendChild(modal);
+        modal.showModal(); // Open it first
+
+        const mockDeps = {
+            querySelector: (sel) => document.querySelector(sel),
+            getModal: () => modal
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.hideSwitchMiniCycleModal();
+
+        if (modal.open) {
+            throw new Error('Modal should be hidden');
+        }
+    });
+
+    await test('updatePreview generates task preview', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const previewWindow = document.createElement('div');
+        previewWindow.id = 'switch-preview-window';
+        document.body.appendChild(previewWindow);
+
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            getElementById: (id) => document.getElementById(id),
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.updatePreview('Morning Routine');
+
+        if (!previewWindow.innerHTML.includes('Tasks:')) {
+            throw new Error('Preview should contain task list');
+        }
+        if (!previewWindow.innerHTML.includes('Wake up')) {
+            throw new Error('Preview should show task text');
+        }
+    });
+
+    await test('updatePreview handles missing cycle data', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const previewWindow = document.createElement('div');
+        previewWindow.id = 'switch-preview-window';
+        document.body.appendChild(previewWindow);
+
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            getElementById: (id) => document.getElementById(id),
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.updatePreview('NonExistentCycle');
+
+        if (!previewWindow.innerHTML.includes('No tasks found')) {
+            throw new Error('Should show "No tasks found" message');
+        }
+    });
+
+    await test('loadMiniCycleListActual populates cycle list', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const listContainer = document.createElement('div');
+        listContainer.id = 'miniCycleList';
+        document.body.appendChild(listContainer);
+
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            getElementById: (id) => document.getElementById(id),
+            querySelectorAll: (sel) => document.querySelectorAll(sel),
+            updateReminderButtons: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.loadMiniCycleListActual();
+
+        // Should have 3 cycles
+        const items = listContainer.querySelectorAll('.mini-cycle-switch-item');
+        if (items.length !== 3) {
+            throw new Error(`Expected 3 cycle items, got ${items.length}`);
+        }
+    });
+
+    await test('loadMiniCycleListActual adds correct emojis', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const listContainer = document.createElement('div');
+        listContainer.id = 'miniCycleList';
+        document.body.appendChild(listContainer);
+
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            getElementById: (id) => document.getElementById(id),
+            querySelectorAll: (sel) => document.querySelectorAll(sel),
+            updateReminderButtons: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.loadMiniCycleListActual();
+
+        // Morning Routine has autoReset=true, should have 🔄 (auto cycle mode)
+        const morningItem = [...listContainer.children].find(el =>
+            el.textContent.includes('Morning Routine')
+        );
+        if (!morningItem || !morningItem.textContent.includes('🔄')) {
+            throw new Error('Auto-reset cycle should have 🔄 emoji');
+        }
+
+        // Work Tasks has deleteCheckedTasks, should have 📋 (default)
+        const workItem = [...listContainer.children].find(el =>
+            el.textContent.includes('Work Tasks')
+        );
+        if (!workItem || !workItem.textContent.includes('📋')) {
+            throw new Error('To-do mode cycle should have 📋 emoji');
+        }
+    });
+
+    // === ERROR HANDLING TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">⚠️ Error Handling</h4>';
+
+    await test('handles missing AppState gracefully', async () => {
+        const mockDeps = {
+            AppState: null,
+            showNotification: (msg) => {
+                if (!msg.includes('not ready')) {
+                    throw new Error('Should notify user about AppState not ready');
+                }
+            },
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        // Should not throw
+        instance.switchMiniCycle();
+    });
+
+    await test('handles missing DOM elements gracefully', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            querySelector: () => null, // Missing elements
+            getElementById: () => null,
+            showNotification: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        // Should not throw even with missing DOM
+        instance.hideSwitchMiniCycleModal();
+        instance.loadMiniCycleListActual();
+    });
+
+    await test('handles corrupted localStorage gracefully', async () => {
+        localStorage.setItem('miniCycleData', 'invalid-json');
+
+        const mockDeps = {
+            showNotification: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        // Should use fallback notification
+        const result = instance.deps.showNotification('test');
+        // Should not throw
+    });
+
+    await test('an unwired onCycleSwitched hook does not abort the switch', async () => {
+        // The DI wrapper moduleLoader supplies is `(...args) => deps.ui?.onCycleSwitched?.(...args)`.
+        // It is ALWAYS a function, so the `typeof === 'function'` guard at the call
+        // site passes — but it RETURNS UNDEFINED when the inner hook is missing, and
+        // `.catch` on undefined throws a TypeError. That throw would land in
+        // confirmMiniCycle with no try block around it: after the state update has
+        // already succeeded and before hideSwitchMiniCycleModal() runs, leaving the
+        // routine switched but the modal stuck open.
+        //
+        // Hardened with Promise.resolve() (v2.497). This test injects the wrapper in
+        // its unwired shape; without the fix it throws.
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const selectedCycle = document.createElement('div');
+        selectedCycle.className = 'mini-cycle-switch-item selected';
+        selectedCycle.dataset.cycleKey = 'Evening Routine';
+        document.body.appendChild(selectedCycle);
+
+        let modalHidden = false;
+        const unwiredUi = {};   // ui exists, but carries no onCycleSwitched
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData,
+                update: (updateFn) => {
+                    // Must PERSIST: confirmMiniCycle re-reads AppState.get() straight
+                    // after and bails if activeRoutineId did not actually change. A
+                    // non-persisting mock aborts the switch before the hook is ever
+                    // reached, which is not the path this test is about.
+                    const state = JSON.parse(JSON.stringify(schemaData));
+                    updateFn(state);
+                    schemaData.appState = state.appState;
+                    schemaData.data = state.data;
+                    return state;
+                }
+            },
+            querySelector: (sel) => document.querySelector(sel),
+            showNotification: () => {},
+            loadMiniCycle: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal'),
+            // exactly the wrapper shape moduleLoader builds
+            onCycleSwitched: (...args) => unwiredUi?.onCycleSwitched?.(...args)
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.hideSwitchMiniCycleModal = () => { modalHidden = true; };
+        instance._selectedCycleKey = 'Evening Routine';
+
+        let threw = null;
+        try {
+            instance.confirmMiniCycle();
+        } catch (e) {
+            threw = e;
+        }
+        await new Promise(resolve => setTimeout(resolve, 150));
+
+        if (threw) {
+            throw new Error(`confirmMiniCycle threw on an unwired hook: ${threw.message}`);
+        }
+        if (!modalHidden) {
+            throw new Error('the switch aborted before hiding the modal — the user would be left with it open');
+        }
+    });
+
+    await test('confirms cycle switch with valid data', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const selectedCycle = document.createElement('div');
+        selectedCycle.className = 'mini-cycle-switch-item selected';
+        selectedCycle.dataset.cycleKey = 'Evening Routine';
+        document.body.appendChild(selectedCycle);
+
+        let updateCalled = false;
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData,
+                update: (updateFn, immediate) => {
+                    updateCalled = true;
+                    const state = JSON.parse(JSON.stringify(schemaData));
+                    updateFn(state);
+                    return state;
+                }
+            },
+            querySelector: (sel) => document.querySelector(sel),
+            showNotification: () => {},
+            loadMiniCycle: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        // Mock hideSwitchMiniCycleModal
+        instance.hideSwitchMiniCycleModal = () => {};
+
+        // Selection is now driven by the tracked source of truth, not the `.selected` DOM
+        // class (which is only a projection). Establish it the way production does.
+        instance._selectedCycleKey = 'Evening Routine';
+
+        instance.confirmMiniCycle();
+
+        // Wait for setTimeout
+        await new Promise(resolve => setTimeout(resolve, 150));
+
+        if (!updateCalled) {
+            throw new Error('AppState.update should be called');
+        }
+    });
+
+    await test('deleting the LAST routine opens the create-routine dialog, not the new-user onboarding', async () => {
+        // Regression guard: deleting your final routine leaves zero cycles. That
+        // path used to call showOnboarding() — the brand-new-user "Welcome to
+        // miniCycle" walkthrough — which is wrong for an existing user who just
+        // deleted a routine. It must open the neutral create-routine dialog
+        // instead. (Reported on r/websitefeedback.)
+        const selectedCycle = document.createElement('div');
+        selectedCycle.className = 'mini-cycle-switch-item selected';
+        selectedCycle.dataset.cycleKey = 'Only Routine';
+        document.body.appendChild(selectedCycle);
+
+        // Single-cycle state; AppState.update mutates it in place so the
+        // post-delete get() returns zero cycles (drives the "no cycles" branch).
+        const state = {
+            data: { routine: { 'Only Routine': { id: 'c1', title: 'Only Routine', tasks: [] } } },
+            appState: { activeRoutineId: 'Only Routine' },
+            metadata: {}
+        };
+
+        let creationModalOpened = false;
+        let onboardingShown = false;
+
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => state,
+                update: (fn) => { fn(state); return state; }
+            },
+            showConfirmationModal: ({ callback }) => callback(true), // auto-confirm
+            showNotification: () => {},
+            querySelector: (sel) => document.querySelector(sel),
+            getElementById: () => document.createElement('div'),
+            getBody: () => document.body,
+            onCycleDeleted: async () => {},
+            showCycleCreationModal: () => { creationModalOpened = true; }, // the target behavior
+            // Even if an onboarding manager is reachable via deps, the last-routine
+            // delete must NOT invoke the new-user walkthrough.
+            getOnboardingManager: () => ({ showOnboarding: () => { onboardingShown = true; } }),
+            getModal: () => null,
+            AppMeta: { version: 'test' }
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+        instance.hideSwitchMiniCycleModal = () => {};
+        instance._selectedCycleKey = 'Only Routine';
+
+        instance.deleteMiniCycle();
+
+        // Delete runs behind two nested setTimeouts (300ms + 500ms).
+        await new Promise(resolve => setTimeout(resolve, 950));
+
+        selectedCycle.remove();
+
+        if (Object.keys(state.data.routine).length !== 0) {
+            throw new Error('precondition failed: the only cycle should have been deleted');
+        }
+        if (!creationModalOpened) {
+            throw new Error('deleting the last routine must open the create-routine dialog (showCycleCreationModal)');
+        }
+        if (onboardingShown) {
+            throw new Error('deleting the last routine must NOT show the new-user onboarding walkthrough');
+        }
+    });
+
+    // === INTEGRATION TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔗 Integration Tests</h4>';
+
+
+    await test('works without AppState (fallback mode)', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        delete window.AppState;
+
+        // ✅ Updated: updatePreview now requires AppState, so provide it in mockDeps
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            showNotification: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        // Should work with provided AppState
+        const previewWindow = document.createElement('div');
+        previewWindow.id = 'switch-preview-window';
+        document.body.appendChild(previewWindow);
+
+        instance.updatePreview('Morning Routine');
+
+        // Should render preview
+        if (!previewWindow.innerHTML) {
+            throw new Error('Should work with provided AppState mock');
+        }
+    });
+
+    // === GLOBAL FUNCTIONS TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🌐 Global Functions</h4>';
+
+    await test('exposes global compatibility functions', async () => {
+        // Check that module exposes expected global functions
+        if (typeof window.switchMiniCycle !== 'function' ||
+            typeof window.renameMiniCycle !== 'function' ||
+            typeof window.deleteMiniCycle !== 'function' ||
+            typeof window.confirmMiniCycle !== 'function' ||
+            typeof window.hideSwitchMiniCycleModal !== 'function' ||
+            typeof window.updatePreview !== 'function' ||
+            typeof window.loadMiniCycleList !== 'function' ||
+            typeof window.setupModalClickOutside !== 'function') {
+            throw new Error('Global functions not properly exposed');
+        }
+    });
+
+    await test('global functions handle null instance gracefully', async () => {
+        // Temporarily clear global instance
+        const originalInstance = window.cycleSwitcher;
+        delete window.cycleSwitcher;
+
+        // Should not throw
+        window.switchMiniCycle();
+        window.renameMiniCycle();
+        window.deleteMiniCycle();
+        window.confirmMiniCycle();
+        window.hideSwitchMiniCycleModal();
+        window.updatePreview('test');
+        window.loadMiniCycleList();
+        window.setupModalClickOutside();
+
+        // Restore
+        window.cycleSwitcher = originalInstance;
+    });
+
+    // === DEBOUNCE TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">⏱️ Debounce Tests</h4>';
+
+    await test('loadMiniCycleList debounces rapid calls', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        let callCount = 0;
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            getElementById: () => {
+                callCount++;
+                return document.createElement('div');
+            },
+            querySelectorAll: () => [],
+            updateReminderButtons: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        // Call multiple times rapidly
+        instance.loadMiniCycleList();
+        instance.loadMiniCycleList();
+        instance.loadMiniCycleList();
+
+        // Wait for debounce
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // Should only call once due to debouncing
+        // Note: callCount may vary based on timing, so we just check it was debounced
+        if (callCount > 3) {
+            throw new Error('Debouncing did not work properly');
+        }
+    });
+
+    // === PERFORMANCE TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🖱️ Click-to-deselect (regression: panels swallowed blank clicks since Mar 2026)</h4>';
+
+    // A fixture that mirrors the switcher modal's body: header controls, the two
+    // panels (list + preview), one routine item, the actions row and the theme
+    // picker. Built here because the test page has no switcher markup.
+    const buildDeselectFixture = () => {
+        const root = document.createElement('div');
+        root.innerHTML = `
+            <dialog class="mini-cycle-switch-modal" open>
+            <div class="mini-cycle-switch-modal-content">
+                <div class="routine-switcher-header"><button id="sort-alpha" class="routine-sort-btn">A-Z</button></div>
+                <div class="routine-switcher-body">
+                    <div class="routine-switcher-left">
+                        <div class="mini-cycle-switch-list" id="miniCycleList" role="listbox">
+                            <div class="mini-cycle-switch-item selected" data-cycle-key="r1" aria-selected="true">Morning</div>
+                        </div>
+                        <div id="routine-list-hint" class="routine-list-hint">blank space below the list</div>
+                    </div>
+                    <div class="routine-switcher-right">
+                        <div id="desktop-preview-window" class="desktop-preview-window">tasks…</div>
+                        <div id="desktop-preview-hint" class="desktop-preview-hint">blank space in the preview panel</div>
+                    </div>
+                </div>
+                <div id="switch-items-row" class="switch-items-row"><button id="switch-theme">Theme</button></div>
+                <div id="theme-picker-row" class="theme-picker-row hidden"></div>
+            </div>
+            </dialog>`;
+        document.body.appendChild(root);
+        const deps = {
+            querySelector: (sel) => root.querySelector(sel),
+            querySelectorAll: (sel) => root.querySelectorAll(sel),
+            getElementById: (id) => root.querySelector('#' + CSS.escape(id)),
+            safeAddEventListener: (el, ev, fn) => el.addEventListener(ev, fn),
+            getModal: () => root.querySelector('dialog'),
+            AppState: { isReady: () => true, get: () => ({}) },
+            showNotification: () => {}
+        };
+        const instance = new RoutineSwitcher(deps);
+        instance._selectedCycleKey = 'r1';
+        const click = (sel) => root.querySelector(sel).dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        const teardown = () => {
+            if (instance._clickOutsideHandler) document.removeEventListener('click', instance._clickOutsideHandler);
+            root.remove();
+        };
+        return { instance, click, root, teardown };
+    };
+
+    await test('a click on blank space in the LIST panel deselects the routine', async () => {
+        const f = buildDeselectFixture();
+        try {
+            f.click('#routine-list-hint');
+            if (f.instance._selectedCycleKey !== null) throw new Error('still selected after clicking blank list-panel space');
+            if (f.root.querySelector('.mini-cycle-switch-item').classList.contains('selected')) throw new Error('.selected class not cleared');
+        } finally { f.teardown(); }
+    });
+
+    await test('a click on blank space in the PREVIEW panel deselects the routine', async () => {
+        const f = buildDeselectFixture();
+        try {
+            f.click('#desktop-preview-hint');
+            if (f.instance._selectedCycleKey !== null) throw new Error('still selected after clicking blank preview-panel space');
+        } finally { f.teardown(); }
+    });
+
+    await test('clicks on a routine item, the preview window, the actions row or a header button keep the selection', async () => {
+        const f = buildDeselectFixture();
+        try {
+            for (const sel of ['.mini-cycle-switch-item', '#desktop-preview-window', '#switch-theme', '#sort-alpha']) {
+                f.click(sel);
+                if (f.instance._selectedCycleKey !== 'r1') throw new Error(`selection lost after clicking ${sel}`);
+            }
+        } finally { f.teardown(); }
+    });
+
+    await test('with the theme picker open, a blank click closes the picker and keeps the selection', async () => {
+        const f = buildDeselectFixture();
+        try {
+            const picker = f.root.querySelector('#theme-picker-row');
+            picker.classList.remove('hidden');
+            f.click('#routine-list-hint');
+            if (!picker.classList.contains('hidden')) throw new Error('picker did not close');
+            if (f.instance._selectedCycleKey !== 'r1') throw new Error('selection should survive the picker-closing click');
+            f.click('#routine-list-hint');
+            if (f.instance._selectedCycleKey !== null) throw new Error('second blank click should deselect');
+        } finally { f.teardown(); }
+    });
+
+    await test('blank-click deselect survives closing and reopening the switcher (regression: died on first close since Apr 2026)', async () => {
+        const f = buildDeselectFixture();
+        try {
+            // Real close path: the dialog's close event runs _cleanup(), which removes the handler.
+            f.root.querySelector('dialog').dispatchEvent(new Event('close'));
+            f.instance._selectedCycleKey = 'r1';
+            f.click('#routine-list-hint');
+            if (f.instance._selectedCycleKey !== null) {
+                // If this ever starts passing on its own, _cleanup() stopped removing the
+                // handler — fine, but then the reopen step below is what this test is for.
+                console.warn('close no longer removes the deselect handler');
+            }
+            // Real open path: switchMiniCycle() must re-arm it. The fixture only carries
+            // the markup the deselect needs, so later steps of the open path may throw —
+            // that is not what is under test; the handler must be armed before them.
+            f.instance.deps.AppState = {
+                isReady: () => true,
+                get: () => ({ data: { routine: { r1: { title: 'Morning', tasks: [] } } }, appState: { activeRoutineId: 'r1' }, settings: {} })
+            };
+            f.instance.deps.hideMainMenu = () => {};
+            try { f.instance.switchMiniCycle(); } catch (e) { console.warn('open path continued past the deselect wiring and threw in the fixture:', e.message); }
+            f.instance._selectedCycleKey = 'r1';
+            f.click('#routine-list-hint');
+            if (f.instance._selectedCycleKey !== null) throw new Error('after close + reopen, a blank click no longer deselects');
+            // And it must not stack: a second open adds no second handler (would double-fire).
+            try { f.instance.switchMiniCycle(); } catch { /* same as above */ }
+            let calls = 0;
+            const orig = f.instance._deselectRoutine.bind(f.instance);
+            f.instance._deselectRoutine = () => { calls++; orig(); };
+            f.instance._selectedCycleKey = 'r1';
+            f.click('#routine-list-hint');
+            if (calls !== 1) throw new Error(`deselect ran ${calls} times for one click — handlers are stacking across opens`);
+        } finally { f.teardown(); }
+    });
+
+    resultsDiv.innerHTML += '<h4 class="test-section">⚡ Performance Tests</h4>';
+
+    await test('loadMiniCycleListActual completes quickly', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const listContainer = document.createElement('div');
+        listContainer.id = 'miniCycleList';
+        document.body.appendChild(listContainer);
+
+        const mockDeps = {
+            AppState: {
+                isReady: () => true,
+                get: () => schemaData
+            },
+            getElementById: (id) => document.getElementById(id),
+            querySelectorAll: (sel) => document.querySelectorAll(sel),
+            updateReminderButtons: () => {},
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        const startTime = performance.now();
+        instance.loadMiniCycleListActual();
+        const endTime = performance.now();
+
+        const duration = endTime - startTime;
+
+        if (duration > 100) { // 100ms threshold
+            throw new Error(`Operation took too long: ${duration.toFixed(2)}ms`);
+        }
+    });
+
+    await test('updatePreview renders quickly', async () => {
+        const schemaData = JSON.parse(localStorage.getItem('miniCycleData'));
+
+        const previewWindow = document.createElement('div');
+        previewWindow.id = 'switch-preview-window';
+        document.body.appendChild(previewWindow);
+
+        const mockDeps = {
+            getElementById: (id) => document.getElementById(id),
+            getModal: () => document.querySelector('.mini-cycle-switch-modal')
+        };
+
+        const instance = new RoutineSwitcher(mockDeps);
+
+        const startTime = performance.now();
+        instance.updatePreview('Morning Routine');
+        const endTime = performance.now();
+
+        const duration = endTime - startTime;
+
+        if (duration > 50) { // 50ms threshold
+            throw new Error(`Preview rendering took too long: ${duration.toFixed(2)}ms`);
+        }
+    });
+
+    // === SUMMARY ===
+    const percentage = Math.round((passed.count / total.count) * 100);
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${percentage}%)</h3>`;
+
+    if (passed.count === total.count) {
+        resultsDiv.innerHTML += '<div class="result pass">✅ All tests passed!</div>';
+    } else {
+        resultsDiv.innerHTML += '<div class="result fail">⚠️ Some tests failed</div>';
+    }
+
+    // 🔓 RESTORE original localStorage data (only when running individually)
+    restoreOriginalData();
+
+    return { passed: passed.count, total: total.count };
+}

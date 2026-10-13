@@ -1,0 +1,2095 @@
+/**
+ * 🔧 miniCycle Core Constants
+ * Application-wide constant values - Single source of truth for magic numbers
+ *
+ * @module modules/core/constants
+ */
+
+// ============================================================================
+// BEHAVIOR SETTINGS
+// ============================================================================
+
+/**
+ * Default deleteWhenComplete settings per mode
+ * Single source of truth for mode-specific behavior
+ *
+ * Architecture:
+ * - cycle: false (tasks reset to incomplete on auto-reset)
+ * - todo: true (tasks are deleted when completed)
+ *
+ * @constant {Object}
+ */
+export const DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS = Object.freeze({
+    cycle: false,  // Cycle mode default: keep tasks (reset to incomplete)
+    todo: true     // To-Do mode default: delete tasks on complete
+});
+
+/**
+ * Default deleteWhenComplete settings for recurring tasks/templates
+ * Recurring tasks always delete in both modes
+ *
+ * @constant {Object}
+ */
+export const DEFAULT_RECURRING_DELETE_SETTINGS = Object.freeze({
+    cycle: true,   // Recurring always deletes in Cycle mode
+    todo: true     // Recurring always deletes in To-Do mode
+});
+
+/**
+ * Default color values used as last-resort fallbacks
+ * CSS equivalent lives in variables.css (--priority-color)
+ * @constant {Object}
+ */
+export const COLORS = Object.freeze({
+    PRIORITY_DEFAULT: '#dc3545'  // Red — fallback when task.priorityColor and settings.priorityColor are both absent
+});
+
+/**
+ * Priority levels, highest first — this order IS the sort order.
+ * Schema 2.5 still stores priority as `highPriority` + a `priorityColor` hex; the
+ * helpers in utils/priorityLevel.js translate between the two until Schema 2.6
+ * stores the level itself (docs/future-work/SCHEMA_2_6_PLAN.md).
+ * @constant {ReadonlyArray<'high'|'medium'|'low'>}
+ */
+export const PRIORITY_LEVELS = Object.freeze(['high', 'medium', 'low']);
+
+/**
+ * Colour-family rule for a priority colour that is NOT one of the swatches (a
+ * hand-written .mcyc can carry any hex). Tuning values for
+ * utils/priorityLevel.js — see SCHEMA_2_6_PLAN.md "Priority levels":
+ *   1. an exact swatch match wins (any theme, or the defaults)
+ *   2. no clear colour (saturation or lightness outside the bounds) → high
+ *   3. otherwise the nearest hue anchor within MAX_HUE_DISTANCE → its level
+ *   4. farther than that from every anchor (blues, purples) → high
+ * Hue anchors are degrees on the HSL wheel; saturation/lightness are 0–1.
+ * Measured Sep 2026: pink/maroon → high, orange/gold/olive/lime → medium,
+ * teal → low, blue/purple/navy/gray/black/white → high; every real swatch
+ * classifies to its own level by hue alone.
+ * @constant {Object}
+ */
+export const PRIORITY_COLOR_FAMILY = Object.freeze({
+    HUE_ANCHORS: Object.freeze({ high: 0, medium: 50, low: 125 }),
+    MAX_HUE_DISTANCE: 45,
+    MIN_SATURATION: 0.25,
+    MIN_LIGHTNESS: 0.10,
+    MAX_LIGHTNESS: 0.92
+});
+
+/**
+ * Priority picker swatches for themes that define none of their own (classic).
+ * Every other theme's set lives in THEME_DEFINITIONS[id].priorityColors, with the
+ * same `level` tags. Red = high, yellow = medium, green = low.
+ * @constant {ReadonlyArray<{level: string, hex: string, labelKey: string}>}
+ */
+export const DEFAULT_PRIORITY_SWATCHES = Object.freeze([
+    Object.freeze({ level: 'high',   hex: COLORS.PRIORITY_DEFAULT, labelKey: 'notify.priorityHigh' }),
+    Object.freeze({ level: 'medium', hex: '#facc15',               labelKey: 'notify.priorityMedium' }),
+    Object.freeze({ level: 'low',    hex: '#28a745',               labelKey: 'notify.priorityLow' })
+]);
+
+// ============================================================================
+// TIMEOUTS (milliseconds)
+// ============================================================================
+
+/**
+ * Boot phase timeouts for orchestrator.js
+ * Controls how long each boot phase can take before timing out
+ * @constant {Object}
+ */
+export const BOOT_TIMEOUTS = Object.freeze({
+    MODULE_IMPORT: 10000,  // 10s for initial module imports
+    PHASE_1: 15000,        // 15s for core boot (AppState, GlobalUtils, migration)
+    PHASE_2: 30000,        // 30s for feature boot (largest phase - 40+ modules); raised
+                           // from 20s for slow/old devices. Phases race independently,
+                           // so worst case 15+30+15=60s stays at the HTML 60s lite cap.
+    PHASE_3: 15000,        // 15s for UI boot (event listeners, DOM init)
+    TOTAL: 60000,          // 60s — documentation-only (not enforced); matches the sum of
+                           // raised phase budgets and the HTML load-timeout lite fallback
+    RETRY_DELAY: 2000,     // 2s delay before boot retry (iOS needs time to restart killed SW)
+    SW_SPINUP_GRACE: 2000, // 2s extra wait for iOS to spin up a killed SW when offline (waitForServiceWorker catch path)
+    SW_READY_WAIT: 8000,   // Cap on waiting for navigator.serviceWorker.ready at boot — always the long value because navigator.onLine lies on iOS (was a dead 3s parameter floored to 8s)
+    IDB_OPERATION: 3000,   // 3s timeout for IndexedDB ops during boot recovery; raised from
+                           // 1s — old/slow devices were timing out test-mode/backup checks
+    VERSION_GATE: 1500     // 1.5s cap on the pre-boot server-version check (orchestrator
+                           // gateOnServerVersion). Kicked off early so it overlaps Phase 1
+                           // (≈free on a healthy network); fails open on timeout/offline so a
+                           // slow/absent network never blocks boot.
+});
+
+/**
+ * Task operation timeouts
+ * Controls timing for task-related operations in taskCore.js
+ * @constant {Object}
+ */
+export const TASK_TIMEOUTS = Object.freeze({
+    CORE_INIT: 1000,              // 1s - Core initialization timeout
+    UI_FUNC_CHECK_INTERVAL: 50,   // 50ms - Interval for checking UI functions
+    UI_FUNC_MAX_WAIT: 100,        // 100ms - Max wait for UI functions (short timeout)
+    UI_FUNC_WAIT_TOTAL: 2000,     // 2s - Total wait time for UI functions (long timeout)
+    POST_RESET_CLEANUP: 500,      // 500ms - Cleanup delay after reset
+    RESET_LOCK_RELEASE: 1500,     // 1.5s - Release reset lock
+    DELETE_NOTIFICATION: 2500,    // 2.5s - Delete notification duration
+    ANIMATION_FILL: 200,          // 200ms - Progress bar fill animation
+    ANIMATION_EMPTY: 300,         // 300ms - Progress bar empty animation
+    // How long a captured manual/button completion breakdown stays valid before
+    // resetTasks discards it. The reset that consumes it is scheduled CORE_INIT
+    // after the mass-complete and then awaits fill animations, so this must
+    // comfortably exceed that — but stay short enough that a breakdown stranded
+    // by a declined due-date modal can never attach to a LATER cycle.
+    COMPLETION_SPLIT_TTL: 15000   // 15s
+});
+
+/**
+ * UI transition timeouts
+ * Controls timing for UI transitions and animations
+ * @constant {Object}
+ */
+export const UI_TIMEOUTS = Object.freeze({
+    CYCLE_SWITCH_TRANSITION: 300,  // 300ms - Delay during cycle switch
+    STATS_UPDATE_DELAY: 100,       // 100ms - Stats panel update delay
+    WHEEL_RESET_DELAY: 200,        // 200ms - horizontal wheel/trackpad accumulation resets after this much silence. Was 15ms, SHORTER than a 60Hz trackpad's ~16.7ms event gap, so each event accumulated alone and flicks rarely reached the threshold
+    WHEEL_NAVIGATE_LOCKOUT: 450,   // 450ms - after a wheel navigation, further horizontal wheel is ignored: one flick's momentum tail used to step a second panel on 120Hz input
+    FOCUS_NEXT_TICK: 20,           // 20ms - Focus a control just after a dialog/modal renders
+    MODAL_ENTER_ARM_DELAY: 100,    // 100ms - Arm the Enter-anywhere confirm handler after a modal opens (avoids catching the opening keypress)
+    IDLE_CALLBACK_FALLBACK: 100,   // 100ms - setTimeout fallback where requestIdleCallback is unavailable
+    TRANSITION_FALLBACK: 300,      // 300ms - Safety fallback when a CSS transitionend never fires (fast transitions)
+    EDIT_OVERLAY_REMOVE: 500,      // 500ms - Edit-focus overlay removal fallback (matches its CSS transition)
+    EXPORT_FALLBACK_SUCCESS: 3000, // 3000ms - Assume export saved if no focus/save-dialog signal arrives by then
+    BLOB_URL_REVOKE: 5000,         // 5000ms - Revoke a download blob URL (generous grace for slow save dialogs)
+    FOCUS_DELAY: 100,              // 100ms - Focus input after action
+    FOCUS_DELAY_SHORT: 50,         // 50ms - Focus an element shortly after it appears (inputs/edit fields)
+    SAVE_DEFER: 50,                // 50ms - Defer a state save to the next tick so DOM/state settles first
+    RESIZE_DEBOUNCE: 150,          // 150ms - Window resize debounce
+    TASK_DRAG_LONG_PRESS: 500,     // 500ms - Hold a task row this long on touch before it lifts for reordering. iOS's own long-press is 500ms, Android's 400ms; shorter buys a faster lift at the price of accidental drags mid-scroll, which move data
+    LONG_PRESS_HINT: 500,          // 500ms - Hold an icon-only control this long before its label appears. Equal to TASK_DRAG_LONG_PRESS on purpose: one hold means the same thing everywhere
+    LONG_PRESS_CLICK_GUARD: 300,   // 300ms - Window in which the synthetic click after a long-press is swallowed, so asking what an icon does never also does it
+    HINT_DISMISS_ARM: 100,         // 100ms - Delay before a shown long-press hint starts listening for the touch that dismisses it, so the press that raised it cannot also close it
+    LAYOUT_CLICK_SWALLOW: 50,      // 50ms - Task View Layout: window in which the synthesized click after a drag is swallowed
+    LAYOUT_HANDLE_LEAVE_GRACE: 250, // 250ms - Task View Layout: how long a draggable stays "hovered" after the cursor leaves it, so a handle floating outside its edge can be reached across the gap (a hidden handle is not hit-testable, so without this the cursor could never arrive on it)
+    NOTIFICATION_MIN_VISIBLE: 40,  // px - the strip of the notification panel that must stay inside the viewport when it is dragged or restored, so it can always be grabbed again
+    SW_VERSION_QUERY: 1500,        // 1500ms - give up asking a service worker for its version; the message may never be answered, and the caller falls back to a version-less notice
+    LAYOUT_COALESCE_WINDOW: 500,   // 500ms - Task View Layout: merge position writes from rapid successive drags into ONE AppState.update (one undo entry per burst, not per drag)
+    ANIMATION_SHORT: 200,          // 200ms - Short animation / transition delay
+    NOTIFICATION_FADE: 300,        // 300ms - Notification removal animation
+    MODAL_ANIMATION: 500,          // 500ms - Modal open/close animation
+    CLEAR_ANIMATION: 600,          // 600ms - Cycle clear animation duration
+    BG_HIGHLIGHT_RESET: 800,       // 800ms - Background highlight reset
+    PAGE_RELOAD: 1000,             // 1000ms - Page reload after data operation
+    SESSION_BACKUP_DELAY: 1000,    // 1000ms - Session backup delay after boot
+    POST_RESTORE_RELOAD: 2500,     // 2500ms - Page reload after backup restoration
+    INDEXEDDB_DELETE_SAFETY: 2000, // 2000ms - Factory reset: give up waiting on a deleteDatabase that fires no success/blocked event (open connection with a prior pending delete) so the reset can't hang
+    NOTIFICATION_BRIEF: 1500,      // 1500ms - Brief notification (undo, quick actions)
+    NOTIFICATION_SHORT: 2000,      // 2000ms - Standard notification duration
+    NOTIFICATION_MEDIUM: 2500,     // 2500ms - Medium notification (permissions, confirmations)
+    NOTIFICATION_LONG: 3000,       // 3000ms - Long notification duration
+    NOTIFICATION_EXTENDED: 4000,   // 4000ms - Extended notification (errors, important info)
+    NOTIFICATION_SLOW: 5000,       // 5000ms - Slow notification (critical errors, init failures)
+    NOTIFICATION_EXTRA_LONG: 6000, // 6000ms - Extra-long notification (migration, milestones)
+    NOTIFICATION_PERSISTENT: 8000, // 8000ms - Near-persistent notification (data loss warnings)
+    NOTIFICATION_OVERLAY: 10000,   // 10000ms - Overlay/celebration auto-dismiss
+    NOTIFICATION_RESUME_MIN: 1000, // 1000ms - Minimum time after hover/interaction before auto-dismiss
+    CELEBRATION_DELAY: 1800,       // 1800ms - Delay before showing celebration overlay (lets reset animation play first)
+    FOCUS_TASK_CELEBRATION: 2000,  // 2000ms - Focus task panel cycle-complete card celebration before showing task 1 (FOCUS_TASK_VIEW_PLAN D5)
+    TOOLTIP_HIDE: 3000,            // 3000ms - Tooltip auto-hide delay
+    FIRST_RUN_WELCOME_SLIDE_HOLD: 8000,    // 8000ms - How long each first-run welcome banner slide is visible before auto-advance
+    TITLE_SCREEN_USECASE_HOLD: 2800,       // 2800ms - Welcome Screen use-case crossfade. Matches the first-run screen's inline rotator: it is the same line doing the same job, and the two screens are meant to feel identical.
+    TIP_ARCHIVE_SLIDE_HOLD: 8000,          // 8000ms - How long one tip stays up in the tip archive before auto-advancing. Matches FIRST_RUN_WELCOME_SLIDE_HOLD: same job (read one short line, unhurried) so the two should not drift apart. Deliberately far slower than the 4s BOOT rotator, which the user is not expected to read completely.
+    FIRST_RUN_SPLASH_WATCHDOG: 12000,      // 12000ms - Hard ceiling on the typewriter splash. Its phase chain hangs off animationend, which never fires if the char animations are disabled or interrupted; this guarantees the splash always fades and its completion promise always resolves (the create/sample picks open their dialog on it)
+
+    // Cycle-demo SVG choreography (slide 3) — relative offsets WITHIN one
+    // iteration of the loop. Each iteration runs end-to-end then schedules
+    // itself to start again, so the demo plays continuously while the slide
+    // is visible (~3 cycles fit in an 8s slide hold).
+    CYCLE_DEMO_TASK_1: 300,                // Task 1 ticks
+    CYCLE_DEMO_TASK_2: 700,                // Task 2 ticks
+    CYCLE_DEMO_TASK_3: 1100,               // Task 3 ticks
+    CYCLE_DEMO_COMPLETE: 1500,             // Counter morphs → "Cycle Complete!"
+    CYCLE_DEMO_COUNTER_UPDATE: 1900,       // Counter text increments (still hidden behind overlay)
+    CYCLE_DEMO_RESET: 2000,                // Task checks clear (still under overlay)
+    CYCLE_DEMO_RESTORE: 2300,              // Overlay fades, counter reappears with new number + pulses
+    CYCLE_DEMO_LOOP: 2900,                 // Iteration ends, next iteration begins immediately
+
+    // Onboarding "Start Tour" SVG button flow (interactive button on step 3)
+    START_TOUR_AFTER_SAMPLE: 3000,        // 3000ms - Tour fires this long after sample loads (lets user read welcome toast / pick blank)
+    START_TOUR_AFTER_BLANK: 1000,         // 1000ms - Tour fires this long after a blank routine becomes active
+    START_TOUR_BLANK_WATCH_GIVEUP: 30000, // 30000ms - Give up the AppState subscription if user cancels create-routine modal
+
+    // Guided tour prompt notification (the 10s "want to take a tour?" toast)
+    TOUR_FIRST_RUN_DELAY: 17000,          // 17000ms - First-run delay before showing the tour prompt notification (lets the Home View welcome notification be read + auto-dismiss first)
+    TOUR_RETURNING_USER_DELAY: 2000,      // 2000ms - Returning-user delay before showing the tour prompt
+    TOUR_RESCHEDULE_DELAY: 3500,          // 3500ms - Delay before re-showing the tour prompt after user dismisses
+
+    // Backup reminder notification (per-session prompt to back up data)
+    REMINDERS_SUMMARY_REFRESH: 60000,     // 60000ms - While the reminders modal is open, re-render the "next reminder in N minutes" line this often so it does not go stale
+    BACKUP_REMINDER_BOOT: 3000,           // 3000ms - Delay after boot before considering whether to show the backup reminder
+    BACKUP_REMINDER_TRIGGER: 2000,        // 2000ms - Delay after trigger event before actually showing the reminder
+
+    // Background image preference compression (large user-uploaded images)
+    BG_IMAGE_COMPRESSION_TIMEOUT: 30000,  // 30000ms - Hard timeout for the bg-image compression worker
+
+    // Undo/redo behavior tuning
+    UNDO_REDO_GRACE_PERIOD: 2000,         // 2000ms - Wait this long after async render before allowing redo-stack clear (prevents race-condition wipes)
+    UNDO_SESSION_LIFETIME: 600000         // 600000ms (10min) - Stored undo state expires after this; older snapshots are discarded on load
+});
+
+/**
+ * Error handling timeouts
+ * @constant {Object}
+ */
+export const ERROR_TIMEOUTS = Object.freeze({
+    CRITICAL_ERROR_EXPORT: 2000    // 2s - Delay before exporting error log
+});
+
+/**
+ * Preferences feature constants
+ * @constant {Object}
+ */
+export const PREFERENCES = Object.freeze({
+    MAX_UNDO_STEPS: 20             // Maximum undo history size
+});
+
+// ============================================================================
+// DEBOUNCE / INTERVALS (milliseconds)
+// ============================================================================
+
+/**
+ * Debounce timings for various operations
+ * @constant {Object}
+ */
+export const DEBOUNCE = Object.freeze({
+    STATE_SAVE: 600,               // 600ms - AppState save debounce
+    STATE_SAVE_IDLE_TIMEOUT: 2000, // 2s - requestIdleCallback timeout for save
+    STATE_SAVE_FALLBACK: 100,      // 100ms - Fallback timeout if no requestIdleCallback
+    UNDO_DB_WRITE: 3000,           // 3s - IndexedDB write debounce for undo
+    UNDO_MIN_INTERVAL: 300,        // 300ms - Minimum interval between undo snapshots
+    CONCURRENT_MOD_CONFLICT: 1000, // 1s - Threshold for concurrent modification detection
+    DUE_DATE_NOTIFY_SYNC: 250,     // 250ms - Coalesce a burst of state writes before re-planning the due-date system notifications
+    SEARCH_RESULT_ANNOUNCE: 500    // 500ms - Wait for typing to settle before announcing a result count. Announcing per keystroke makes a screen reader unusable while typing
+});
+
+/**
+ * Interval timings for recurring operations
+ * @constant {Object}
+ */
+export const INTERVALS = Object.freeze({
+    RECURRING_WATCHER: 15000,           // 15s - Recurring task watcher check interval (active)
+    RECURRING_WATCHER_IDLE: 7200000,    // 2h - Recurring watcher interval when no templates exist
+    BACKUP_DAILY: 86400000,             // 24h - Default daily auto-backup interval
+    BACKUP_SESSION_MIN: 300000,         // 5min - Minimum gap between auto-backups within a single session
+    BACKUP_TEST_MIN: 300000,            // 5min - Minimum gap before re-running backup integrity tests
+    // Foreground cadence for the daily auto-uncheck. Only covers the app sitting
+    // open ACROSS the scheduled minute — a backgrounded tab has its timers
+    // throttled or suspended, and visibilitychange is the catch-up for that.
+    DAILY_RESET_TICK: 30000,            // 30s - Daily auto-uncheck check interval (active: at least one routine has it enabled)
+    DAILY_RESET_TICK_IDLE: 7200000      // 2h - Daily auto-uncheck interval when NO routine has it enabled. Mirrors RECURRING_WATCHER_IDLE. Correctness never rests on this tick — init() and visibilitychange both run the same idempotent catch-up check — so a slow idle poll costs nothing but wakeups
+});
+
+/**
+ * Frequency unit to milliseconds conversion
+ * Used by reminders system for scheduling intervals
+ * @constant {Object}
+ */
+export const FREQUENCY_MS = Object.freeze({
+    minutes: 60000,
+    hours: 3600000,
+    days: 86400000
+});
+
+/**
+ * System (OS / browser) notification assets and tags. A tag collapses repeats
+ * of the same kind into one entry in the notification centre.
+ * @constant {Object}
+ */
+export const SYSTEM_NOTIFICATIONS = Object.freeze({
+    ICON: './assets/images/logo/taskcycle_logo_blackandwhite_transparent.png',
+    TAG_REMINDER: 'minicycle-reminder',
+    TAG_DUE_DATE: 'minicycle-due-date'
+});
+
+// ============================================================================
+// FONT SIZE
+// ============================================================================
+
+/**
+ * Base font size bounds, in pixels.
+ *
+ * DEFAULT_PX is the "no inline override" value: when the stored setting equals
+ * it, consumers must REMOVE the inline --font-size-base rather than write it,
+ * so the stylesheet's responsive default (the max-width:480px bump) can win.
+ *
+ * MIN_PX/MAX_PX bound what may reach setProperty. The <select> only offers
+ * 14/16/18/20, but the stored value is just a string in state — the range is
+ * the validation floor for anything that reads it back.
+ * @constant {Object}
+ */
+export const FONT_SIZE = Object.freeze({
+    DEFAULT_PX: 16,
+    MIN_PX: 10,
+    MAX_PX: 32
+});
+
+// ============================================================================
+// SIZE LIMITS
+// ============================================================================
+
+/**
+ * Size limits for various data structures
+ * @constant {Object}
+ */
+/**
+ * Schema versions. Two DIFFERENT shapes, easy to conflate:
+ *   CURRENT      — top-level `metadata.schemaVersion`, the STRING "2.6"
+ *   CURRENT_TASK — per-task/template `schemaVersion`, the NUMBER 2
+ * Cycles carry NEITHER — a diagnostic that tested `cycle.schemaVersion` was
+ * therefore dead and always reported "valid" (fixed Aug 2026).
+ * @constant {Object}
+ */
+export const SCHEMA = Object.freeze({
+    CURRENT: '2.6',
+    // The oldest top-level version this build can still read — a restore or
+    // import of anything between here and CURRENT is accepted (and, once a
+    // migration exists, migrated at boot). Pre-2.5 was retired Sep 2026, so
+    // this stays '2.5' when CURRENT moves to '2.6'.
+    OLDEST_MIGRATABLE: '2.5',
+    CURRENT_TASK: 2
+});
+
+/**
+ * Default reminder settings — the single source of truth shared by the READER
+ * (the reader in dataAccess.js substitutes this when `customReminders` is absent)
+ * and every WRITER (reminders.updateReminderSettings merges onto it).
+ *
+ * Lives here rather than in dataAccess.js because this module is pure — it imports
+ * nothing — so a writer can depend on the defaults without pulling in the legacy,
+ * stateful data-access layer and its versioned/unversioned module-instance hazard.
+ *
+ * Frozen to prevent accidental mutation; spread when assigning to create a fresh copy.
+ */
+export const DEFAULT_REMINDERS = Object.freeze({
+    enabled: false,
+    indefinite: false,
+    dueDatesReminders: false,
+    repeatCount: 0,
+    frequencyValue: 30,
+    frequencyUnit: "minutes"
+});
+
+/**
+ * Moments a one-time "this moved" notice is keyed to. A user whose data
+ * predates the moment used the old layout and gets told once; data created
+ * after it never does. Epoch ms, UTC.
+ * @constant {Object}
+ */
+export const LAYOUT_CHANGES = Object.freeze({
+    FOCUS_EXIT_MOVED_AT: Date.UTC(2026, 9, 10)  // v2.594: the × to leave Focus View moved from the top-left corner to under the routine list, bottom right (866ee77f)
+});
+
+export const LIMITS = Object.freeze({
+    MAX_TIMEOUT_MS: 2147483647,    // Largest setTimeout delay (~24.8 days). Above this the delay overflows a signed 32-bit int and the timer fires IMMEDIATELY — clamp and re-arm for anything longer (reminders.js scheduleNextReminder)
+    UNDO_STACK: 20,                // Max items in undo/redo stack
+    UNDO_CACHE_MAX_BYTES: 1000000, // Byte cap on the localStorage undo cache (~1MB of the ~5MB quota shared with main state); oldest snapshots shed first. REAL bytes: consumers compare string length × 2 (UTF-16), matching storageUtils' quota metering
+    TASKS_PER_CYCLE: 150,          // Max tasks per cycle/routine
+    MAX_SPECIFIC_DATES: 366,       // Max specificDates entries per recurring task (a year of dailies). Shared by BOTH producers — the .mcyc importer (which truncates) and the panel's Add button (which refuses and notifies). Was import-only, so the panel had no cap at all and the two disagreed
+    RECURRING_SEARCH_THRESHOLD: 5,  // Show the recurring panel's search only once the list is long enough to scroll past. Below this a search box is chrome, not help — the whole list is already on screen
+    DYNAMIC_CACHE_ENTRIES: 100,    // Max entries in service worker dynamic cache
+    NORMALIZATION_CACHE: 50,       // Max entries in recurring settings normalization cache
+    ERROR_LOG: 50,                 // Max errors to keep in error log
+    MAX_ERRORS_BEFORE_SILENCE: 10, // Max error notifications before silencing
+    TASK_CHARACTER: 500,           // Max characters for task text — the STORAGE ceiling, enforced by the .mcyc importer
+    // Max characters accepted from the UI input. DELIBERATELY lower than
+    // TASK_CHARACTER: the importer accepts up to the storage ceiling, so an
+    // imported routine can legitimately hold longer text than a user can type.
+    // These were the same hardcoded-100 vs 500 divergence with no name to tell
+    // them apart (Aug 2026) — raise this to TASK_CHARACTER if the two should
+    // ever agree, rather than re-hardcoding either.
+    TASK_CHARACTER_INPUT: 100,
+    CYCLE_NAME_CHARACTER: 100,     // Max characters for cycle name
+    RATING_HISTORY: 10,            // Max entries kept in userProgress.uxRatingHistory
+    CONSOLE_BUFFER_MAX: 500,       // Max console log entries kept in the in-memory buffer
+    CONSOLE_BUFFER_TRIM_TARGET: 100, // After overflow, trim the buffer down to this size
+    STORAGE_WARNING_PERCENTAGE: 75,  // Show storage warning notification when localStorage usage exceeds this percentage
+    BACKUP_REMINDER_EVERY_N_CYCLES: 25,  // Trigger backup reminder every N completed cycles
+    BACKUP_REMINDER_EVERY_N_TASKS: 100,  // Trigger backup reminder every N cleared tasks (To-Do mode)
+    MAX_CORRUPT_BACKUPS: 3,              // Max raw-corrupted-data snapshots kept in localStorage for manual recovery
+    RECURRING_OVERSLEEP_FACTOR: 2,       // Watch tick counts as overslept when the gap since the last tick exceeds this multiple of the expected interval (device sleep / tab freeze) — the tick then delegates to catch-up
+    // Max task names stored on ONE history event's completion breakdown (per
+    // side). Names are user text, so this is a STORAGE cap, not a display one:
+    // TASKS_PER_CYCLE (150) x TASK_CHARACTER (500) x MAX_EVENTS (100) is ~7.5MB
+    // uncapped, against a ~5MB localStorage quota. Counts are always exact; only
+    // the name list is truncated, and the renderer says "+N more".
+    HISTORY_EVENT_TASK_NAMES: 12,
+    LAYOUT_DRAG_THRESHOLD: 5,             // px - Task View Layout: pointer travel before drag starts (forgive hover jitter)
+    LAYOUT_DOCK_GAP: 20,                  // px - Task View Layout: vertical gap between an anchor element and its docked dependent
+    LAYOUT_KEY_STEP: 10,                  // px - Task View Layout: how far one arrow key press moves a draggable (Shift = 1px)
+    LAYOUT_MIN_VISIBLE_OVERLAP: 40,       // px - Task View Layout: how much of a restored element must stay inside #task-view, so a layout saved on a wider display can never strand it (and its drag handle) out of reach
+    DUE_DATE_NOTIFY_HOUR: 9,              // Local hour on the due day at which a dated task's system notification fires (due dates are date-only)
+    NATIVE_DUE_DATE_SCHEDULE_MAX: 30,     // Max due-day notifications pre-scheduled natively (one per day that has due tasks); also the cancel range
+    NATIVE_REMINDER_SCHEDULE_MAX: 24      // Max future reminder occurrences pre-scheduled as native notifications (iOS caps pending local notifications at 64 app-wide)
+});
+
+/**
+ * Inset rectangle for the Task View Layout drag bounds. Defines the
+ * "play area" — the region a user can drag elements into. Values are
+ * pixels measured inward from each viewport edge so dragged elements
+ * can't slide under the header, footer, or off-screen.
+ * @constant {Object}
+ */
+/**
+ * Snap-back ("dock") zone geometry per Task View draggable, keyed to the
+ * `key` of each entry in taskViewLayoutManager's DRAGGABLES registry.
+ *
+ * `tolerancePx`   — vertical depth of the snap band. Drop an element with its
+ *                   centre inside and it re-docks instead of staying free.
+ * `widthFraction` — horizontal width of that band as a fraction of the anchor's
+ *                   current width (0..1, centred on the anchor).
+ *
+ * These are feel knobs — how forgiving the snap is — so they live here with the
+ * other tunables rather than inline in the registry.
+ *
+ * Deliberately NOT de-duplicated: two pairs share values today (90/0.8 and
+ * 80/0.7), but they describe unrelated elements. Collapsing them into shared
+ * entries would mean tuning the status bubble silently re-tunes Quick Actions.
+ * @constant {Object}
+ */
+export const LAYOUT_DOCK_ZONES = Object.freeze({
+    // Big, forgiving band — the task card is the anchor everything else docks to,
+    // so homing it should not require precision.
+    TASK_CARD_GROUP:     Object.freeze({ tolerancePx: 160, widthFraction: 0.5 }),
+    ADD_TASK_INPUT:      Object.freeze({ tolerancePx: 80,  widthFraction: 0.7 }),
+    QUICK_ACTIONS_PANEL: Object.freeze({ tolerancePx: 90,  widthFraction: 0.8 }),
+    STATUS_BUBBLE:       Object.freeze({ tolerancePx: 90,  widthFraction: 0.8 }),
+    COMPLETE_CYCLE_BTN:  Object.freeze({ tolerancePx: 80,  widthFraction: 0.7 })
+});
+
+/**
+ * Task View Layout: which coordinate frame saved positions were measured in.
+ * Positions are stored as pixels relative to #task-view. Until Oct 2026 that
+ * box hugged its in-flow content and was centred on the band, so its origin
+ * moved every time an element floated out of it or a routine changed length —
+ * a saved position meant something different on every reload. Frame 2 is the
+ * band itself (app-container.css ≥769px: a fixed-height box). Positions with
+ * no frame, or an older one, are discarded on apply rather than restored into
+ * the wrong place.
+ */
+export const LAYOUT_FRAME_VERSION = 2;
+
+export const LAYOUT_PLAY_AREA_INSETS = Object.freeze({
+    top: 90,        // header + mode pill clearance
+    bottom: 90,     // nav-dots + footer clearance
+    left: 20,       // edge gutter
+    right: 20       // edge gutter
+});
+
+// RESPONSIVE BREAKPOINTS — keep in sync with styles/base media queries.
+// Convention: mobile check = `innerWidth <= BREAKPOINTS.MOBILE_MAX`,
+// desktop check = `innerWidth >= BREAKPOINTS.DESKTOP_MIN` (negate for not-desktop).
+export const BREAKPOINTS = Object.freeze({
+    MOBILE_MAX: 768,    // ≤ 768px → mobile layout
+    DESKTOP_MIN: 1024   // ≥ 1024px → desktop layout
+});
+
+// ============================================================================
+// GESTURE THRESHOLDS (pixels)
+// ============================================================================
+
+/**
+ * Touch and mouse gesture thresholds
+ * @constant {Object}
+ */
+export const GESTURE = Object.freeze({
+    SWIPE_THRESHOLD: 400,          // Minimum distance for swipe recognition
+    MOUSE_DRAG_THRESHOLD: 400,     // Minimum distance for mouse drag
+    MOUSE_DRAG_START: 20,          // Minimum distance to start mouse drag
+    TOUCH_SWIPE: 50,               // Minimum distance for touch swipe
+    VERTICAL_SWIPE: 60,            // Minimum vertical distance for the focus task panel's swipe-to-skip (higher than TOUCH_SWIPE to avoid scroll-intent misfires)
+    TASK_HOLD_SLOP: 15,            // px, per axis - How far a finger may drift during the TASK_DRAG_LONG_PRESS hold before it is read as a scroll and the hold is cancelled. Wider than the platforms' 8-10px on purpose: a thumb trembles while it waits, and a real scroll clears 15px long before the hold is up
+    WHEEL_SCROLL_MIN: 10,          // Minimum wheel scroll to trigger action
+    AXIS_DOMINANCE_RATIO: 1.5      // A swipe must exceed the OTHER axis by this factor to count — without it, a thumb arcing during a scroll reads as a sideways swipe
+});
+
+// ============================================================================
+// ACHIEVEMENT MILESTONES
+// ============================================================================
+
+/**
+ * Cycle completion milestones for unlocking features
+ * @constant {Object}
+ */
+/**
+ * Achievement milestone thresholds - SINGLE SOURCE OF TRUTH
+ * Used by: cycleCompletion.js (reward unlocks), achievementsManager.js (achievement tracking)
+ *
+ * To change thresholds, edit ONLY this file.
+ */
+export const MILESTONES = Object.freeze({
+    TASK_ORDER_GAME: 100,       // global cycles → unlock Task Order game
+
+    // One-time celebration overlay thresholds (>= so backup restores past
+    // the threshold still trigger once — see cycleCompletion/taskCycleReset)
+    CELEBRATE_CYCLES_100: 100,  // global cycles completed
+    CELEBRATE_CYCLES_500: 500,  // global cycles completed
+    CELEBRATE_TASKS_500: 500,   // total tasks completed
+
+    // Full milestone definitions (5 tiers: 5, 25, 50, 75, 100)
+    // Emojis match vocab theme celebrate icons: 🔥 💪 📚 🧹 👑
+    TIERS: Object.freeze([
+        {
+            id: 'milestone-5',
+            name: 'Habit Tracker',
+            emoji: '🔥',
+            cycles: 5,
+            tasks: 5,
+            reward: 'habit-tracker',
+            rewardType: 'vocab-theme',
+            rewardLabel: 'Habit Tracker Theme'
+        },
+        {
+            id: 'milestone-25',
+            name: 'Fitness',
+            emoji: '💪',
+            cycles: 25,
+            tasks: 125,
+            reward: 'fitness',
+            rewardType: 'vocab-theme',
+            rewardLabel: 'Fitness Theme'
+        },
+        {
+            id: 'milestone-50',
+            name: 'Scholar',
+            emoji: '📚',
+            cycles: 50,
+            tasks: 250,
+            reward: 'scholar',
+            rewardType: 'vocab-theme',
+            rewardLabel: 'Scholar Theme'
+        },
+        {
+            id: 'milestone-75',
+            name: 'Cleaning',
+            emoji: '🧹',
+            cycles: 75,
+            tasks: 375,
+            reward: 'cleaning',
+            rewardType: 'vocab-theme',
+            rewardLabel: 'Cleaning Theme'
+        },
+        {
+            id: 'milestone-100',
+            name: 'Crowned',
+            emoji: '👑',
+            cycles: 100,
+            tasks: 500,
+            reward: 'whack-a-order',
+            rewardType: 'game',
+            rewardLabel: 'Whack-a-Order Game'
+        }
+    ])
+});
+
+// ============================================================================
+// CHART / SVG DIMENSIONS
+// ============================================================================
+
+/**
+ * SVG chart dimensions for stats panel doughnut chart
+ * @constant {Object}
+ */
+export const CHART = Object.freeze({
+    DOUGHNUT_CIRCUMFERENCE: 251.2, // SVG circle circumference (2 * PI * radius)
+    DOUGHNUT_RADIUS: 40            // SVG circle radius
+});
+
+// ============================================================================
+// CACHE CONFIGURATION
+// ============================================================================
+
+/**
+ * Service worker cache configuration
+ * Note: These are duplicated in service-worker.js for ES5 compatibility
+ * @constant {Object}
+ */
+export const CACHE_CONFIG = Object.freeze({
+    MAX_AGE_DAYS: 7,                           // Cache expiration in days
+    MAX_AGE_MS: 7 * 24 * 60 * 60 * 1000        // Cache expiration in milliseconds
+});
+
+// ============================================================================
+// Z-INDEX LAYERS
+// ============================================================================
+
+/**
+ * Z-index stacking layers — single source of truth for JS usage.
+ * Values mirror CSS custom properties in styles/base/variables.css.
+ * @constant {Object}
+ */
+export const Z_INDEX = Object.freeze({
+    BACKGROUND: -2,          // Background patterns
+    BASE: 0,                 // Normal document flow
+    CONTENT: 1,              // Minor elevation within components
+    ELEVATED: 5,             // Progress bars, internal stacking
+    EDIT_FOCUS: 50,          // Edit focus overlay (below header)
+    HEADER: 100,             // Fixed header
+    MENU: 500,               // Main menu overlay
+    MODAL_BACKDROP: 999,     // Modal backdrops
+    MODAL: 1000,             // Standard modals
+    MODAL_HIGH: 2000,        // High-priority modals (storage, onboarding)
+    OVERLAY_CRITICAL: 10000, // Import error overlays and the testing modal
+    LONG_PRESS_HINT: 1001,   // Long-press label bubble — one above MODAL, matching .quick-actions-tooltip's calc(var(--z-modal) + 1). Inside a showModal() dialog the top layer decides instead; see longPressHint._ensureHintElement
+    TOUR_OVERLAY: 10500,     // Guided tour overlay
+    TOUR_TOOLTIP: 10501,     // Guided tour tooltip
+    DEBUG: 99999,            // Debug utilities
+    TASK_VIEW_HANDLE: 10,    // Task View Layout: drag handle — above task-search (5) and mini-cycle-title (1) so it doesn't get covered when card content shifts
+    TASK_VIEW_DRAGGING: 20,  // Task View Layout: element being dragged — above other draggables' handles so it stays on top during drag
+    NOTIFICATION: 100000,    // Notification container (above all overlays)
+    NOTIFICATION_ACTIVE: 100001, // Dragging notification
+    NOTIFICATION_BTN: 100002,    // Notification interactive buttons
+    CRITICAL: 999999         // Boot critical errors only
+});
+
+// ============================================================================
+// TIME CONSTANTS
+// ============================================================================
+
+/**
+ * Standard time unit constants for date calculations
+ * @constant {Object}
+ */
+export const TIME_UNITS = Object.freeze({
+    MS_PER_SECOND: 1000,
+    SECONDS_PER_MINUTE: 60,
+    MINUTES_PER_HOUR: 60,
+    HOURS_PER_DAY: 24,
+    DAYS_PER_WEEK: 7,
+    MS_PER_DAY: 24 * 60 * 60 * 1000
+});
+
+// ============================================================================
+// STORAGE KEYS — Single source of truth for localStorage key strings
+// ============================================================================
+
+/**
+ * localStorage key constants
+ * Prevents typos and enables find-all-references
+ * @constant {Object}
+ */
+export const STORAGE_KEYS = Object.freeze({
+    DATA: 'miniCycleData',
+    MILESTONE_UNLOCKS: 'milestoneUnlocks',
+    DARK_MODE: 'darkModeEnabled',
+    CURRENT_THEME: 'currentTheme',
+    LITE_DATA: 'miniCycleLite',
+    LITE_MODE: 'miniCycleLiteMode',
+    LITE_THEME: 'miniCycleLiteTheme',
+    LITE_CYCLES: 'miniCycleLiteCycles',
+    LITE_LIFETIME_COMPLETED: 'miniCycleLiteLifetimeCompleted',
+    LITE_TODO_DELETED: 'miniCycleLiteToDoDeleted',
+    LITE_CELEBRATED_BADGES: 'miniCycleLite_celebratedBadges',
+    LITE_CELEBRATED_CLEARED_BADGES: 'miniCycleLite_celebratedClearedBadges',
+    LITE_NOTIFICATIONS: 'miniCycleLiteNotifications',
+    // 'on' | 'off'. Lite's collapsed/expanded view preference — the one Lite key
+    // that was written but never listed here, so backups silently dropped it
+    // (Sep 2026). Lite's autoSave() also READS a "...LiteCount" key that nothing
+    // ever writes — a dead read that always yields 0 — so that one is NOT a key.
+    LITE_FOCUS_MODE: 'miniCycleLiteFocusMode',
+    FORCE_FULL_VERSION: 'miniCycleForceFullVersion',
+    // First-run choice screen. Written by the static handler in miniCycle.html
+    // and re-written when a factory reset raises that screen again in place.
+    FIRST_RUN_CHOICE_SESSION: 'miniCycle_firstRunChoice',
+    FIRST_RUN_CHOICE_MADE: 'miniCycle_firstRunChoiceMade',
+    CONSOLE_CAPTURE_ENABLED: 'miniCycle_enableAutoConsoleCapture',
+    CONSOLE_CAPTURE_BUFFER: 'miniCycle_capturedConsoleBuffer',
+    TIME_TRACKER: 'timeTrackerData'
+});
+
+/**
+ * Where AppState keeps the raw stored document, byte for byte, before migrating it
+ * to a newer schema: `<DATA>_pre-migration_<timestamp>` (appState._migrateIfOlder),
+ * beside the `<DATA>_corrupted_<ts>` copies dataRecovery keeps. Settings → Data
+ * Management lets the user download, restore or delete it (backupRestoreManager).
+ * Not a STORAGE_KEYS entry: the key is dynamic, and the factory reset sweeps it by
+ * the name-matching rule.
+ * @constant {string}
+ */
+export const PRE_MIGRATION_BACKUP_PREFIX = `${STORAGE_KEYS.DATA}_pre-migration_`;
+
+// ============================================================================
+// CUSTOM EVENT NAMES — Single source of truth for document.dispatchEvent
+// ============================================================================
+
+/**
+ * Custom event names dispatched on `document` for cross-module coordination.
+ * Use these instead of string literals so callers and listeners stay in sync.
+ * @constant {Object}
+ */
+export const EVENTS = Object.freeze({
+    FOCUS_MODE_ACTIVATED: 'focusMode:activated',
+    FOCUS_MODE_DEACTIVATED: 'focusMode:deactivated',
+    /** Dispatched on document by panelCarousel after a panel becomes active:
+        detail = { id, previousId, index, changed }. */
+    PANEL_CAROUSEL_CHANGED: 'panelCarousel:changed',
+    /** Dispatched on document by uiBoot when Escape was pressed and nothing
+        was closing (no open dialog, no open menu, no text field focused):
+        every module that holds transient UI state — a tooltip, a hover
+        reveal, an open dropdown — drops it. The generic sweep (task option
+        reveals, drag marks, body classes, long-press hints) runs before the
+        event; this is for state only its owner can see. */
+    UI_ESCAPE_RESET: 'ui:escapeReset',
+    /** Dispatched on document by the undo wrapper just before it captures the
+        pre-write snapshot for a user action. A module holding coalesced writes
+        of its own (taskViewLayoutManager's drag positions) flushes them on this,
+        so its entry lands on the undo stack BEFORE the action that followed
+        it — the order the user performed them. */
+    UNDO_SNAPSHOT_PENDING: 'undo:snapshotPending',
+    FIRST_RUN_REARM: 'firstrun:rearm',          // backupRestoreManager after an IN-PLACE factory reset: the choice screen is back, the origin is empty again (inline rotators and the + shimmer re-arm on it)
+    ADD_TASK_DISCOVERED: 'ui:addTaskDiscovered' // uiBoot when a task is added through the input bar: modeManager clears the + button's first-time shimmer and records the discovery
+});
+
+// ============================================================================
+// DOM CSS CLASSES — Single source of truth for classList operations
+// ============================================================================
+
+/**
+ * CSS class name constants for classList.add/remove/toggle/contains
+ * Prevents typos and enables find-all-references
+ * @constant {Object}
+ */
+export const DOM_CLASSES = Object.freeze({
+    // ---- Visibility ----
+    HIDDEN: 'hidden',
+    VISIBLE: 'visible',
+    LONG_PRESS_HINT: 'long-press-hint',
+    SHOW: 'show',
+    HIDE: 'hide',
+    HIDE_LEFT: 'hide-left',    // panel carousel: hidden panel sits left of the active one
+    HIDE_RIGHT: 'hide-right',  // panel carousel: hidden panel sits right of the active one
+    COLLAPSED: 'collapsed',
+
+    // ---- State ----
+    ACTIVE: 'active',
+    SELECTED: 'selected',
+    CURRENT_ROUTINE: 'current-routine',
+    CHECKED: 'checked',
+    DISABLED: 'disabled',
+
+    // ---- Task ----
+    TASK: 'task',
+    TASK_CONTENT: 'task-content',
+    TASK_TEXT: 'task-text',
+    THREE_DOTS_BTN: 'three-dots-btn',
+    HOVER_ENABLED: 'hover-enabled',
+
+    // ---- Task State ----
+    RECURRING: 'recurring',
+    HIGH_PRIORITY: 'high-priority',
+    KEPT_TASK: 'kept-task',
+    SHOW_DELETE_INDICATOR: 'show-delete-indicator',
+    DELETE_WHEN_COMPLETE_ACTIVE: 'delete-when-complete-active',
+    REMINDER_ACTIVE: 'reminder-active',
+    OVERDUE_TASK: 'overdue-task',
+    DUE_DATE: 'due-date',
+
+    // ---- Drag & Drop ----
+    DRAGGING: 'dragging',
+    DRAGGABLE: 'draggable',
+    LONG_PRESSED: 'long-pressed',
+    REARRANGING: 'rearranging',
+    DROP_TARGET: 'drop-target',
+    RECURRING_PAUSED: 'recurring-paused',     // Recurring panel row whose template is paused
+    MOVE_UP: 'move-up',
+    MOVE_DOWN: 'move-down',
+
+    // ---- Task Options Mode ----
+    SHOW_THREE_DOTS_ENABLED: 'show-three-dots-enabled',
+
+    // ---- Edit Focus ----
+    EDIT_FOCUS_OVERLAY: 'edit-focus-overlay',
+    EDIT_FOCUS_INNER: 'edit-focus-inner',
+    EDIT_FOCUS_RAISED: 'edit-focus-raised',
+    EDIT_FOCUS_TARGET: 'edit-focus-target',
+    EDIT_FOCUS_ACTIVE: 'active',
+    SEARCH_PAGE_OVERLAY: 'search-page-overlay',
+
+    // ---- Theme ----
+    DARK_MODE: 'dark-mode',
+    DARK_OCEAN: 'dark-ocean',
+    GOLDEN_GLOW: 'golden-glow',
+    THEME_DARK_OCEAN: 'theme-dark-ocean',
+    THEME_GOLDEN_GLOW: 'theme-golden-glow',
+
+    // ---- Boot / Loader ----
+    APP_LOADING: 'app-loading',
+    FADE_OUT: 'fade-out',
+
+    // ---- Device Mode ----
+    DESKTOP_MODE: 'desktop-mode',
+    TOUCH_MODE: 'touch-mode',
+
+    // ---- Animation ----
+    LOGO_SPIN: 'logo-spin',
+    COMPLETE_ANIMATION: 'mini-cycle-complete-animation',
+    CLEAR_ANIMATION: 'mini-cycle-clear-animation',
+    MILESTONE_ANIMATION: 'mini-cycle-milestone',
+
+    // ---- Layout ----
+    TASK_CARD_GROUP: 'task-card-group',
+    TVL_DRAGGABLE: 'tvl-draggable',          // Task View Layout: an element registered as draggable
+    TVL_HANDLE: 'tvl-handle',                // Task View Layout: drag handle button injected into a draggable
+    TVL_HANDLE_HOST: 'tvl-handle-host',      // Task View Layout: child element that visually hosts the handle (positioned ancestor for the handle)
+    TVL_HOVERED: 'tvl-hovered',              // Task View Layout: JS-tracked hover state on a draggable (replaces :hover so reveal is deterministic)
+    TVL_DRAGGING: 'tvl-dragging',            // Task View Layout: applied to element while drag is in progress
+    TVL_CUSTOMIZED: 'tvl-customized',        // Task View Layout: element has been moved from its default position
+    TVL_SNAP_HOVER: 'tvl-snap-hover',        // Task View Layout: dragged element is inside its snap-back zone
+    TVL_SNAP_TARGET: 'tvl-snap-target',      // Task View Layout: visual indicator showing the snap-back zone
+    TVL_SNAP_TARGET_VISIBLE: 'tvl-snap-target--visible',  // Task View Layout: indicator is shown (drag in progress)
+    TVL_SNAP_TARGET_ACTIVE: 'tvl-snap-target--active',    // Task View Layout: dragged element is currently inside this indicator's zone
+    TVL_SNAP_TARGET_LABEL: 'tvl-snap-target__label',      // Task View Layout: text label inside the snap-target indicator
+    MODE_DESCRIPTION_VISIBLE: 'mode-description-visible',
+    MODE_RADIO_ROW: 'mode-radio-row',
+    MODE_RADIO_OPTION: 'mode-radio-option',
+    HELP_WINDOW_SIDE: 'help-window-side',
+    ONBOARDING_ACTIVE: 'onboarding-active',
+    FOCUS_MODE: 'focus-mode',
+    // On <body> while the task search's sort chip is anything but Default.
+    // The sorted view has no meaningful "up"/"down", and a reorder written
+    // through it silently rewrote the real routine order (measured Oct 2026),
+    // so drag-and-drop and the move arrows pause while it is set.
+    TASKS_SORTED: 'tasks-sorted',
+    // Focus task card, empty routine (no tasks at all) — drops the card's
+    // chrome so the message sits on the background rather than inside a card
+    // wrapped around nothing. NOT the all-done state, which keeps its card.
+    FOCUS_TASK_EMPTY: 'focus-task-empty',
+    FIRST_RUN_WELCOME: 'first-run-welcome',
+    FIRST_RUN_WELCOME_VISIBLE: 'first-run-welcome--visible',
+    FIRST_RUN_WELCOME_ACTIVE: 'first-run-welcome-active',
+    FIRST_RUN_WELCOME_MESSAGE: 'first-run-welcome__message',
+    FIRST_RUN_WELCOME_MESSAGE_FADING: 'first-run-welcome__message--fading',
+    FIRST_RUN_WELCOME_TITLE_FADING: 'first-run-welcome__title--fading',
+    FIRST_RUN_WELCOME_TOGGLE: 'first-run-welcome__toggle',
+    FIRST_RUN_WELCOME_PAUSED: 'first-run-welcome--paused',
+    FIRST_RUN_WELCOME_NAV: 'first-run-welcome__nav',
+    FIRST_RUN_WELCOME_NAV_PREV: 'first-run-welcome__nav--prev',
+    FIRST_RUN_WELCOME_NAV_NEXT: 'first-run-welcome__nav--next',
+    FIRST_RUN_WELCOME_NAV_HIDDEN: 'first-run-welcome__nav--hidden',
+    FIRST_RUN_WELCOME_LOGO: 'first-run-welcome__logo',
+    // Cycle-demo SVG (slide 3 of the welcome carousel — animated demonstration
+    // of three tasks completing and the cycle counter advancing).
+    CYCLE_DEMO: 'cycle-demo',
+    CYCLE_DEMO_TASK: 'cycle-demo__task',
+    CYCLE_DEMO_TASK_DONE: 'cycle-demo__task--done',
+    CYCLE_DEMO_CIRCLE: 'cycle-demo__circle',
+    CYCLE_DEMO_CHECK: 'cycle-demo__check',
+    CYCLE_DEMO_LABEL: 'cycle-demo__label',
+    CYCLE_DEMO_STRIKE: 'cycle-demo__strike',
+    CYCLE_DEMO_COUNTER: 'cycle-demo__counter',
+    CYCLE_DEMO_COUNT: 'cycle-demo__count',
+    CYCLE_DEMO_COMPLETE_TEXT: 'cycle-demo__complete',
+    CYCLE_DEMO_COMPLETE_VISIBLE: 'cycle-demo--complete',
+    CYCLE_DEMO_COUNTER_PULSE: 'cycle-demo--counter-pulse',
+    CYCLE_DEMO_DIVIDER: 'cycle-demo__divider',
+    CYCLE_DEMO_SUBTITLE: 'cycle-demo__subtitle',
+    CYCLE_DEMO_ARROW: 'cycle-demo__arrow',
+    FIRST_RUN_MODE: 'first-run-mode',       // on #app-loader while the choice screen is up
+    MC_FIRST_RUN: 'mc-first-run',           // on <html>; critical.css lays the screen out from it
+    FIRST_RUN_BTN: 'first-run-btn',
+    FIRST_RUN_BTN_CHOSEN: 'is-chosen',
+    FIRST_RUN_SPLASH: 'first-run-splash',
+    FIRST_RUN_SPLASH_VISIBLE: 'first-run-splash--visible',
+    FIRST_RUN_SPLASH_FADING: 'first-run-splash--fading',
+    FIRST_RUN_SPLASH_CHAR: 'first-run-splash__char',
+    FIRST_RUN_SPLASH_TITLE: 'first-run-splash__title',
+    FIRST_RUN_SPLASH_LINE: 'first-run-splash__line',
+    FIRST_RUN_SPLASH_WORD: 'first-run-splash__word',
+    FIRST_RUN_SPLASH_WORD_LANDING: 'first-run-splash__word--landing',
+    FIRST_RUN_WELCOME_TITLE: 'first-run-welcome__title',
+    FIXED_HEADER_CONTAINER: 'fixed-header-container',
+    DROPDOWN_OPEN: 'dropdown-open',
+    REFRESHING: 'refreshing',
+
+    // ---- Modals (generic) ----
+    // The shared dialog shell from styles/components/modals.css. Reusable by any
+    // modal that needs no bespoke chrome — see features/tipArchive.js.
+    MODAL: 'modal',
+    MODAL_CONTENT: 'modal-content',
+
+    // ---- Tip Archive ----
+    // Label span inside a menu button. iconInit.js wraps the icon in its OWN
+    // <span class="icon">, so a module setting button text MUST target this
+    // class — a bare querySelector('span') hits the icon wrapper and wipes the SVG.
+    MENU_ITEM_LABEL: 'menu-item-label',
+    // Bespoke shell + has-corner-logo: the house pattern every other modal uses
+    // (themes / preferences / settings / feedback). Bare .modal-content is a
+    // different visual language and reads as foreign beside them.
+    TIP_ARCHIVE_MODAL_CONTENT: 'tip-archive-modal-content',
+    TIP_ARCHIVE_BODY: 'tip-archive-body',
+    HAS_CORNER_LOGO: 'has-corner-logo',
+    // House class for a modal's primary/close action: full-width, --color-primary.
+    // Used by the reminders, settings and preferences modals.
+    SETTINGS_BTN: 'settings-btn',
+    // ---- Welcome Screen (modules/ui/titleScreen.js) ----
+    // NOTE: deliberately NOT reusing .first-run-choice. critical.css hides it
+    // with `html:not(.mc-first-run) .first-run-choice { display: none }`, and a
+    // returning user never carries that class — the surface would be invisible
+    // to exactly the audience it is built for, with nothing thrown.
+    TITLE_SCREEN: 'title-screen',
+    TITLE_SCREEN_INNER: 'title-screen-inner',
+    TITLE_SCREEN_LOGO: 'title-screen-logo',
+    TITLE_SCREEN_TIP: 'title-screen-tip',
+    TITLE_SCREEN_TAGLINE: 'title-screen-tagline',
+    TITLE_SCREEN_CREDIT: 'title-screen-credit',
+    TITLE_SCREEN_FOOTER: 'title-screen-footer',
+    // Crossfade state on .first-run-usecase-text (critical.css). Not the same as
+    // ACTIVE ('active') above — that one is unrelated task/panel state.
+    IS_ACTIVE: 'is-active',
+    TITLE_SCREEN_ACTIONS: 'title-screen-actions',
+    TITLE_SCREEN_LEGAL: 'title-screen-legal',
+    TIP_ARCHIVE_STAGE: 'tip-archive-stage',
+    TIP_ARCHIVE_TEXT: 'tip-archive-text',
+    TIP_ARCHIVE_KICKER: 'tip-archive-kicker',
+    TIP_ARCHIVE_NAV: 'tip-archive-nav',
+    TIP_ARCHIVE_NAV_BTN: 'tip-archive-nav-btn',
+    TIP_ARCHIVE_PAUSE_BTN: 'tip-archive-pause-btn',
+    TIP_ARCHIVE_POSITION: 'tip-archive-position',
+    TIP_ARCHIVE_FADING: 'tip-archive-fading',
+
+    // ---- Empty State ----
+    // The empty-state hint varies across TWO axes: which view is active
+    // (home vs focus) and whether the task input bar is currently showing.
+    // That's 4 messages; CSS picks one using `body.focus-mode` ×
+    // `body.input-bar-visible`. Each hint names the affordance that actually
+    // works in its state, so we never tell the user to reveal a bar that is
+    // already open (which would in fact hide it).
+    EMPTY_STATE_HINT_FOCUS: 'empty-state-hint-focus',
+    EMPTY_STATE_HINT_VISIBLE: 'empty-state-hint-visible',
+    EMPTY_STATE_HINT_FOCUS_VISIBLE: 'empty-state-hint-focus-visible',
+    // Set on <body> whenever the task input bar is showing (see modeManager's
+    // _updateTaskInputVisibility — the single choke point for that state).
+    INPUT_BAR_VISIBLE: 'input-bar-visible',
+    // Set on <body> when the ACTIVE ROUTINE HAS TASKS AND EVERY ONE IS COMPLETE.
+    // Read from AppState, never from the DOM: with the completed-tasks dropdown
+    // enabled the finished tasks are moved OUT of #taskList, so the list is
+    // literally :empty and the DOM cannot tell "just finished everything" apart
+    // from "brand new routine". CSS uses this to swap the empty state's
+    // onboarding copy for a completion message (task-list.css).
+    // Choke point: completedTasksManager.updateCount().
+    ALL_TASKS_COMPLETE: 'all-tasks-complete',
+
+    // ---- Main Menu section headers (icon + label grouping) ----
+    MENU_SECTION_LABEL: 'menu-section-label',
+    MENU_SECTION_ICON: 'menu-section-icon',
+    MAIN_MENU_BACKDROP: 'main-menu-backdrop',
+
+    // ---- Body-level open-state flags (PWA-reliable alternative to :has()) ----
+    MAIN_MENU_OPEN: 'main-menu-open',
+    QUICK_ACTIONS_OPEN: 'quick-actions-open',
+    FOCUS_MODE_MENU_OPEN: 'focus-mode-menu-open',
+
+    // ---- Focus Mode (component classes used in JS for createElement.className) ----
+    FOCUS_MODE_BTN: 'focus-mode-btn',
+    FOCUS_MODE_EXIT_BTN: 'focus-mode-exit-btn',
+    FOCUS_ACTION_BTN: 'focus-action-btn',   /* Focus View's fixed Complete Cycle / Clear button (its own element since Oct 2026) */
+    /* The enter / exit Focus View control's (eye / ×) slot BENEATH a carousel
+       panel, hanging off its lower-right corner like the routine card's
+       .progress-focus-row. The Task and Stats panels get it appended by
+       focusMode; the control moves to whichever panel is active. */
+    PANEL_ACTION_SLOT: 'panel-action-slot',
+    FOCUS_MODE_MENU: 'focus-mode-menu',
+    FOCUS_MODE_MENU_BTN: 'focus-mode-menu-btn',
+    FOCUS_MODE_MENU_ITEM: 'focus-mode-menu-item',
+    FOCUS_MODE_MENU_ITEM_DESTRUCTIVE: 'focus-mode-menu-item--destructive',
+    FOCUS_MODE_MENU_SEPARATOR: 'focus-mode-menu-separator',
+    FOCUS_MODE_MODE_MODAL: 'focus-mode-mode-modal',
+    FOCUS_MODE_MODE_MODAL_BACKDROP: 'focus-mode-mode-modal-backdrop',
+    FOCUS_MODE_MODE_MODAL_TITLE: 'focus-mode-mode-modal-title',
+    FOCUS_MODE_MODE_OPTION: 'focus-mode-mode-option',
+    FOCUS_MODE_MODE_OPTION_TEXT: 'focus-mode-mode-option-text',
+    FOCUS_MODE_MODE_OPTION_NAME: 'focus-mode-mode-option-name',
+    FOCUS_MODE_MODE_OPTION_DESC: 'focus-mode-mode-option-desc',
+    FOCUS_MODE_MODE_DONE_BTN: 'focus-mode-mode-done-btn',
+
+    // ---- Routine Switcher ----
+    MINI_CYCLE_SWITCH_ITEM: 'mini-cycle-switch-item',
+    RECENT_ROUTINES_SECTION: 'recent-routines-section',
+    MINICYCLE_INPUT_ERROR: 'miniCycle-input-error',
+
+    // ---- Task Boundary Markers ----
+    IS_FIRST_TASK: 'is-first-task',
+    IS_LAST_TASK: 'is-last-task',
+
+    // ---- Task Options Visibility ----
+    TASK_OPTIONS_FORCE_HIDDEN: 'task-options-force-hidden',
+    TASK_OPTIONS_VISIBLE: 'task-options-visible',
+
+    // ---- Task Buttons ----
+    TASK_OPTIONS: 'task-options',
+    TASK_BTN: 'task-btn',
+    CUSTOMIZE_BTN: 'customize-btn',
+    PRIORITY_ACTIVE: 'priority-active',
+
+    // ---- Mode Buttons ----
+    AUTO_CYCLE_MODE: 'auto-cycle-mode',
+    MANUAL_CYCLE_MODE: 'manual-cycle-mode',
+    TODO_MODE_MODE: 'todo-mode-mode',
+    TODO_MODE_BTN: 'todo-mode-btn',
+    CYCLE_MODE_BTN: 'cycle-mode-btn',
+    COMPLETE_BTN_VISIBLE: 'complete-btn-visible',
+
+    // ---- Background / Pattern ----
+    NO_BG_PATTERN: 'no-bg-pattern',
+    CUSTOM_PATTERN: 'custom-pattern',
+    HAS_BG_IMAGE: 'has-bg-image',
+    BG_MODE_COVER: 'bg-mode-cover',
+    BG_MODE_CENTER: 'bg-mode-center',
+    BG_MODE_TILE: 'bg-mode-tile',
+
+    // ---- Panel Visibility ----
+    HIDE_HELP_WINDOW: 'hide-help-window',
+    HIDE_QUICK_ACTIONS: 'hide-quick-actions',
+
+    // ---- Accessibility ----
+    REDUCED_MOTION: 'reduced-motion',
+    HIGH_CONTRAST: 'high-contrast',
+
+    // ---- Checkmark Styles ----
+    CHECKMARK_FITTED: 'checkmark-fitted',
+    CHECKMARK_MINIMAL: 'checkmark-minimal',
+    CHECKMARK_CIRCLE: 'checkmark-circle',
+
+    // ---- Notifications ----
+    TIP_CLOSE: 'tip-close',
+    TIP_TOGGLE: 'tip-toggle',
+    TIP_TOGGLE_BTN: 'tip-toggle-btn',
+    HAS_NOTIFICATIONS: 'has-notifications',
+    NOTIFICATION_ERROR: 'error',
+    NOTIFICATION_SUCCESS: 'success',
+    NOTIFICATION_INFO: 'info',
+    NOTIFICATION_WARNING: 'warning',
+    SHOW_QUICK_ACTIONS: 'show-quick-actions',
+    APPLY_QUICK_RECURRING: 'apply-quick-recurring',
+    OPEN_RECURRING_SETTINGS: 'open-recurring-settings',
+
+    // ---- Achievements / Badges ----
+    UNLOCKED: 'unlocked',
+    UNLOCKED_MESSAGE: 'unlocked-message',
+    OCEAN_THEME: 'ocean-theme',
+    GOLDEN_THEME: 'golden-theme',
+    GAME_UNLOCKED: 'game-unlocked',
+    HAS_CONTENT: 'has-content',
+
+    // ---- Task Cycle Reset ----
+    TASK_RESETTING: 'task-resetting',
+    TASK_CLEARING: 'task-clearing',
+    COMPLETED: 'completed',
+    PROGRESS_COMPLETE: 'complete',   /* .progress-bar at 100%: the sheen plays once (progress-bar.css) */
+
+    // ---- Pull to Refresh ----
+    OPEN: 'open',
+    READY: 'ready',
+
+    // ---- Onboarding ----
+    FIRST_TIME_SHIMMER: 'first-time-shimmer',
+    TASKS_EMPTY: 'tasks-empty',
+
+    // ---- Recurring Panel ----
+    FIRST_SPECIFIC_DATE: 'first-specific-date',
+    TWO_COL_ACTIVE: 'two-col-active',
+    RECURRING_SETTINGS_TITLE: 'recurring-settings-title',
+    OPTION_CHECKBOX: 'option-checkbox',
+
+    // ---- Task Option Buttons (individual) ----
+    EDIT_BTN: 'edit-btn',
+    DELETE_BTN: 'delete-btn',
+    PRIORITY_BTN: 'priority-btn',
+    SET_DUE_DATE: 'set-due-date',
+    CLOSE_BTN: 'close-btn'
+});
+
+// ============================================================================
+// DOM ELEMENT IDS — Single source of truth for getElementById calls
+// ============================================================================
+
+/**
+ * DOM element ID constants for getElementById calls.
+ * Includes factory functions for parameterized IDs (e.g., freqSpecificTime, notificationCurrentSettings).
+ * @constant {Object<string, string|Function>}
+ */
+export const DOM_IDS = Object.freeze({
+    // ---- Task ----
+    TASK_LIST: 'taskList',
+    // Developer diagnostic overlay, rendered only when the URL carries
+    // ?layoutdebug=1. See focusMode._renderLayoutDebug().
+    LAYOUT_DEBUG_OVERLAY: 'layout-debug-overlay',
+    TASK_INPUT: 'taskInput',
+    ADD_TASK_BTN: 'addTaskBtn',
+    COMPLETE_ALL: 'completeAll',
+    COMPLETED_TASK_LIST: 'completedTaskList',
+    EMPTY_STATE: 'empty-state',
+    RECURRING_INFO_LINK: 'recurring-info-link',
+    COMPLETED_TASKS_SECTION: 'completed-tasks-section',
+    COMPLETED_TASKS_HEADER: 'completed-tasks-header',
+    COMPLETED_COUNT: 'completed-count',
+
+    // ---- Task Search ----
+    TASK_SEARCH_CONTAINER: 'task-search-container',
+    TASK_SEARCH_BTN: 'task-search-btn',
+    TASK_SEARCH_INPUT: 'task-search-input',
+    TASK_SEARCH_CLEAR: 'task-search-clear',
+    TASK_SEARCH_INPUT_ROW: 'task-search-input-row',
+    TASK_FILTER_SORT_ROW: 'task-filter-sort-row',
+
+    // ---- Menu ----
+    MENU_BUTTON: 'menu-button',
+    APP_CONTAINER: 'app-container',       // <main tabindex=-1>: the last-resort focus target after a dialog closes
+    CLOSE_MAIN_MENU: 'close-main-menu',
+    MAIN_MENU_TITLE: 'main-menu-mini-cycle-title',
+    CURRENT_DATE: 'current-date',
+    MENU_TASK_OPTIONS: 'menu-task-options',
+    MENU_ENTER_FOCUS_VIEW: 'menu-enter-focus-view',
+    OPEN_USER_MANUAL: 'open-user-manual',
+    OPEN_TIP_ARCHIVE: 'open-tip-archive',
+    MENU_OPEN_TITLE_SCREEN: 'menu-open-title-screen',
+    TITLE_SCREEN: 'title-screen',
+    TITLE_SCREEN_CLOSE: 'title-screen-close',
+    TITLE_SCREEN_CREATE_ROUTINE: 'title-screen-create-routine',
+    TITLE_SCREEN_OPEN_ROUTINE: 'title-screen-open-routine',
+    TITLE_SCREEN_RESTORE_BACKUP: 'title-screen-restore-backup',
+    TITLE_SCREEN_USER_MANUAL: 'title-screen-user-manual',
+    TITLE_SCREEN_WEBSITE: 'title-screen-website',
+    TITLE_SCREEN_TIP_BTN: 'title-screen-tip-btn',
+    TITLE_SCREEN_USECASE_A: 'title-screen-usecase-a',
+    TITLE_SCREEN_USECASE_B: 'title-screen-usecase-b',
+    TIP_ARCHIVE_MODAL: 'tip-archive-modal',
+    TIP_ARCHIVE_CLOSE: 'tip-archive-close',
+    TIP_ARCHIVE_TEXT: 'tip-archive-text',
+    TIP_ARCHIVE_PREV: 'tip-archive-prev',
+    TIP_ARCHIVE_NEXT: 'tip-archive-next',
+    TIP_ARCHIVE_PLAYPAUSE: 'tip-archive-playpause',
+    TIP_ARCHIVE_POSITION: 'tip-archive-position',
+    SAVE_AS_MINI_CYCLE: 'save-as-mini-cycle',
+    OPEN_MINI_CYCLE: 'open-mini-cycle',
+    // Wired by cycleImportManager (which still matches it by literal string).
+    IMPORT_MINI_CYCLE: 'import-mini-cycle',
+    // Wired by cycleImportManager (which still matches it by literal string).
+    CLEAR_MINI_CYCLE_TASKS: 'clear-mini-cycle-tasks',
+    DELETE_ALL_MINI_CYCLE_TASKS: 'delete-all-mini-cycle-tasks',
+    AUTO_UNCHECK_DAILY_TOGGLE: 'auto-uncheck-daily-toggle',
+    AUTO_UNCHECK_DAILY_TIME_BTN: 'auto-uncheck-daily-time-btn',
+    AUTO_UNCHECK_DAILY_TIME_LABEL: 'auto-uncheck-daily-time-label',
+    AUTO_UNCHECK_BANNER: 'auto-uncheck-banner',
+    AUTO_UNCHECK_BANNER_TEXT: 'auto-uncheck-banner-text',
+    NEW_MINI_CYCLE: 'new-mini-cycle',
+    EXPORT_MINI_CYCLE: 'export-mini-cycle',
+    SHARE_ROUTINE: 'share-routine',
+    SHARE_APP: 'share-app',
+
+    // ---- Settings ----
+    OPEN_SETTINGS: 'open-settings',
+    CLOSE_SETTINGS: 'close-settings',
+    SETTINGS_VERSION_DISPLAY: 'settings-version-display',
+    DARK_MODE_TOGGLE: 'darkModeToggle',
+    DARK_MODE_TOGGLE_THEMES: 'darkModeToggleThemes',
+    TOGGLE_MOVE_ARROWS: 'toggle-move-arrows',
+    TOGGLE_THREE_DOTS: 'toggle-three-dots',
+    TOGGLE_COMPLETED_DROPDOWN: 'toggle-completed-dropdown',
+    TOGGLE_SCROLL_TO_NEW_TASK: 'toggle-scroll-to-new-task',
+    TOGGLE_SCROLL_ON_LOAD: 'toggle-scroll-on-load',
+    TOGGLE_DEBUG_MODE: 'toggle-debug-mode',
+    RESET_RECURRING_DEFAULT: 'reset-recurring-default',
+    RESET_ACHIEVEMENT_PROGRESS: 'reset-achievement-progress',
+    CLEAR_UNDO_HISTORY: 'clear-undo-history',
+    RETAKE_GUIDED_TOUR: 'retake-guided-tour',
+    MENU_RETAKE_TOURS: 'menu-retake-tours',
+    TOGGLE_CHECKBOX_FILL: 'toggle-checkbox-fill',
+    TOGGLE_CHECKBOX_INCOMPLETE: 'toggle-checkbox-incomplete',
+    TOGGLE_BG_PATTERN: 'toggle-bg-pattern',
+    TOGGLE_BG_IMAGE_VISIBLE: 'toggle-bg-image-visible',
+    TOGGLE_HELP_WINDOW: 'toggle-help-window',
+    TOGGLE_QUICK_ACTIONS: 'toggle-quick-actions',
+    SETTINGS_TOGGLE_HELP_WINDOW: 'settings-toggle-help-window',
+    SETTINGS_TOGGLE_QUICK_ACTIONS: 'settings-toggle-quick-actions',
+    SETTINGS_TOGGLE_ONE_SECTION: 'settings-toggle-one-section',
+
+    // ---- Accessibility Settings ----
+    TOGGLE_REDUCED_MOTION: 'toggle-reduced-motion',
+    TOGGLE_HIGH_CONTRAST: 'toggle-high-contrast',
+    FONT_SIZE_SELECT: 'font-size-select',
+
+    // ---- Behavior Settings ----
+    TOGGLE_NOTIFICATIONS: 'toggle-notifications',
+    RESET_NOTIFICATION_POSITION: 'reset-notification-position',
+    RESET_TASK_VIEW_LAYOUT: 'reset-task-view-layout',
+
+    // ---- Lite Version ----
+    TRY_LITE_VERSION: 'try-lite-version',
+    MENU_LITE_VERSION: 'menu-lite-version',
+    // "Check for Updates" — Settings → Advanced, and the main menu (utils/updateCheck.js)
+    CHECK_FOR_UPDATES: 'check-for-updates',
+    MENU_CHECK_UPDATES: 'menu-check-updates',
+
+    // ---- Backup & Recovery ----
+    BACKUP_MINI_CYCLES: 'backup-mini-cycles',
+    RESTORE_MINI_CYCLES: 'restore-mini-cycles',
+    // The copy AppState kept before a schema migration (Settings → Data Management)
+    PRE_MIGRATION_COPY: 'pre-migration-copy',
+    PRE_MIGRATION_COPY_DESC: 'pre-migration-copy-desc',
+    PRE_MIGRATION_DOWNLOAD: 'pre-migration-download',
+    PRE_MIGRATION_RESTORE: 'pre-migration-restore',
+    PRE_MIGRATION_DELETE: 'pre-migration-delete',
+    FACTORY_RESET: 'factory-reset',
+    RECOVERY_FRESH_START: 'recovery-fresh-start',
+    RECOVERY_LOAD_SAMPLE: 'recovery-load-sample',
+    RECOVERY_DOWNLOAD_BACKUP: 'recovery-download-backup',
+
+    // ---- Modals ----
+    REMINDERS_MODAL: 'reminders-modal',
+    REMINDERS_WEB_NOTE: 'reminders-web-note',
+    REMINDERS_WEB_NOTE_TEXT: 'reminders-web-note-text',
+    REMINDERS_BELL_NOTE: 'reminders-bell-note',
+    DUE_DATES_NOTE: 'due-dates-note',
+    DUE_DATES_NOTE_TEXT: 'due-dates-note-text',
+    REMINDERS_NEXT_SUMMARY: 'reminders-next-summary',
+    TEST_RUNNER_IFRAME: 'test-runner-iframe',    // the cross-origin test runner frame in the testing modal      // the "web reminders need the app open" line in the reminders modal
+    CLOSE_REMINDERS_BTN: 'close-reminders-btn',
+    OPEN_REMINDERS_MODAL: 'open-reminders-modal',
+    FEEDBACK_MODAL: 'feedback-modal',
+    OPEN_FEEDBACK_MODAL: 'open-feedback-modal',
+    OPEN_FEEDBACK_MODAL_FOOTER: 'open-feedback-modal-footer',
+    FEEDBACK_FORM: 'feedback-form',
+    FEEDBACK_MODAL_TITLE: 'feedback-modal-title',
+    FEEDBACK_TEXT: 'feedback-text',
+    FEEDBACK_EMAIL: 'feedback-email',
+    SUBMIT_FEEDBACK: 'submit-feedback',
+    THANK_YOU_MESSAGE: 'thank-you-message',
+    FEEDBACK_RATING_SECTION: 'feedback-rating-section',
+    FEEDBACK_RATING_LABEL: 'feedback-rating-label',
+    FEEDBACK_STAR_ROW: 'feedback-star-row',
+    FEEDBACK_RATING_PROMPT: 'feedback-rating-prompt',
+    FEEDBACK_TAGS_LABEL: 'feedback-tags-label',
+    FEEDBACK_TAGS_ROW: 'feedback-tags-row',
+    FEEDBACK_PREVIOUS_RATING: 'feedback-previous-rating',
+    FEEDBACK_RATING_VALUE: 'feedback-rating-value',
+    FEEDBACK_RATING_TAGS_VALUE: 'feedback-rating-tags-value',
+    ABOUT_MODAL: 'about-modal',
+    OPEN_ABOUT_MODAL: 'open-about-modal',
+    ABOUT_VERSION: 'about-version',
+    ABOUT_SW_VERSION: 'about-sw-version',
+    TASK_OPTIONS_CUSTOMIZER_MODAL: 'task-options-customizer-modal',
+    OPEN_TASK_OPTIONS_CUSTOMIZER: 'open-task-options-customizer',
+    CLOSE_TASK_OPTIONS_BTN: 'close-task-options-btn',
+    RESET_TASK_OPTIONS_BTN: 'reset-task-options-btn',
+    OPTION_PREVIEW_CONTENT: 'option-preview-content',
+
+    // ---- Preferences ----
+    PREFERENCES_MODAL: 'preferences-modal',
+    OPEN_PREFERENCES: 'open-preferences',
+    CLOSE_PREFERENCES_BTN: 'close-preferences-btn',
+    PERSONALIZATION_BTN: 'personalization-btn',
+    PREFERENCES_OPEN_THEMES: 'preferences-open-themes',
+    PREFERENCES_PREVIEW: 'preferences-preview',
+    PREFERENCES_NO_PRESETS: 'preferences-no-presets',
+    PREFERENCES_PRESETS_LIST: 'preferences-presets-list',
+    PREFERENCES_RESET_ALL: 'preferences-reset-all',
+    PREF_SAVE_PRESET: 'pref-save-preset',
+    PREF_IMPORT_PRESET: 'pref-import-preset',
+    PREFERENCES_UNDO: 'preferences-undo',
+    PREF_QUICK_PRESETS_GRID: 'pref-section-quick-themes',
+    PREFERENCES_THEME_NOTICE: 'preferences-theme-notice',
+    PREF_PATTERN_COLOR: 'pref-pattern-color',
+    PREF_PATTERN_OPACITY: 'pref-pattern-opacity',
+    PREF_CHECKBOX_BG: 'pref-checkbox-bg',
+    PREF_CHECKBOX_INCOMPLETE_BG: 'pref-checkbox-incomplete-bg',
+    BG_IMAGE_OPTIONS: 'bg-image-options',
+    BG_IMAGE_REMOVE_BTN: 'bg-image-remove-btn',
+    BG_IMAGE_PREVIEW: 'bg-image-preview',
+    BG_IMAGE_MODE: 'bg-image-mode',
+    BG_IMAGE_UPLOAD_BTN: 'bg-image-upload-btn',
+    BG_IMAGE_UPLOAD: 'bg-image-upload',
+    PREF_STATS_PROGRESS: 'pref-stats-progress',
+    PREF_STATS_DOUGHNUT: 'pref-stats-doughnut',
+    TOGGLE_SOLID_LIST_BG: 'toggle-solid-list-bg',
+    TOGGLE_SOLID_STATS_BG: 'toggle-solid-stats-bg',
+    CHECKMARK_STYLE_OPTIONS: 'checkmark-style-options',
+
+    // ---- Cycle Completion ----
+    PREF_RESET_FLASH_COLOR: 'pref-reset-flash-color',
+    PREF_CELEBRATION_COLOR: 'pref-celebration-color',
+    PREF_TOAST_SELECT: 'pref-toast-select',
+    TOGGLE_COMPLETION_ANIMATION: 'toggle-completion-animation',
+    TOGGLE_COMPLETION_TOAST: 'toggle-completion-toast',
+
+    // ---- Reminders Form ----
+    ENABLE_REMINDERS: 'enableReminders',
+    INDEFINITE_CHECKBOX: 'indefiniteCheckbox',
+    DUE_DATES_REMINDERS: 'dueDatesReminders',
+    REPEAT_COUNT: 'repeatCount',
+    FREQUENCY_VALUE: 'frequencyValue',
+    FREQUENCY_UNIT: 'frequencyUnit',
+    FREQUENCY_SECTION: 'frequency-section',
+    REPEAT_COUNT_ROW: 'repeat-count-row',
+    BROWSER_NOTIFICATIONS: 'browserNotifications',
+    PRIVACY_NOTICE_DETAILS: 'privacyNoticeDetails',
+
+    // ---- Routine / Cycle ----
+    MINI_CYCLE_TITLE: 'mini-cycle-title',
+    MODE_SELECTOR: 'mode-selector',
+    TOGGLE_AUTO_RESET: 'toggleAutoReset',
+    DELETE_CHECKED_TASKS: 'deleteCheckedTasks',
+    DELETE_CHECKED_TASKS_CONTAINER: 'deleteCheckedTasksContainer',
+    AUTO_RESET_CONTAINER: 'autoResetContainer',
+    MODE_DESCRIPTION: 'mode-description',
+    MODE_DESCRIPTION_TOGGLE: 'mode-description-toggle',
+    ROUTINE_SWITCHER_BTN: 'routine-switcher-btn',
+
+    // ---- Routine Switcher ----
+    MINI_CYCLE_LIST: 'miniCycleList',
+    ROUTINE_SEARCH_INPUT: 'routine-search-input',
+    SWITCH_ITEMS_ROW: 'switch-items-row',
+    SORT_ALPHA: 'sort-alpha',
+    SORT_RECENT: 'sort-recent',
+    SORT_SIZE: 'sort-size',
+    ROUTINE_FILTER_SELECT: 'routine-filter-select',
+    SWITCH_DUPLICATE: 'switch-duplicate',
+    SWITCH_RENAME: 'switch-rename',
+    SWITCH_DELETE: 'switch-delete',
+    SWITCH_DOWNLOAD: 'switch-download',
+    SWITCH_THEME_BTN: 'switch-theme',
+    THEME_PICKER_ROW: 'theme-picker-row',
+    MINI_CYCLE_SWITCH_CONFIRM: 'miniCycleSwitchConfirm',
+    MINI_CYCLE_SWITCH_CANCEL: 'miniCycleSwitchCancel',
+    MINI_CYCLE_SWITCH_CLOSE: 'miniCycleSwitchClose',
+    STORAGE_BAR_FILL: 'storage-bar-fill',
+    STORAGE_BAR_TEXT: 'storage-bar-text',
+    SWITCH_PREVIEW_WINDOW: 'switch-preview-window',
+    SWITCH_PREVIEW_DATE: 'switch-preview-date',
+    DESKTOP_PREVIEW_WINDOW: 'desktop-preview-window',
+    DESKTOP_PREVIEW_TITLE: 'desktop-preview-title',
+    DESKTOP_PREVIEW_HINT: 'desktop-preview-hint',
+    ROUTINE_LIST_HINT: 'routine-list-hint',
+    STORAGE_REFRESH_BTN: 'storage-refresh-btn',
+    PREVIEW_REVIEW_OVERLAY: 'preview-review-overlay',
+
+    // ---- Stats & Navigation ----
+    STATS_PANEL: 'stats-panel',
+    TASK_VIEW: 'task-view',
+    TASK_CARD_GROUP: 'task-card-group',
+    TASK_INPUT_ROW: 'task-input-row',
+    FIRST_RUN_WELCOME: 'first-run-welcome',
+    FIRST_RUN_WELCOME_DISMISS: 'first-run-welcome-dismiss',
+    FIRST_RUN_WELCOME_TOGGLE: 'first-run-welcome-toggle',
+    FIRST_RUN_WELCOME_PREV: 'first-run-welcome-prev',
+    FIRST_RUN_WELCOME_NEXT: 'first-run-welcome-next',
+    FIRST_RUN_SPLASH: 'first-run-splash',
+    FIRST_RUN_SPLASH_TITLE: 'first-run-splash-title',
+    // Static first-run choice screen (create / sample / learn). Lives in
+    // miniCycle.html and is re-shown in place after a factory reset.
+    FIRST_RUN_CHOICE: 'first-run-choice',
+    LIVE_REGION: 'live-region',
+    SLIDE_LEFT: 'slide-left',
+    SLIDE_RIGHT: 'slide-right',
+    NAV_DOTS: 'nav-dots',
+    TOTAL_TASKS: 'total-tasks',
+    COMPLETED_TASKS: 'completed-tasks',
+    COMPLETION_RATE: 'completion-rate',
+    MINI_CYCLE_COUNT: 'mini-cycle-count',
+    PER_CYCLE_COUNT: 'per-cycle-count',
+    MILESTONE_PROGRESS_TEXT: 'milestone-progress-text',
+    STATS_PROGRESS_BAR: 'stats-progress-bar',
+    CURRENT_ROUTINE_STATUS: 'current-routine-status',
+    CURRENT_ROUTINE_NAME: 'current-routine-name',
+    CURRENT_CYCLE_DOUGHNUT_CONTAINER: 'current-cycle-doughnut-container',
+    CURRENT_CYCLE_DOUGHNUT_PROGRESS: 'current-cycle-doughnut-progress',
+    CURRENT_CYCLE_DOUGHNUT_TEXT: 'current-cycle-doughnut-text',
+    CURRENT_CYCLE_PROGRESS_TEXT: 'current-cycle-progress-text',
+    CURRENT_ROUTINE_CYCLE_COUNT: 'current-routine-cycle-count',
+    CURRENT_ROUTINE_CLEARED_COUNT: 'current-routine-cleared-count',
+    HISTORY_BTN: 'history-btn',
+    HISTORY_MODAL_DIALOG: 'history-modal-dialog',
+    ACHIEVEMENTS_MODAL_DIALOG: 'achievements-modal-dialog',
+    PER_ROUTINE_CLEARED: 'per-routine-cleared',
+    THEME_UNLOCK_MESSAGE: 'theme-unlock-message',
+    GOLDEN_UNLOCK_MESSAGE: 'golden-unlock-message',
+    GAME_UNLOCK_MESSAGE: 'game-unlock-message',
+    THEME_UNLOCK_STATUS: 'theme-unlock-status',
+
+    // ---- Themes ----
+    OPEN_THEMES_PANEL: 'open-themes-panel',
+    THEMES_MODAL: 'themes-modal',
+    CLOSE_THEMES_BTN: 'close-themes-btn',
+    QUICK_DARK_TOGGLE: 'quick-dark-toggle',
+    THEME_COLOR_META: 'theme-color-meta',
+    STATUS_BAR_STYLE_META: 'status-bar-style-meta',
+    THEME_OPTIONS_SECTION: 'theme-options-section',
+    THEME_OPTION_CONTAINER: 'theme-option-container',
+    VOCAB_THEME_SECTION: 'vocab-theme-section',
+
+    // ---- Recurring Panel ----
+    RECURRING_PANEL_OVERLAY: 'recurring-panel-overlay',
+    RECURRING_PANEL: 'recurring-panel',
+    RECURRING_TASK_LIST: 'recurring-task-list',
+    RECURRING_SEARCH_ROW: 'recurring-search-row',
+    RECURRING_SEARCH_INPUT: 'recurring-search-input',
+    RECURRING_NO_MATCHES: 'recurring-no-matches',
+    RECURRING_SEARCH_STATUS: 'recurring-search-status',
+    RECURRING_SETTINGS_PANEL: 'recurring-settings-panel',
+    RECURRING_SUMMARY_PREVIEW: 'recurring-summary-preview',
+    CLOSE_RECURRING_PANEL: 'close-recurring-panel',
+    OPEN_RECURRING_PANEL: 'open-recurring-panel',
+    CHANGE_RECURRING_SETTINGS: 'change-recurring-settings',
+    RECUR_FREQUENCY: 'recur-frequency',
+    RECUR_FREQUENCY_CONTAINER: 'recur-frequency-container',
+    SET_DEFAULT_RECURRING_CONTAINER: 'set-default-recurring-container',
+    SET_DEFAULT_RECURRING: 'set-default-recurring',
+    TOGGLE_CHECK_ALL: 'toggle-check-all',
+    TOGGLE_ADVANCED_SETTINGS: 'toggle-advanced-settings',
+    APPLY_RECURRING_SETTINGS: 'apply-recurring-settings',
+    CANCEL_RECURRING_SETTINGS: 'cancel-recurring-settings',
+    RECURRING_TOGGLE_ACTIONS: 'recurring-toggle-actions',
+    RECURRING_EMPTY_STATE: 'recurring-empty-state',
+    RECURRING_PREVIEW_TEXT: 'recurring-preview-text',
+    RECURRING_SUMMARY: 'recurring-summary',
+    ADD_RECURRING_TASK_SECTION: 'add-recurring-task-section',
+    ADD_RECURRING_TASK_BTN: 'add-recurring-task-btn',
+    AVAILABLE_TASKS_LIST: 'available-tasks-list',
+    CONFIRM_ADD_RECURRING: 'confirm-add-recurring',
+    NON_RECURRING_TASKS: 'non-recurring-tasks',
+    SELECT_ALL_ADD_RECURRING: 'select-all-add-recurring',
+    NO_AVAILABLE_TASKS: 'no-available-tasks',
+    RECUR_INDEFINITELY: 'recur-indefinitely',
+    RECUR_LIMITED_CONTAINER: 'recur-limited-container',
+    RECUR_COUNT_RADIO: 'recur-count-radio',
+    RECUR_UNTIL_RADIO: 'recur-until-radio',
+    RECUR_COUNT_CONTAINER: 'recur-count-container',
+    RECUR_UNTIL_CONTAINER: 'recur-until-container',
+    RECUR_COUNT_INPUT: 'recur-count-input',
+    RECUR_UNTIL_DATE: 'recur-until-date',
+    ADD_SPECIFIC_DATE: 'add-specific-date',
+    SPECIFIC_DATE_LIST: 'specific-date-list',
+    RECUR_SPECIFIC_DATES: 'recur-specific-dates',
+    SPECIFIC_DATES_PANEL: 'specific-dates-panel',
+    SPECIFIC_DATE_TIME_OPTIONS: 'specific-date-time-options',
+    SPECIFIC_DATE_SPECIFIC_TIME: 'specific-date-specific-time',
+    SPECIFIC_DATE_TIME_CONTAINER: 'specific-date-time-container',
+    SPECIFIC_DATE_TIME: 'specific-date-time',
+    HOURLY_OPTIONS: 'hourly-options',
+    DAILY_OPTIONS: 'daily-options',
+    WEEKLY_OPTIONS: 'weekly-options',
+    BIWEEKLY_OPTIONS: 'biweekly-options',
+    MONTHLY_OPTIONS: 'monthly-options',
+    YEARLY_OPTIONS: 'yearly-options',
+    HOURLY_MINUTE: 'hourly-minute',
+    HOURLY_MINUTE_CONTAINER: 'hourly-minute-container',
+    HOURLY_SPECIFIC_TIME: 'hourly-specific-time',
+    MONTHLY_SPECIFIC_DAYS: 'monthly-specific-days',
+    MONTHLY_WEEK_OF_MONTH: 'monthly-week-of-month',
+    MONTHLY_WEEK_CONTAINER: 'monthly-week-container',
+    MONTHLY_DAY_CONTAINER: 'monthly-day-container',
+    MONTHLY_LAST_DAY: 'monthly-last-day',
+    MONTHLY_WEEK_ORDINAL: 'monthly-week-ordinal',
+    MONTHLY_WEEK_DAY: 'monthly-week-day',
+    YEARLY_MONTH_SELECT: 'yearly-month-select',
+    YEARLY_APPLY_DAYS_TO_ALL: 'yearly-apply-days-to-all',
+    YEARLY_SPECIFIC_DAYS: 'yearly-specific-days',
+    YEARLY_DAY_CONTAINER: 'yearly-day-container',
+    YEARLY_SPECIFIC_MONTHS: 'yearly-specific-months',
+    YEARLY_SPECIFIC_DAYS_LABEL: 'yearly-specific-days-label',
+    YEARLY_DAYS_FOR_MONTH_LABEL: 'yearly-days-for-month-label',
+    YEARLY_APPLY_ALL: 'yearly-apply-all',
+    YEARLY_APPLY_ALL_LABEL: 'yearly-apply-all-label',
+    BIWEEKLY_SPECIFIC_DAYS: 'biweekly-specific-days',
+    BIWEEKLY_DAY_CONTAINER: 'biweekly-day-container',
+    WEEKLY_SPECIFIC_DAYS: 'weekly-specific-days',
+    WEEKLY_DAY_CONTAINER: 'weekly-day-container',
+    YEARLY_MONTH_CONTAINER: 'yearly-month-container',
+
+    // ---- Frequency Time Inputs (parametric by frequency name) ----
+    freqSpecificTime: (freq) => `${freq}-specific-time`,
+    freqTime: (freq) => `${freq}-time`,
+    freqTimeContainer: (freq) => `${freq}-time-container`,
+
+    // ---- Time Picker Sections (surfaced outside advanced) ----
+    TIME_PICKER_SECTION: 'time-picker-section',
+    DAILY_TIME_SECTION: 'daily-time-section',
+    HOURLY_TIME_SECTION: 'hourly-time-section',
+    WEEKLY_TIME_SECTION: 'weekly-time-section',
+    BIWEEKLY_TIME_SECTION: 'biweekly-time-section',
+    MONTHLY_TIME_SECTION: 'monthly-time-section',
+    YEARLY_TIME_SECTION: 'yearly-time-section',
+
+    // ---- Games & Achievements ----
+    OPEN_GAMES_PANEL: 'open-games-panel',
+    GAMES_MENU_OPTION: 'games-menu-option',
+    GAMES_PANEL: 'games-panel',
+    CLOSE_GAMES_PANEL: 'close-games-panel',
+    OPEN_TASK_ORDER_GAME: 'open-task-order-game',
+    BADGE_SPIN_AREA: 'badge-spin-area',
+    BADGE_COIN: 'badge-coin',
+    BADGE_DETAIL_OVERLAY: 'badge-detail-overlay',
+    ACHIEVEMENT_BADGES_BTN: 'achievement-badges-btn',
+    ACHIEVEMENT_COUNT_BADGE: 'achievement-count-badge',
+
+    // ---- Undo/Redo ----
+    UNDO_BTN: 'undo-btn',
+    REDO_BTN: 'redo-btn',
+    UNDO_REDO_BUTTONS: 'undo-redo-buttons',
+    MENU_TOGGLE_INPUT_BAR: 'menu-toggle-input-bar',
+    MODE_RADIO_GROUP: 'mode-radio-group',
+
+    // ---- Quick Actions ----
+    QUICK_ACTIONS_WINDOW: 'quick-actions-window',
+    QUICK_ACTIONS_SLOTS: 'quick-actions-slots',
+    QUICK_ACTIONS_MENU_SLOTS: 'quick-actions-menu-slots',
+    QUICK_ACTIONS_PICKER_OVERLAY: 'quick-actions-picker-overlay',
+    QUICK_ACTIONS_TOOLTIP: 'quick-actions-tooltip',
+    LONG_PRESS_HINT: 'long-press-hint',
+    QUICK_ACTIONS_BTN: 'quick-actions-btn',
+    // Focus task panel (one task at a time — FOCUS_TASK_VIEW_PLAN Phase 1)
+    FOCUS_TASK_PANEL: 'focus-task-panel',
+    FOCUS_TASK_POSITION: 'focus-task-position',
+    FOCUS_TASK_TEXT: 'focus-task-text',
+    FOCUS_TASK_RECURRING_INDICATOR: 'focus-task-recurring-indicator',
+    FOCUS_TASK_DUE_INDICATOR: 'focus-task-due-indicator',
+    // One element for both reset states — they are mutually exclusive by
+    // construction (see getTaskResetIndicator), so a single slot enforces that.
+    FOCUS_TASK_RESET_INDICATOR: 'focus-task-reset-indicator',
+    FOCUS_TASK_COMPLETE_BTN: 'focus-task-complete-btn',
+    FOCUS_TASK_PREV_BTN: 'focus-task-prev-btn',
+    FOCUS_TASK_NEXT_BTN: 'focus-task-next-btn',
+    FOCUS_TASK_ALLDONE: 'focus-task-alldone',
+    FOCUS_TASK_ALLDONE_TEXT: 'focus-task-alldone-text',
+    FOCUS_TASK_ALLDONE_HINT: 'focus-task-alldone-hint',
+    FOCUS_TASK_CELEBRATION: 'focus-task-celebration',
+    FOCUS_TASK_CELEBRATION_TEXT: 'focus-task-celebration-text',
+    QUICK_ACTIONS_MENU: 'quick-actions-menu',
+    TOGGLE_TASK_INPUT_BTN: 'toggle-task-input-btn',
+    CREATE_ROUTINE_BTN: 'create-routine-btn',
+    TOGGLE_TASK_INPUT_TEXT: 'toggle-task-input-text',
+    APP_SUBTITLE: 'app-subtitle',
+
+    // ---- Onboarding ----
+    ONBOARDING_MODAL: 'onboarding-modal',
+    ONBOARDING_STEP_CONTENT: 'onboarding-step-content',
+    ONBOARDING_NEXT: 'onboarding-next',
+    ONBOARDING_PREV: 'onboarding-prev',
+    ONBOARDING_SKIP: 'onboarding-skip',
+    ONBOARDING_START_TOUR_BTN: 'onboarding-start-tour-btn',
+    RESET_ONBOARDING: 'reset-onboarding',
+
+    // ---- Loading & UI ----
+    APP_LOADER: 'app-loader',
+    NEWER_DATA_NOTICE: 'newer-data-notice',   // appInit.showNewerDataNotice — storage written by a newer build
+    LOADER_TIP: 'loader-tip',
+    PROGRESS_BAR: 'progressBar',
+    LOADING_OVERLAY: 'loading-overlay',
+    CLEAR_CACHE_BTN: 'clear-cache-btn',
+    HELP_WINDOW: 'help-window',
+    MAIN_MENU_BACKDROP: 'main-menu-backdrop',
+    FOCUS_MODE_BTN: 'focus-mode-btn',
+    FOCUS_MODE_EXIT_BTN: 'focus-mode-exit-btn',
+    FOCUS_ACTION_BTN: 'focus-action-btn',   /* Focus View's fixed Complete Cycle / Clear button (its own element since Oct 2026) */
+    FOCUS_MODE_MENU_BTN: 'focus-mode-menu-btn',
+    FOCUS_MODE_MENU: 'focus-mode-menu',
+    FOCUS_MODE_MODE_ITEM: 'focus-mode-mode-item',
+    FOCUS_MODE_MODE_MODAL: 'focus-mode-mode-modal',
+    FOCUS_MODE_MODE_MODAL_BACKDROP: 'focus-mode-mode-modal-backdrop',
+    FOCUS_MODE_MODE_DONE_BTN: 'focus-mode-mode-done-btn',
+    FOOTER_CONTAINER: 'footer-container',
+    COMPLETE_ALL_CONTAINER: 'complete-all-and-help-window-container',
+    NOTIFICATION_CONTAINER: 'notification-container',
+    notificationCurrentSettings: (taskId) => `current-settings-${taskId}`,
+    NEW_TASK_INPUT: 'new-task-input',
+    PULL_REFRESH_INDICATOR: 'pull-refresh-indicator',
+    SAVING_INDICATOR: 'saving-indicator',
+
+    // ---- Testing ----
+    TESTING_MODAL: 'testing-modal',
+    OPEN_TESTING_MODAL: 'open-testing-modal',
+    CLOSE_TESTING_MODAL: 'close-testing-modal',
+    AUTOMATED_TEST_OUTPUT: 'automated-test-output',
+    TESTING_OUTPUT: 'testing-output',
+    TEST_PROGRESS_BAR: 'test-progress-bar',
+    TEST_STATUS_TEXT: 'test-status-text',
+    TEST_TIME_ESTIMATE: 'test-time-estimate',
+    TEST_RUNNER_TITLE: 'test-runner-title',
+    OPEN_TEST_SUITE_LINK: 'open-test-suite-link',
+    QUICK_TEST_HINT: 'quick-test-hint',
+    SEARCH_TEST_RESULTS: 'search-test-results',
+    STORAGE_VIEWER_OVERLAY: 'storage-viewer-overlay',
+    CLOSE_STORAGE_VIEWER_BTN: 'close-storage-viewer-btn',
+    STORAGE_CONTENT: 'storage-content',
+    STAY_OPEN_TOGGLE: 'stay-open-toggle',
+
+    // ---- Testing Results Modal ----
+    CLOSE_RESULTS_MODAL: 'close-results-modal',
+    COPY_RESULTS: 'copy-results',
+    SAVE_RESULTS: 'save-results',
+    PRINT_RESULTS: 'print-results',
+    SEARCH_RESULTS: 'search-results',
+    SEARCH_BAR: 'search-bar',
+    SEARCH_INPUT: 'search-input',
+    SEARCH_INFO: 'search-info',
+    MODAL_RESULTS_CONTENT: 'modal-results-content',
+    CLEAR_SELECTION: 'clear-selection',
+
+    // ---- Modal Root IDs (used by modalRegistry) ----
+    ROUTINE_SWITCHER_MODAL: 'routine-switcher-modal',
+    SETTINGS_MODAL: 'settings-modal',
+
+    // ---- Sample Creation Dialog ----
+    SAMPLE_CREATION_INPUT: 'sample-creation-input',
+    ROUTINE_CREATION_TITLE: 'routine-creation-title',   // <h2> naming the creation dialog's name view (aria-labelledby)
+    SAMPLE_CREATION_TITLE: 'sample-creation-title',     // <h2> naming the sample-picker view; the dialog's label follows the active view
+    SAMPLE_CREATION_GRID: 'sample-creation-grid'
+});
+
+// ============================================================================
+// DOM CSS SELECTORS — Single source of truth for querySelector calls
+// ============================================================================
+
+/**
+ * CSS selector constants for querySelector/querySelectorAll calls.
+ * @constant {Object<string, string>}
+ */
+export const DOM_SELECTORS = Object.freeze({
+    // ---- Task ----
+    TASK: '.task',
+    TASK_TEXT: '.task-text',
+    TASK_EDIT_INPUT: '.task-edit-input',
+    TASK_OPTIONS: '.task-options',
+    TASK_OPTIONS_LIST: '.task-options-list',
+    TASK_OPTIONS_GLOBAL_SECTION: '.task-options-container .options-section:last-child',
+    TASK_OPTIONS_MODAL_BODY: '.modal-body',
+    TASK_BTN: '.task-btn',
+    TASK_CHECKBOX: 'input[type="checkbox"]',
+    TASK_INPUT: '.task-input',
+    TASK_LIST_CONTAINER: '.task-list-container',
+    TASK_CARD: '.task-card',
+    TITLE_ROW: '.title-row',
+    // Fixed header + mode-selector wrapper — measured by headerLayoutManager to
+    // publish --header-total-height (note: this is a CLASS, not an id).
+    FIXED_HEADER_CONTAINER: '.fixed-header-container',
+    // The band that actually PAINTS at the top (backdrop-filter: blur(5px)).
+    // Not the same as FIXED_HEADER_CONTAINER, which is transparent and also
+    // spans the mode-selector wrapper that focus mode hides. Measured by
+    // headerLayoutManager to publish --focus-chrome-bottom.
+    MINI_CYCLE_HEADER_ROW: '.mini-cycle-header-row',
+    COMPLETE_ALL_BTN: '.complete-all-btn',
+    EMPTY_STATE_TEXT: '.empty-state-text',
+    // Home-view hint shown while the input bar is HIDDEN. The variant classes
+    // below are separate tokens (never stacked on the same element), so this
+    // selector keeps matching exactly one node — existing callers are unaffected.
+    // The vocabulary-neutral "what is this app" line above the hints. Always
+    // shown alongside whichever hint CSS picks; blacked out in all-tasks-complete.
+    EMPTY_STATE_PITCH: '.empty-state-pitch',
+    EMPTY_STATE_HINT: '.empty-state-hint',
+    EMPTY_STATE_HINT_VISIBLE: '.empty-state-hint-visible',
+    // Shown INSTEAD of the text/hint pair above when body carries
+    // DOM_CLASSES.ALL_TASKS_COMPLETE — see task-list.css.
+    EMPTY_STATE_ALLDONE_TEXT: '.empty-state-alldone-text',
+    EMPTY_STATE_ALLDONE_HINT: '.empty-state-alldone-hint',
+    TASK_NOT_FOUND: '.task-not-found',
+    TASK_BY_ID: '.task[data-task-id]',
+    IS_FIRST_TASK: '.is-first-task',
+    IS_LAST_TASK: '.is-last-task',
+
+    // ---- Task Content ----
+    TASK_CONTENT: '.task-content',
+
+    // ---- Task Options & Buttons ----
+    ENABLE_TASK_REMINDERS: '.enable-task-reminders',
+    REMINDER_ACTIVE: '.reminder-active',
+    PRIORITY_BTN: '.priority-btn',
+    SET_DUE_DATE: '.set-due-date',
+    DUE_DATE: '.due-date',
+    DELETE_WHEN_COMPLETE_BTN: '.delete-when-complete-btn',
+    RECURRING_BTN: '.recurring-btn',
+    RECURRING_INDICATOR: '.recurring-indicator',
+    THREE_DOTS_BTN: '.three-dots-btn',
+    FOCUS_MODE_MENU_ITEM: '.focus-mode-menu-item',
+    FOCUS_MODE_MODE_RADIO: '.focus-mode-mode-option input[type="radio"]',
+    MODE_RADIO: '#mode-radio-group input[type="radio"]',
+    MODE_RADIO_OPTION: '.mode-radio-option',
+    MODE_RADIO_LABEL: '.mode-radio-label',
+    MODE_RADIO_INPUT: 'input[type="radio"]',
+    AUTO_UNCHECK_ROW: '.auto-uncheck-row',
+    AUTO_UNCHECK_ROW_TEXT: '.auto-uncheck-row-text',
+    FOCUS_MODE_MODE_OPTION: '.focus-mode-mode-option',
+    MOVE_UP: '.move-up',
+    MOVE_DOWN: '.move-down',
+    MOVE_ARROWS: '.move-up, .move-down',
+
+    // ---- Menu & Settings ----
+    MENU_LINK_BUTTON: '.menu-link-button',
+    MENU_SECTION: '.menu-section',
+    MENU_SECTIONS: '.menu-sections',
+    MENU_CONTAINER: '.menu-container',
+    MENU_CONTAINER_VISIBLE: '.menu-container.visible',
+    MENU_BUTTON: '.menu-button',
+    HAMBURGER_MENU: '.hamburger-menu',
+    MAIN_MENU: '.main-menu',
+    MENU_SECTION_HEADER: '.menu-section-header',
+    MENU_SECTION_HEADER_COLLAPSIBLE: '.menu-section-header.collapsible',
+    MENU_SECTION_BY_DATA: '.menu-section[data-section]',
+    TOGGLE_SWITCH: '.toggle-switch',
+    SETTINGS_MODAL: '.settings-modal',
+    SETTINGS_MODAL_CONTENT: '.settings-modal-content',
+    SETTINGS_SECTION: '.settings-section',
+    SETTINGS_SECTION_HEADER: '.settings-section-header',
+    SETTINGS_SECTION_COLLAPSIBLE: '.settings-section.collapsible[data-section]',
+
+    // ---- Modals (general) ----
+    DATA_MODAL: '[data-modal]',
+    // Every element whose text is just the current copyright year. Markup carries
+    // a literal year as the no-JS fallback; uiBoot overwrites it at boot.
+    COPYRIGHT_YEAR: '[data-copyright-year]',
+    CLOSE_MODAL: '.close-modal',
+
+    // ---- Routine Switcher ----
+    MINI_CYCLE_SWITCH_MODAL: '.mini-cycle-switch-modal',
+    MINI_CYCLE_SWITCH_MODAL_CONTENT: '.mini-cycle-switch-modal-content',
+    MINI_CYCLE_SWITCH_TITLE: '.mini-cycle-switch-title',
+    MINI_CYCLE_SWITCH_ITEM: '.mini-cycle-switch-item',
+    MINI_CYCLE_SWITCH_ITEM_SELECTED: '.mini-cycle-switch-item.selected',
+    RECENT_ROUTINES_SECTION: '.recent-routines-section',
+    ROUTINE_SWITCHER_BODY: '.routine-switcher-body',
+    CYCLE_ITEM_TITLE: '.cycle-item-title',
+    MINI_CYCLE_OVERLAY: '.miniCycle-prompt-dialog',
+    MINI_MODAL_OVERLAY: '.mini-modal-dialog',
+    SWITCH_PREVIEW_WINDOW: '.switch-preview-window',
+    DESKTOP_PREVIEW_WINDOW: '.desktop-preview-window',
+    ROUTINE_SWITCHER_LEFT: '.routine-switcher-left',
+    ROUTINE_SWITCHER_RIGHT: '.routine-switcher-right',
+    SWITCH_BUTTONS: '.switch-buttons',
+    PREVIEW_REVIEW_CLOSE: '.preview-review-close',
+
+    // ---- Progress ----
+    PROGRESS_CONTAINER: '.progress-container',
+
+    // ---- Stats ----
+    STATS_PANEL: '.stats-panel',
+    CLICKABLE: '.clickable',
+    TASK_INPUT_CHECKED: '.task input:checked',
+    DOT: '.dot',
+    BADGE_CONTAINER: '.badge-container',
+    GLOBAL_STATS_CONTAINER: '.global-stats-container',
+
+    // ---- Themes ----
+    THEME_CONTAINER: '.theme-container',
+    THEME_TOGGLE: '.theme-toggle',
+    THEMES_MODAL_CONTENT: '.themes-modal-content',
+
+    // ---- Completed Tasks ----
+    COMPLETED_TASKS_SECTION: '.completed-tasks-section',
+    TOGGLE_ICON: '.toggle-icon',
+
+    // ---- Recurring ----
+    FREQUENCY_OPTIONS: '.frequency-options',
+    FREQUENCY_TIME_SECTION: '.frequency-time-section',
+    RECURRING_PANEL_HINT: '.recurring-panel-hint',
+    RECURRING_TASK_ITEM: '.recurring-task-item',
+    RECURRING_CHECK: '.recurring-check',
+    RECURRING_CHECK_VISIBLE: '.recurring-check:not(.hidden)',
+    RECURRING_CHECK_CHECKED: '.recurring-check:checked',
+    CHANGE_RECURRING_BTN: '.change-recurring-btn',
+    RECURRING_TASK_ITEM_SELECTED: '.recurring-task-item.selected',
+    RECURRING_TASK_ITEM_CHECKED: '.recurring-task-item.checked',
+    BIWEEKLY_DAYS: '.biweekly-days',
+    BIWEEKLY_DAY_BOX: '.biweekly-day-box',
+    BIWEEKLY_DAY_BOX_SELECTED: '.biweekly-day-box.selected',
+    MONTHLY_DAYS: '.monthly-days',
+    MONTHLY_DAY_BOX: '.monthly-day-box',
+    MONTHLY_DAY_BOX_SELECTED: '.monthly-day-box.selected',
+    WEEKLY_DAYS: '.weekly-days',
+    WEEKLY_DAY_BOX: '.weekly-day-box',
+    WEEKLY_DAY_BOX_SELECTED: '.weekly-day-box.selected',
+    YEARLY_MONTHS: '.yearly-months',
+    YEARLY_MONTH_BOX: '.yearly-month-box',
+    YEARLY_MONTH_BOX_SELECTED: '.yearly-month-box.selected',
+    YEARLY_DAYS: '.yearly-days',
+    YEARLY_DAY_BOX: '.yearly-day-box',
+    RECURRING_REMOVE_BTN: '.recurring-remove-btn',
+    RECURRING_PAUSE_BTN: '.recurring-pause-btn',     // Recurring panel row: pause / resume toggle
+    RECURRING_TASK_TEXT: '.recurring-task-text',
+    NON_RECURRING_SELECTED: '#non-recurring-tasks li.selected',
+    OPEN_RECURRING_SETTINGS: '.open-recurring-settings',
+    NON_RECURRING_CHECKBOX: '#non-recurring-tasks input[type="checkbox"]',
+    BIWEEKLY_WEEK1_SELECTED: '.biweekly-day-box.selected[data-week="1"]',
+    BIWEEKLY_WEEK2_SELECTED: '.biweekly-day-box.selected[data-week="2"]',
+    SPECIFIC_DATE_INPUT: `#specific-date-list input[type="date"]`,
+    FOCUSABLE_ELEMENTS: 'button, input, select, [tabindex="0"]',
+
+    // ---- Task Search ----
+    FILTER_CHIP_GROUP: '.filter-chip-group',
+    FILTER_CHIP: '.filter-chip',
+    SORT_CHIP: '.sort-chip',
+
+    // ---- Onboarding ----
+    ONBOARDING_STEP_INDICATOR: '.onboarding-step-indicator',
+    ONBOARDING_TRY_BTN: '.onboarding-try-btn',
+    ONBOARDING_CYCLE_ANIMATION: '.onboarding-cycle-animation',
+    ONBOARDING_CHOICE_HINT: '.onboarding-choice-hint',
+    CYCLE_DEMO_TASK: '.cycle-demo-task',
+    CYCLE_DEMO_TASK_TEXT: '.cycle-demo-task-text',
+    CYCLE_DEMO_CHECKBOX: '.cycle-demo-checkbox',
+
+    // ---- Preferences ----
+    PREFERENCES_SECTION: '.preferences-section',
+    PREFERENCES_SECTION_HEADER: '.preferences-section-header',
+    PREVIEW_HELP_WINDOW: '.preview-help-window',
+    PREVIEW_QUICK_ACTIONS: '.preview-quick-actions',
+    PREFERENCES_MODAL: '.preferences-modal',
+    PREFERENCES_MODAL_CONTENT: '.preferences-modal-content',
+    PREFERENCES_SCROLL_AREA: '.preferences-scroll-area',
+    REMINDERS_MODAL_CONTENT: '.reminders-modal-content',
+    PREFERENCES_SECTION_HEADER_COLLAPSIBLE: '.preferences-section-header.collapsible',
+    PREFERENCES_SECTION_BY_DATA: '.preferences-section[data-section], .preferences-preview-section[data-section]',
+    PREFERENCES_RESET_BTN: '.preferences-reset-btn',
+    QUICK_PRESET_BTN: '.quick-preset-btn',
+    PREFERENCES_PRESET_ITEM: '.preferences-preset-item',
+    PREFERENCES_PRESET_NAME: '.preferences-preset-name',
+    PREFERENCES_PREVIEW_SECTION: '.preferences-preview-section',
+    LOAD_BTN: '.load-btn',
+    EXPORT_BTN: '.export-btn',
+    DELETE_BTN: '.delete-btn',
+
+    // ---- Feedback ----
+    FEEDBACK_MODAL: '.feedback-modal',
+    CLOSE_FEEDBACK_MODAL: '.close-feedback-modal',
+    FEEDBACK_STAR: '.feedback-star',
+    FEEDBACK_TAG: '.feedback-tag',
+
+    // ---- Notifications ----
+    SHOW_QUICK_ACTIONS: '.show-quick-actions',
+    QUICK_OPTION: '.quick-option',
+    QUICK_RECURRING_OPTIONS: '.quick-recurring-options',
+    PRIORITY_COLOR_PICKER: '.priority-color-picker',
+    PRIORITY_COLOR_BTN: '.priority-color-btn',
+    PRIORITY_RADIO_DOT: '.priority-radio-dot',
+    PRIORITY_SWATCH: '.priority-swatch',
+    BTN_CHOICE: '.btn-choice',
+    NOTIFICATION: '.notification',
+    NOTIFICATION_SHOW: '.notification.show',
+    NOTIFICATION_RECURRING_SHOW: '.notification.recurring.show',
+    CLOSE_BTN: '.close-btn',
+    NOTIFICATION_CLOSE: '.notification-close',
+    TIP_CLOSE: '.tip-close',
+    TIP_TOGGLE: '.tip-toggle',
+    NOTIFICATION_CONTENT: '.notification-content',
+    EDUCATIONAL_TIP: '.educational-tip',
+    QUICK_RECURRING_CONTAINER: '.quick-recurring-container',
+    RADIO_CIRCLE: '.radio-circle',
+    RADIO_CIRCLE_SELECTED: '.radio-circle.selected',
+    APPLY_QUICK_RECURRING: '.apply-quick-recurring',
+
+    // ---- Native Dialogs ----
+    OPEN_DIALOG: 'dialog[open]',
+
+    // ---- Confirmation Dialogs ----
+    BTN_CONFIRM: '.btn-confirm',
+    BTN_CANCEL: '.btn-cancel',
+    MINI_MODAL_CHECKBOX_INPUT: '.mini-modal-checkbox-input',  // optional checkbox row in showConfirmationModal
+    MINI_CYCLE_PROMPT_INPUT: '.miniCycle-prompt-input',
+    MINI_CYCLE_BTN_CANCEL: '.miniCycle-btn-cancel',
+    MINI_CYCLE_BTN_CONFIRM: '.miniCycle-btn-confirm',
+
+    // ---- History & Cleared Tasks ----
+    HISTORY_MODAL: '.history-modal',
+    HISTORY_MODAL_CONTENT: '.history-modal-content',
+    HISTORY_BACK_BTN: '.history-back-btn',
+    HISTORY_ACTION_BTN: '.history-action-btn',
+    HISTORY_TAB: '.history-tab',
+    HISTORY_CANCEL_BTN: '.history-cancel-btn',
+    HISTORY_CONFIRM_BTN: '.history-confirm-btn',
+    HISTORY_RESET_PROGRESS_BTN: '.history-reset-progress-btn',
+    HISTORY_FOOTER: '.history-footer',
+    HISTORY_TABS: '.history-tabs',
+    HISTORY_EVENT: '.history-event',
+    CLEARED_VIEW_RECURRING: '.cleared-view-recurring',
+    CLEARED_ENTRY: '.cleared-entry',
+    CLEARED_TASKS_MODAL: '.cleared-tasks-modal',
+    CLEARED_TASKS_MODAL_CONTENT: '.cleared-tasks-modal-content',
+    CLEARED_BACK_BTN: '.cleared-back-btn',
+    CLEARED_RECREATE_BTN: '.cleared-recreate-btn',
+    CLEARED_CANCEL_BTN: '.cleared-cancel-btn',
+    CLEARED_CONFIRM_BTN: '.cleared-confirm-btn',
+    CLEARED_TASKS_FOOTER: '.cleared-tasks-footer',
+    CLEARED_TASKS_SUMMARY: '.cleared-tasks-summary',
+
+    // ---- Drag & Drop ----
+    DROP_TARGET: '.drop-target',
+    REARRANGING: '.rearranging',
+
+    // ---- Achievements ----
+    ACHIEVEMENTS_MODAL: '.achievements-modal',
+    ACHIEVEMENTS_MODAL_CONTENT: '.achievements-modal-content',
+    ACHIEVEMENTS_BACK_BTN: '.achievements-back-btn',
+    ACHIEVEMENTS_SUMMARY: '.achievements-summary',
+    ACHIEVEMENTS_UNLOCKED: '.achievements-unlocked',
+    ACHIEVEMENTS_UPCOMING: '.achievements-upcoming',
+
+    // ---- Games ----
+    GAMES_MODAL_CONTENT: '.games-modal-content',
+    BADGE: '.badge',
+    BADGES_CONTAINER: '.badges',
+
+    // ---- Quick Actions ----
+    QUICK_ACTIONS_MENU_ROW: '.quick-actions-menu-row',
+    QUICK_ACTIONS_PREV: '.quick-actions-prev',
+    QUICK_ACTIONS_NEXT: '.quick-actions-next',
+    QUICK_ACTIONS_HEADER: '.quick-actions-header',
+    QUICK_ACTIONS_TITLE: '.quick-actions-title',
+    QUICK_ACTIONS_PICKER: '.quick-actions-picker',
+    QUICK_ACTIONS_PICKER_GRID: '.quick-actions-picker-grid',
+    QUICK_ACTIONS_SLOT: '.quick-actions-slot',
+    QUICK_ACTIONS_SLOTS: '.quick-actions-slots',
+    QUICK_ACTIONS_PANEL: '.quick-actions-panel',
+    TOOLTIP_REMOVE: 'tooltip-remove',
+
+    // ---- Edit Focus ----
+    EDIT_FOCUS_OVERLAY: '.edit-focus-overlay',
+    EDIT_FOCUS_TARGET: '.edit-focus-target',
+    FOCUS_SAFE: '.focus-safe',
+
+    // ---- Loading & UI ----
+    LOADER_TEXT: '.loader-text',
+    LOADER_BAR: '.loader-bar',
+    LOADING_SPINNER_TEXT: '.loading-spinner-text',
+    HEADER_BRANDING: '.header-branding',
+    // Focus view hides the header's chrome children individually rather than the
+    // whole .fixed-header-container, so the branding lockup can stay visible.
+    MODE_SELECTOR_WRAPPER: '.mode-selector-wrapper',
+    HEADER_BRANDING_LOGO: '.header-branding .header-logo',
+    HEADER_LOGO: '.header-logo',
+    PULL_REFRESH_ICON: '.pull-refresh-icon',
+    PULL_REFRESH_TEXT: '.pull-refresh-text',
+
+    // ---- Import/Export ----
+    MCYC_DROP_CONTENT: '.mcyc-drop-content',
+    MCYC_DROP_ICON: '.mcyc-drop-icon',
+    MCYC_DROP_TEXT: '.mcyc-drop-text',
+
+    // ---- Task Options Customizer ----
+    TASK_OPTIONS_MODAL: '.task-options-modal',
+    TASK_OPTION_ITEM: '.task-option-item',
+    TASK_OPTION_ITEM_SELECTED: '.task-option-item.selected',
+    TASK_OPTION_PREVIEW: '.task-option-preview',
+    OPTION_CHECKBOX: '.option-checkbox',
+    OPTION_CHECKBOX_CONTAINER: '.option-checkbox-container',
+    OPTION_LABEL: '.option-label',
+
+    // ---- Icons ----
+    ICON_FONTAWESOME: 'i.fas, i.far, i.fab, i.fa',
+
+    // ---- Storage Viewer ----
+    STORAGE_MODAL_BOX: '.storage-modal-box',
+
+    // ---- Testing ----
+    TESTING_MODAL: '.testing-modal',
+    TESTING_MODAL_CONTENT: '.testing-modal-content',
+    TESTING_MODAL_HEADER: '.testing-modal-header',
+    TESTING_MODAL_BODY: '.testing-modal-body',
+    TESTING_MODAL_DRAG_HANDLE: '.testing-modal-drag-handle',
+    TESTING_RESULTS_AREA: '.testing-results-area',
+    TESTING_RESULTS_HEADER: '.testing-results-header',
+    TESTING_RESULTS_CONTROLS: '.testing-results-controls',
+    TEST_RESULTS_HINT: '.test-results-hint',
+    TESTING_TAB: '.testing-tab',
+    TESTING_TAB_CONTENT: '.testing-tab-content',
+    TESTING_TAB_CONTENT_ACTIVE: '.testing-tab-content.active',
+    CLOSE_TESTING_MODAL: '.close-testing-modal',
+    BACKUP_ITEM: '.backup-item',
+
+    // ---- Guided Tour ----
+    TOUR_BACK: '.tour-back',
+    TOUR_SKIP: '.tour-skip',
+    TOUR_NEXT: '.tour-next',
+
+    // ---- Onboarding ----
+    ONBOARDING_MODAL: '.onboarding-modal',
+
+    // ---- Settings (collapsible header within section) ----
+    SETTINGS_SECTION_HEADER_COLLAPSIBLE: '.settings-section-header.collapsible'
+});
+
+// ============================================================================
+// DOM DATA SELECTORS — Factory functions for parameterized selectors
+// ============================================================================
+
+/**
+ * Selector factory functions for data-attribute queries
+ * Replaces magic template literal selectors scattered across modules
+ * @constant {Object}
+ */
+export const DATA_SELECTORS = Object.freeze({
+    // CSS.escape like cycleByKey below: task ids can originate from imported
+    // .mcyc files and legacy-data repairs, and an unescaped quote or bracket
+    // in an id turns querySelector into a thrown DOMException at every call site.
+    taskById: (id) => `.task[data-task-id="${CSS.escape(id)}"]`,
+    recurringTaskById: (id) => `.recurring-task-item[data-task-id="${CSS.escape(id)}"]`,
+    elementByTaskId: (id) => `[data-task-id="${CSS.escape(id)}"]`,
+    TASK_ID_ELEMENT: '[data-task-id]',
+    menuSectionByName: (name) => `.menu-section[data-section="${name}"]`,
+    settingsSectionByName: (name) => `.settings-section[data-section="${name}"]`,
+    preferencesSectionByName: (name) => `.preferences-section[data-section="${name}"], .preferences-preview-section[data-section="${name}"]`,
+    cycleByKey: (key) => `[data-cycle-key="${CSS.escape(key)}"]`,
+    // Educational tips are addressed by element id, not a data attribute.
+    // CSS.escape for the same reason as the builders above: tip ids are author-
+    // supplied strings, and an id starting with a digit or containing a colon is
+    // a thrown DOMException rather than a miss.
+    tipById: (id) => `#tip-${CSS.escape(id)}`,
+    // Data attribute names (for setAttribute/removeAttribute/getAttribute)
+    ATTR_RECURRING_SETTINGS: 'data-recurring-settings'
+});
+
+// ============================================================================
+// VERSION
+// ============================================================================
+
+/**
+ * Centralized application version string, derived from version.js via globalThis.
+ * @type {string}
+ */
+export const APP_VERSION = globalThis.APP_VERSION || 'dev-local';
+
+/**
+ * Relative path to the lite version HTML file for legacy device redirect.
+ * @type {string}
+ */
+export const LITE_VERSION_PATH = './lite/miniCycle-lite.html';
+
+/**
+ * Canonical application URL used for share links.
+ * @type {string}
+ */
+export const APP_URL = 'https://minicycle.app';
+
+/**
+ * Resolve the ORIGIN that serves the in-app test runner.
+ *
+ * The runner must live on a *separate* origin from the live app so the browser
+ * keeps its localStorage/IndexedDB physically isolated from real user data —
+ * isolation by construction, no backup/restore needed.
+ *
+ *  - Production (minicycle.app)      → https://test.minicycle.app
+ *  - Local dev / LAN (localhost, IP) → same host on port 8081 (run a 2nd server there)
+ *  - Anything else                   → same origin (fallback; no isolation, but no breakage)
+ *
+ * @returns {string} absolute origin, e.g. "https://test.minicycle.app"
+ */
+export function getTestOrigin() {
+    const { protocol, hostname, origin } = window.location;
+    if (hostname.includes('minicycle.app')) {
+        return 'https://test.minicycle.app';
+    }
+    // localhost, 127.0.0.1, or a LAN IP (e.g. 192.168.x for phone testing)
+    if (hostname === 'localhost' || /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) {
+        return `${protocol}//${hostname}:8081`;
+    }
+    return origin;
+}
+
+/**
+ * Version marker for cache debugging, derived from the single source of truth in version.js.
+ * @type {string}
+ */
+export const CONSTANTS_VERSION = globalThis.APP_VERSION;
+
+// Phase 2 Step 6 - Clean exports (no window.* pollution)

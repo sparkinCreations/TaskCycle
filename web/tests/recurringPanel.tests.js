@@ -1,0 +1,1632 @@
+/**
+ * RecurringPanel Module Tests
+ * Tests for the recurring tasks UI panel manager
+ *
+ * Pattern: Resilient Constructor 🛡️
+ */
+
+// Module references - populated by dynamic import in runRecurringPanelTests
+let RecurringPanelManager, buildRecurringSummaryFromSettings, setRecurringPanelDependencies, loadPanelSubModules;
+
+/**
+ * Helper to set up required DI dependencies before creating RecurringPanelManager
+ * @param {Object} overrides - Optional overrides for specific deps
+ */
+function setupPanelDeps(overrides = {}) {
+    const defaultDeps = {
+        AppState: overrides.AppState || {
+            get: () => ({
+                schemaVersion: "2.6",
+                data: { routine: {} },
+                appState: { activeRoutineId: null }
+            }),
+            update: (fn) => {},
+            isReady: () => true
+        },
+        showNotification: overrides.showNotification || ((msg) => msg),
+        applyRecurringSettings: overrides.applyRecurringSettings || ((taskId, settings) => {}),
+        normalizeRecurringSettings: overrides.normalizeRecurringSettings || ((settings) => settings || {}),
+        calculateNextOccurrence: overrides.calculateNextOccurrence || (() => null),
+        appInit: overrides.appInit || { waitForCore: () => Promise.resolve() },
+        deleteTemplate: overrides.deleteTemplate || (() => {}),
+        buildRecurringSummary: overrides.buildRecurringSummary || ((settings) => `Recurs ${settings?.frequency || 'unknown'}`),
+        formatNextOccurrence: overrides.formatNextOccurrence || (() => 'N/A'),
+        updateAppState: overrides.updateAppState || ((fn) => {}),
+        showConfirmationModal: overrides.showConfirmationModal || ((options) => options?.onConfirm?.()),
+        getElementById: overrides.getElementById || ((id) => document.getElementById(id)),
+        querySelector: overrides.querySelector || ((sel) => document.querySelector(sel)),
+        querySelectorAll: overrides.querySelectorAll || ((sel) => document.querySelectorAll(sel)),
+        safeAddEventListener: overrides.safeAddEventListener || ((el, event, handler, options) => {
+            if (el && el.addEventListener) {
+                el.addEventListener(event, handler, options);
+            }
+        }),
+        isOverlayActive: overrides.isOverlayActive || (() => false),
+        escapeHtml: overrides.escapeHtml || ((str) => str),
+        getModal: overrides.getModal || ((name) => {
+            const map = { recurringOverlay: 'recurring-panel-overlay', recurringPanel: 'recurring-settings-panel' };
+            return document.getElementById(map[name]) || null;
+        })
+    };
+    // Forward any override this fixture does not name explicitly. Without this the
+    // object above is an ALLOW-LIST: a test passing a dep it needs (for example
+    // activateTaskRecurringState) had it silently dropped, and the assertion then
+    // failed for a reason unrelated to the code under test. Spreading last preserves
+    // the existing `overrides.X || default` semantics for named keys.
+    Object.assign(defaultDeps, overrides);
+    setRecurringPanelDependencies(defaultDeps);
+    return defaultDeps;
+}
+
+export async function runRecurringPanelTests(resultsDiv) {
+    resultsDiv.innerHTML = '<h2>🎛️ RecurringPanel Tests</h2><h3>Loading module...</h3>';
+
+    // Dynamic import with cache busting to avoid stale CDN cache
+    const cacheBuster = window.testCacheBuster || Date.now();
+    const module = await import(`../modules/recurring/recurringPanel.js?v=${cacheBuster}`);
+    RecurringPanelManager = module.RecurringPanelManager;
+    buildRecurringSummaryFromSettings = module.buildRecurringSummaryFromSettings;
+    setRecurringPanelDependencies = module.setRecurringPanelDependencies;
+    loadPanelSubModules = module.loadPanelSubModules;
+
+    resultsDiv.innerHTML = '<h2>🎛️ RecurringPanel Tests</h2><h3>Loading sub-modules...</h3>';
+
+    // Load sub-modules before running tests
+    await loadPanelSubModules(cacheBuster);
+
+    resultsDiv.innerHTML = '<h2>🎛️ RecurringPanel Tests</h2><h3>Running tests...</h3>';
+
+    let passed = { count: 0 };
+    let total = { count: 0 };
+
+    // Save console methods at suite level
+    const originalConsole = {
+        log: console.log,
+        error: console.error,
+        warn: console.warn,
+        info: console.info
+    };
+
+    async function test(name, testFn) {
+        total.count++;
+
+        // 🔒 SAVE REAL APP DATA before test runs
+        const savedRealData = {};
+        const protectedKeys = ['miniCycleData', 'miniCycleForceFullVersion'];
+        protectedKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                savedRealData[key] = value;
+            }
+        });
+
+        // Save global state
+        const savedGlobals = {
+            AppState: window.AppState,
+            showNotification: window.showNotification,
+            refreshUIFromState: window.refreshUIFromState,
+            FeatureFlags: window.FeatureFlags
+        };
+
+        try {
+            const result = testFn();
+            if (result instanceof Promise) await result;
+            resultsDiv.innerHTML += `<div class="result pass">✅ ${name}</div>`;
+            passed.count++;
+        } catch (error) {
+            resultsDiv.innerHTML += `<div class="result fail">❌ ${name}: ${error.message}</div>`;
+            console.error(`Test failed: ${name}`, error);
+        } finally {
+            // Restore global state
+            Object.keys(savedGlobals).forEach(key => {
+                if (savedGlobals[key] === undefined) {
+                    delete window[key];
+                } else {
+                    window[key] = savedGlobals[key];
+                }
+            });
+
+            // Restore console methods
+            console.log = originalConsole.log;
+            console.error = originalConsole.error;
+            console.warn = originalConsole.warn;
+            console.info = originalConsole.info;
+
+            // 🔒 RESTORE REAL APP DATA after test completes (even if it failed)
+            localStorage.clear();
+            Object.keys(savedRealData).forEach(key => {
+                localStorage.setItem(key, savedRealData[key]);
+            });
+        }
+    }
+
+    // ===== INITIALIZATION TESTS =====
+    // =========================================================
+    // ➕ Add-recurring-task flow — WRITTEN BEFORE THE EXTRACTION
+    // =========================================================
+    // setupAddTaskSection / updateConfirmButtonVisibility / populateAvailableTasks /
+    // handleConfirmAddRecurring are moving to recurringPanelAddTask.js (splits-plan
+    // Priority 4). All four had ZERO test references.
+    //
+    // These deliberately drive the PARENT's methods rather than the new module, so
+    // the identical tests prove behaviour before the move and after it — the parent
+    // keeps delegating entry points either way.
+    resultsDiv.innerHTML += '<h4 class="test-section">➕ Add Recurring Tasks (pre-extraction)</h4>';
+
+    function addTaskDom() {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <ul id="non-recurring-tasks"></ul>
+            <p id="no-available-tasks"></p>
+            <button id="confirm-add-recurring"></button>
+            <button id="select-all-add-recurring"></button>
+            <button id="add-recurring-task-btn"></button>
+            <div id="available-tasks-list"></div>`;
+        document.body.appendChild(host);
+        return host;
+    }
+
+    function cycleState(tasks, templates = {}) {
+        return {
+            schemaVersion: '2.6',
+            data: { routine: { c1: { title: 'c1', tasks, recurringTemplates: templates } } },
+            appState: { activeRoutineId: 'c1' }
+        };
+    }
+
+    await test('confirm button hides when nothing is selected', async () => {
+        const host = addTaskDom();
+        try {
+            setupPanelDeps();
+            const panel = new RecurringPanelManager();
+            panel.updateConfirmButtonVisibility();
+            const btn = document.getElementById('confirm-add-recurring');
+            if (!btn.classList.contains('hidden')) throw new Error('confirm button should be hidden with 0 selected');
+        } finally { host.remove(); }
+    });
+
+    await test('confirm button shows and names the count when tasks are selected', async () => {
+        const host = addTaskDom();
+        try {
+            const list = document.getElementById('non-recurring-tasks');
+            list.innerHTML = '<li class="selected" data-task-id="t1"></li><li class="selected" data-task-id="t2"></li>';
+            setupPanelDeps();
+            const panel = new RecurringPanelManager();
+            panel.updateConfirmButtonVisibility();
+            const btn = document.getElementById('confirm-add-recurring');
+            if (btn.classList.contains('hidden')) throw new Error('confirm button should be visible with 2 selected');
+            if (!/2/.test(btn.textContent)) throw new Error(`expected the count in the label, got "${btn.textContent}"`);
+        } finally { host.remove(); }
+    });
+
+    await test('available list excludes tasks that are already recurring', async () => {
+        // Excluded two ways: present in recurringTemplates, OR carrying task.recurring.
+        // Missing either check offers the user a task that is already scheduled.
+        const host = addTaskDom();
+        try {
+            const state = cycleState(
+                [{ id: 't1', text: 'plain' },
+                 { id: 't2', text: 'templated' },
+                 { id: 't3', text: 'flagged', recurring: true }],
+                { t2: {} }
+            );
+            setupPanelDeps({ AppState: { get: () => state, update: () => {}, isReady: () => true } });
+            const panel = new RecurringPanelManager();
+            panel.populateAvailableTasks();
+            const items = document.querySelectorAll('#non-recurring-tasks li');
+            const ids = Array.from(items).map(li => li.dataset.taskId);
+            if (ids.length !== 1 || ids[0] !== 't1') {
+                throw new Error(`expected only t1 to be offered, got [${ids.join(', ')}]`);
+            }
+        } finally { host.remove(); }
+    });
+
+    await test('handleConfirmAddRecurring refuses when nothing is selected', async () => {
+        const host = addTaskDom();
+        try {
+            let notified = null, updated = false;
+            setupPanelDeps({
+                AppState: { get: () => cycleState([]), update: () => {}, isReady: () => true },
+                showNotification: (msg) => { notified = msg; },
+                updateAppState: () => { updated = true; }
+            });
+            const panel = new RecurringPanelManager();
+            await panel.handleConfirmAddRecurring();
+            if (updated) throw new Error('state was written with no tasks selected');
+            if (!notified) throw new Error('the user was not told why nothing happened');
+        } finally { host.remove(); }
+    });
+
+    await test('handleConfirmAddRecurring refuses when AppState is not ready', async () => {
+        const host = addTaskDom();
+        try {
+            document.getElementById('non-recurring-tasks').innerHTML =
+                '<li class="selected" data-task-id="t1"></li>';
+            let updated = false;
+            setupPanelDeps({
+                AppState: { get: () => cycleState([]), update: () => {}, isReady: () => false },
+                updateAppState: () => { updated = true; }
+            });
+            const panel = new RecurringPanelManager();
+            await panel.handleConfirmAddRecurring();
+            if (updated) throw new Error('state was written while AppState was not ready');
+        } finally { host.remove(); }
+    });
+
+    await test('handleConfirmAddRecurring activates every selected task', async () => {
+        const host = addTaskDom();
+        try {
+            document.getElementById('non-recurring-tasks').innerHTML =
+                '<li class="selected" data-task-id="t1"></li><li class="selected" data-task-id="t2"></li>';
+            const state = cycleState([{ id: 't1', text: 'a' }, { id: 't2', text: 'b' }, { id: 't3', text: 'c' }]);
+            const activated = [];
+            setupPanelDeps({
+                AppState: { get: () => state, update: () => {}, isReady: () => true },
+                updateAppState: async (fn) => { fn(state); },
+                activateTaskRecurringState: (cycle, taskId) => { activated.push(taskId); }
+            });
+            const panel = new RecurringPanelManager();
+            panel.updateRecurringPanel = async () => {};
+            await panel.handleConfirmAddRecurring();
+            if (activated.join(',') !== 't1,t2') {
+                throw new Error(`expected t1,t2 activated; got [${activated.join(', ')}]`);
+            }
+        } finally { host.remove(); }
+    });
+
+    await test('confirming while editing preserves the checked task ids', async () => {
+        // The DOM rebuild that follows wipes checkboxes. In editing mode the ids are
+        // stashed on state first so the re-render can restore them; losing that makes
+        // a user's selection silently vanish mid-edit.
+        const host = addTaskDom();
+        try {
+            document.getElementById('non-recurring-tasks').innerHTML =
+                '<li class="selected" data-task-id="t1"></li>';
+            const state = cycleState([{ id: 't1', text: 'a' }]);
+            setupPanelDeps({
+                AppState: { get: () => state, update: () => {}, isReady: () => true },
+                updateAppState: async (fn) => { fn(state); },
+                activateTaskRecurringState: () => {}
+            });
+            const panel = new RecurringPanelManager();
+            panel.updateRecurringPanel = async () => {};
+            panel.state.panelMode = 'editing';
+            await panel.handleConfirmAddRecurring();
+            if (!Array.isArray(panel.state.preservedCheckedIds)) {
+                // Reports the observed values: when this broke during the extraction it
+                // was panelMode="browsing", which is what exposed the shadowed parameter.
+                throw new Error('preservedCheckedIds=' + JSON.stringify(panel.state.preservedCheckedIds)
+                    + ' panelMode=' + JSON.stringify(panel.state.panelMode));
+            }
+        } finally { host.remove(); }
+    });
+
+    resultsDiv.innerHTML += '<h4 class="test-section">🔧 Initialization</h4>';
+
+    test('RecurringPanelManager class is defined', () => {
+        if (typeof RecurringPanelManager === 'undefined') {
+            throw new Error('RecurringPanelManager not found');
+        }
+    });
+
+    test('creates instance with DI dependencies', () => {
+        setupPanelDeps();
+        const panel = new RecurringPanelManager();
+
+        if (!panel) {
+            throw new Error('Panel not created');
+        }
+
+        if (!panel.deps) {
+            throw new Error('Dependencies not initialized');
+        }
+    });
+
+    test('creates instance with custom dependencies', () => {
+        const mockDeps = {
+            showNotification: (msg) => msg,
+            AppState: {
+                get: () => ({ data: {}, appState: {} }),
+                update: (fn) => {},
+                isReady: () => true
+            }
+        };
+
+        setupPanelDeps(mockDeps);
+        const panel = new RecurringPanelManager();
+
+        if (!panel) {
+            throw new Error('Panel not created');
+        }
+    });
+
+    test('initializes with default internal state', () => {
+        setupPanelDeps();
+        const panel = new RecurringPanelManager();
+
+        if (!panel.state) {
+            throw new Error('State not initialized');
+        }
+
+        if (panel.state.isInitialized !== false) {
+            throw new Error('isInitialized should be false initially');
+        }
+
+        if (panel.state.panelOpen !== false) {
+            throw new Error('panelOpen should be false initially');
+        }
+
+        if (panel.state.selectedTaskId !== null) {
+            throw new Error('selectedTaskId should be null initially');
+        }
+    });
+
+    test('stores dependency overrides correctly', () => {
+        let notificationCalled = false;
+
+        setupPanelDeps({
+            showNotification: () => { notificationCalled = true; }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.deps.showNotification('test');
+
+        if (!notificationCalled) {
+            throw new Error('Custom notification function not called');
+        }
+    });
+
+    // ===== FALLBACK METHODS =====
+    // NOTE: fallbackDeleteTemplate, fallbackBuildSummary, fallbackConfirmation
+    // were removed from RecurringPanelManager. These functions are now handled
+    // ── Pausing and resuming a template ──────────────────────────────────────
+    const pauseRig = ({ paused }) => {
+        const state = {
+            schemaVersion: '2.6',
+            appState: { activeRoutineId: 'c1' },
+            data: { routine: { c1: {
+                title: 'C1', tasks: [],
+                recurringTemplates: { r: { id: 'r', text: 'Rent', recurring: true, paused, recurringSettings: { frequency: 'daily' }, nextScheduledOccurrence: 5, occurrenceCount: 3 } }
+            } } }
+        };
+        const seen = { notices: [] };
+        setupPanelDeps({
+            AppState: { get: () => state, update: (fn) => fn(state), isReady: () => true },
+            updateAppState: async (fn) => fn(state),
+            calculateNextOccurrence: () => 999,
+            showNotification: (msg) => seen.notices.push(String(msg)),
+            querySelector: () => null
+        });
+        return { state, seen };
+    };
+
+    await test('pausing a template flags it and leaves its schedule and progress alone', async () => {
+        const { state } = pauseRig({ paused: false });
+        const panel = new RecurringPanelManager();
+        panel.updateRecurringPanel = async () => {};
+        await panel.handleTogglePause(state.data.routine.c1.recurringTemplates.r, document.createElement('li'));
+        const tpl = state.data.routine.c1.recurringTemplates.r;
+        if (tpl.paused !== true) throw new Error('template should be paused');
+        if (tpl.nextScheduledOccurrence !== 5) throw new Error('pausing must not touch the schedule');
+        if (tpl.occurrenceCount !== 3) throw new Error('pausing must not touch progress');
+    });
+
+    await test('resuming reschedules from now and does not catch up', async () => {
+        const { state, seen } = pauseRig({ paused: true });
+        const panel = new RecurringPanelManager();
+        panel.updateRecurringPanel = async () => {};
+        await panel.handleTogglePause(state.data.routine.c1.recurringTemplates.r, document.createElement('li'));
+        const tpl = state.data.routine.c1.recurringTemplates.r;
+        if (tpl.paused !== false) throw new Error('template should be live again');
+        if (tpl.nextScheduledOccurrence !== 999) throw new Error(`next occurrence should be recomputed from now, got ${tpl.nextScheduledOccurrence}`);
+        if (!seen.notices.some(n => /resumed/i.test(n))) throw new Error('no resume notice');
+    });
+
+    await test('a paused template renders its row paused with a resume control', () => {
+        setupPanelDeps({});
+        const panel = new RecurringPanelManager();
+        const row = panel.createRecurringTaskItem({ id: 'r', text: 'Rent', paused: true }, {});
+        if (!row.classList.contains('recurring-paused')) throw new Error('row not marked paused');
+        const btn = row.querySelector('.recurring-pause-btn');
+        if (!btn) throw new Error('no pause/resume button');
+        if (btn.getAttribute('aria-pressed') !== 'true') throw new Error('resume control should read pressed');
+        if (!row.querySelector('.recurring-paused-badge')) throw new Error('no Paused badge');
+        const live = panel.createRecurringTaskItem({ id: 'x', text: 'Live' }, {});
+        if (live.classList.contains('recurring-paused') || live.querySelector('.recurring-paused-badge')) throw new Error('a live row must not look paused');
+        if (live.querySelector('.recurring-pause-btn')?.getAttribute('aria-pressed') !== 'false') throw new Error('live control should read not pressed');
+    });
+
+    // ── Removing a recurring task whose instance is not in the list ─────────
+    const removeRig = ({ taskInList, checked }) => {
+        const state = {
+            schemaVersion: '2.6',
+            appState: { activeRoutineId: 'c1' },
+            data: { routine: { c1: {
+                title: 'C1',
+                tasks: taskInList ? [{ id: 'r', text: 'Rent', completed: false, recurring: true }] : [{ id: 'x', text: 'X', completed: false }],
+                recurringTemplates: { r: { id: 'r', text: 'Rent', recurring: true, priority: 'high', remindersEnabled: true, dueDate: '2026-10-01', position: 0, recurringSettings: { frequency: 'monthly' }, nextScheduledOccurrence: 1 } }
+            } } }
+        };
+        const seen = {};
+        const deps = setupPanelDeps({
+            AppState: { get: () => state, update: (fn) => fn(state), isReady: () => true },
+            updateAppState: async (fn) => fn(state),
+            showConfirmationModal: (options) => { seen.options = options; options.callback(true, options.checkbox ? { checked } : undefined); },
+            deactivateTaskRecurringState: (cycle, id) => { const t = cycle.tasks.find(x => x.id === id); if (t) t.recurring = false; delete cycle.recurringTemplates[id]; },
+            refreshUIFromState: () => { seen.refreshed = true; },
+            querySelector: () => null
+        });
+        return { state, seen, deps };
+    };
+
+    await test('removing a recurrence whose task is absent offers to put the task back, checked by default', async () => {
+        const { state, seen } = removeRig({ taskInList: false, checked: true });
+        const panel = new RecurringPanelManager();
+        panel.handleRemoveTask(state.data.routine.c1.recurringTemplates.r, document.createElement("li"));
+        await new Promise(r => setTimeout(r, 20));
+        if (!seen.options?.checkbox) throw new Error('no checkbox was offered');
+        if (seen.options.checkbox.checked !== true) throw new Error('the checkbox should default to checked');
+        const restored = state.data.routine.c1.tasks.find(t => t.id === 'r');
+        if (!restored) throw new Error('the task was not put back in the list');
+        if (restored.recurring !== false) throw new Error('the restored task must not be recurring');
+        if (restored.dueDate !== null) throw new Error('the restored task must not carry the occurrence due date');
+        if (restored.priority !== 'high') throw new Error(`priority not carried over, got ${restored.priority}`);
+        if (state.data.routine.c1.tasks[0].id !== 'r') throw new Error('the task should return to its recorded slot (0)');
+        if (state.data.routine.c1.recurringTemplates.r) throw new Error('the template should be gone');
+        if (!seen.refreshed) throw new Error('the list should be re-rendered after a restore');
+    });
+
+    await test('unticking the box removes the recurrence without putting the task back', async () => {
+        const { state } = removeRig({ taskInList: false, checked: false });
+        const panel = new RecurringPanelManager();
+        panel.handleRemoveTask(state.data.routine.c1.recurringTemplates.r, document.createElement("li"));
+        await new Promise(r => setTimeout(r, 20));
+        if (state.data.routine.c1.tasks.some(t => t.id === 'r')) throw new Error('the task should not have been added');
+        if (state.data.routine.c1.recurringTemplates.r) throw new Error('the template should be gone');
+    });
+
+    await test('no checkbox when the task is already in the list, and it is never duplicated', async () => {
+        const { state, seen } = removeRig({ taskInList: true, checked: true });
+        const panel = new RecurringPanelManager();
+        panel.handleRemoveTask(state.data.routine.c1.recurringTemplates.r, document.createElement("li"));
+        await new Promise(r => setTimeout(r, 20));
+        if (seen.options?.checkbox) throw new Error('a checkbox was offered although the task is in the list');
+        if (state.data.routine.c1.tasks.filter(t => t.id === 'r').length !== 1) throw new Error('the task was duplicated or lost');
+        if (state.data.routine.c1.tasks[0].recurring !== false) throw new Error('the task should no longer be recurring');
+    });
+
+    // by dependency injection (deleteTemplate, buildRecurringSummary, showConfirmationModal).
+
+    // ===== STATE MANAGEMENT =====
+    resultsDiv.innerHTML += '<h4 class="test-section">📊 State Management</h4>';
+
+    test('tracks panel open state', () => {
+        setupPanelDeps();
+        const panel = new RecurringPanelManager();
+
+        if (panel.state.panelOpen !== false) {
+            throw new Error('Panel should be closed initially');
+        }
+
+        panel.state.panelOpen = true;
+
+        if (panel.state.panelOpen !== true) {
+            throw new Error('Panel open state not updated');
+        }
+    });
+
+    test('tracks selected task ID', () => {
+        setupPanelDeps();
+        const panel = new RecurringPanelManager();
+
+        panel.state.selectedTaskId = 'task-123';
+
+        if (panel.state.selectedTaskId !== 'task-123') {
+            throw new Error('Selected task ID not tracked');
+        }
+    });
+
+    test('tracks yearly day selections per month', () => {
+        setupPanelDeps();
+        const panel = new RecurringPanelManager();
+
+        panel.state.selectedYearlyDays[1] = [5, 10, 15];
+
+        if (!Array.isArray(panel.state.selectedYearlyDays[1])) {
+            throw new Error('Should store array of days');
+        }
+
+        if (panel.state.selectedYearlyDays[1].length !== 3) {
+            throw new Error('Should track correct number of days');
+        }
+    });
+
+    // ===== PANEL OPERATIONS =====
+    resultsDiv.innerHTML += '<h4 class="test-section">🔁 Panel Operations</h4>';
+
+    await test('openPanel waits for core systems', async () => {
+        // ✅ Test updated: With AppInit, openPanel() waits for core instead of failing
+
+        // Mark core ready so the test completes
+        if (window.appInit && !window.appInit.isCoreReady()) {
+            await window.appInit.markCoreSystemsReady();
+        }
+
+        setupPanelDeps({
+            AppState: {
+                get: () => ({
+                    data: { routine: {} },
+                    appState: { activeRoutineId: 'cycle-1' }
+                }),
+                update: (fn) => {},
+                isReady: () => true
+            },
+            getElementById: () => ({ classList: { remove: () => {}, add: () => {} } })
+        });
+        const panel = new RecurringPanelManager();
+
+        // Should wait and then open successfully
+        await panel.openPanel();
+
+        if (!panel.state.panelOpen) {
+            throw new Error('Panel should open after waiting for core');
+        }
+    });
+
+    await test('openPanel sets panelOpen state', async () => {
+        // ✅ Mark core systems ready for test
+        if (window.appInit && !window.appInit.isCoreReady()) {
+            await window.appInit.markCoreSystemsReady();
+        }
+
+        setupPanelDeps({
+            AppState: {
+                get: () => ({
+                    data: { routine: {} },
+                    appState: { activeRoutineId: 'cycle-1' }
+                }),
+                update: (fn) => {},
+                isReady: () => true
+            },
+            getElementById: () => ({ classList: { remove: () => {}, add: () => {} } })
+        });
+        const panel = new RecurringPanelManager();
+
+        await panel.openPanel();
+
+        if (!panel.state.panelOpen) {
+            throw new Error('Panel should be marked as open');
+        }
+    });
+
+    test('closePanel clears panelOpen state', () => {
+        setupPanelDeps({
+            getElementById: () => ({ classList: { add: () => {} } })
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.state.panelOpen = true;
+        panel.state.selectedTaskId = 'task-1';
+
+        panel.closePanel();
+
+        if (panel.state.panelOpen) {
+            throw new Error('Panel should be marked as closed');
+        }
+
+        if (panel.state.selectedTaskId !== null) {
+            throw new Error('Selected task should be cleared');
+        }
+    });
+
+    // ===== FORM BUILDING =====
+    resultsDiv.innerHTML += '<h4 class="test-section">📝 Form Building</h4>';
+
+    test('buildRecurringSettingsFromPanel returns default settings', () => {
+        setupPanelDeps({
+            getElementById: () => null,
+            querySelectorAll: () => []
+        });
+        const panel = new RecurringPanelManager();
+
+        const settings = panel.buildRecurringSettingsFromPanel();
+
+        if (!settings.frequency) {
+            throw new Error('Should return frequency');
+        }
+    });
+
+    test('buildRecurringSettingsFromPanel reads frequency', () => {
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-frequency') return { value: 'weekly' };
+                return null;
+            },
+            querySelectorAll: () => []
+        });
+        const panel = new RecurringPanelManager();
+
+        const settings = panel.buildRecurringSettingsFromPanel();
+
+        if (settings.frequency !== 'weekly') {
+            throw new Error('Should read frequency from form');
+        }
+    });
+
+    test('buildRecurringSettingsFromPanel reads indefinitely checkbox', () => {
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-indefinitely') return { checked: false };
+                if (id === 'recur-count-radio') return { checked: true };
+                if (id === 'recur-count-input') return { value: '10' };
+                return null;
+            },
+            querySelectorAll: () => []
+        });
+        const panel = new RecurringPanelManager();
+
+        const settings = panel.buildRecurringSettingsFromPanel();
+
+        if (settings.indefinitely !== false) {
+            throw new Error('Should read indefinitely setting');
+        }
+
+        if (settings.count !== 10) {
+            throw new Error('Should read count when not indefinite');
+        }
+    });
+
+    test('buildRecurringSettingsFromPanel handles specific dates', () => {
+        const mockDateInputs = [
+            { value: '2025-10-15' },
+            { value: '2025-10-20' }
+        ];
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-specific-dates') return { checked: true };
+                return null;
+            },
+            querySelectorAll: (sel) => {
+                if (sel.includes('specific-date-list')) return mockDateInputs;
+                return [];
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        const settings = panel.buildRecurringSettingsFromPanel();
+
+        if (!settings.specificDates.enabled) {
+            throw new Error('Should enable specific dates');
+        }
+
+        if (settings.specificDates.dates.length !== 2) {
+            throw new Error('Should read all date values');
+        }
+    });
+
+    test('buildRecurringSettingsFromPanel handles hourly frequency', () => {
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-frequency') return { value: 'hourly' };
+                if (id === 'hourly-specific-time') return { checked: true };
+                if (id === 'hourly-minute') return { value: '30' };
+                return null;
+            },
+            querySelectorAll: () => []
+        });
+        const panel = new RecurringPanelManager();
+
+        const settings = panel.buildRecurringSettingsFromPanel();
+
+        if (settings.frequency !== 'hourly') {
+            throw new Error('Should be hourly frequency');
+        }
+
+        if (!settings.hourly.useSpecificMinute) {
+            throw new Error('Should enable specific minute');
+        }
+
+        if (settings.hourly.minute !== 30) {
+            throw new Error('Should read minute value');
+        }
+    });
+
+    // ===== FORM OPERATIONS =====
+    resultsDiv.innerHTML += '<h4 class="test-section">📋 Form Operations</h4>';
+
+    test('clearRecurringForm resets frequency to daily', () => {
+        let frequencySet = null;
+        let eventDispatched = false;
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-frequency') {
+                    return {
+                        value: 'weekly',
+                        set value(val) { frequencySet = val; },
+                        dispatchEvent: () => { eventDispatched = true; }
+                    };
+                }
+                return null;
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.clearRecurringForm();
+
+        if (frequencySet !== 'daily') {
+            throw new Error('Should reset frequency to daily');
+        }
+
+        if (!eventDispatched) {
+            throw new Error('Should dispatch change event');
+        }
+    });
+
+    test('clearRecurringForm resets indefinite checkbox', () => {
+        let checkboxChecked = null;
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-indefinitely') {
+                    return {
+                        set checked(val) { checkboxChecked = val; }
+                    };
+                }
+                if (id === 'recur-frequency') {
+                    return {
+                        value: 'daily',
+                        dispatchEvent: () => {}
+                    };
+                }
+                return null;
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.clearRecurringForm();
+
+        if (checkboxChecked !== true) {
+            throw new Error('Should reset indefinite to true');
+        }
+    });
+
+    test('populateRecurringFormWithSettings sets frequency', () => {
+        let frequencyValue = null;
+        let eventDispatched = false;
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-frequency') {
+                    return {
+                        value: 'daily',
+                        set value(val) { frequencyValue = val; },
+                        dispatchEvent: () => { eventDispatched = true; }
+                    };
+                }
+                return null;
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.populateRecurringFormWithSettings({ frequency: 'monthly' });
+
+        if (frequencyValue !== 'monthly') {
+            throw new Error('Should set frequency from settings');
+        }
+    });
+
+    test('populateRecurringFormWithSettings sets count', () => {
+        let countValue = null;
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-frequency') {
+                    return { value: 'daily', dispatchEvent: () => {} };
+                }
+                if (id === 'recur-count-input') {
+                    return {
+                        set value(val) { countValue = val; }
+                    };
+                }
+                if (id === 'recur-indefinitely') {
+                    return { set checked(val) {}, dispatchEvent: () => {} };
+                }
+                if (id === 'recur-count-radio') {
+                    return {
+                        checked: false,
+                        set checked(val) {},
+                        dispatchEvent: () => {}
+                    };
+                }
+                return null;
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.populateRecurringFormWithSettings({
+            frequency: 'daily',
+            indefinitely: false,
+            count: 25
+        });
+
+        if (countValue !== 25) {
+            throw new Error('Should set count from settings');
+        }
+    });
+
+    // ===== GRID GENERATION =====
+    resultsDiv.innerHTML += '<h4 class="test-section">📅 Grid Generation</h4>';
+
+    test('generateMonthlyDayGrid creates 31 day boxes', () => {
+        const mockContainer = {
+            innerHTML: '',
+            appendChild: function(el) { this.innerHTML += el.outerHTML || 'box'; }
+        };
+
+        setupPanelDeps({
+            querySelector: () => mockContainer
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.generateMonthlyDayGrid();
+
+        // Count data-day attributes (one per day box, not ambiguous like "box")
+        const boxCount = (mockContainer.innerHTML.match(/data-day="/g) || []).length;
+        if (boxCount !== 31) {
+            throw new Error(`Should create 31 day boxes, got ${boxCount}`);
+        }
+    });
+
+    test('generateYearlyMonthGrid creates 12 month boxes', () => {
+        const mockContainer = {
+            innerHTML: '',
+            appendChild: function(el) { this.innerHTML += el.outerHTML || 'box'; }
+        };
+
+        setupPanelDeps({
+            querySelector: () => mockContainer,
+            getElementById: () => null,
+            querySelectorAll: () => []
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.generateYearlyMonthGrid();
+
+        // Count data-month attributes (one per month box, not ambiguous like "box")
+        const boxCount = (mockContainer.innerHTML.match(/data-month="/g) || []).length;
+        if (boxCount !== 12) {
+            throw new Error(`Should create 12 month boxes, got ${boxCount}`);
+        }
+    });
+
+    test('getSelectedYearlyMonths returns selected months', () => {
+        const mockMonthBoxes = [
+            { classList: { contains: () => true }, dataset: { month: '1' } },
+            { classList: { contains: () => true }, dataset: { month: '6' } },
+            { classList: { contains: () => false }, dataset: { month: '12' } }
+        ];
+
+        setupPanelDeps({
+            querySelectorAll: (sel) => {
+                if (sel.includes('yearly-month-box.selected')) {
+                    return mockMonthBoxes.filter(box => box.classList.contains());
+                }
+                return [];
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        const selected = panel.getSelectedYearlyMonths();
+
+        if (selected.length !== 2) {
+            throw new Error('Should return only selected months');
+        }
+
+        if (!selected.includes(1) || !selected.includes(6)) {
+            throw new Error('Should return correct month numbers');
+        }
+    });
+
+    test('getSelectedMonthlyDays returns selected days', () => {
+        const mockDayBoxes = [
+            { classList: { contains: () => true }, dataset: { day: '5' } },
+            { classList: { contains: () => true }, dataset: { day: '15' } },
+            { classList: { contains: () => false }, dataset: { day: '25' } }
+        ];
+
+        setupPanelDeps({
+            querySelectorAll: (sel) => {
+                if (sel.includes('monthly-day-box.selected')) {
+                    return mockDayBoxes.filter(box => box.classList.contains());
+                }
+                return [];
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        const selected = panel.getSelectedMonthlyDays();
+
+        if (selected.length !== 2) {
+            throw new Error('Should return only selected days');
+        }
+    });
+
+    // ===== UTILITY FUNCTIONS =====
+    resultsDiv.innerHTML += '<h4 class="test-section">🛠️ Utility Functions</h4>';
+
+    test('getTomorrow returns future date', () => {
+        setupPanelDeps();
+        const panel = new RecurringPanelManager();
+
+        const tomorrow = panel.getTomorrow();
+        const today = new Date();
+
+        if (!(tomorrow instanceof Date)) {
+            throw new Error('Should return Date object');
+        }
+
+        if (tomorrow <= today) {
+            throw new Error('Tomorrow should be after today');
+        }
+    });
+
+    test('getTomorrow handles errors gracefully', () => {
+        setupPanelDeps();
+        const panel = new RecurringPanelManager();
+
+        // Should not throw even if there are internal errors
+        const result = panel.getTomorrow();
+
+        if (!result) {
+            throw new Error('Should return fallback date on error');
+        }
+    });
+
+    test('updateRecurCountVisibility hides count for indefinite', () => {
+        let countContainerHidden = false;
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-indefinitely') return { checked: true };
+                if (id === 'recur-specific-dates') return { checked: false };
+                if (id === 'recur-count-container') {
+                    return {
+                        classList: {
+                            toggle: (cls, condition) => {
+                                if (cls === 'hidden') countContainerHidden = condition;
+                            }
+                        }
+                    };
+                }
+                return null;
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.updateRecurCountVisibility();
+
+        if (!countContainerHidden) {
+            throw new Error('Count should be hidden for indefinite');
+        }
+    });
+
+    test('updateRecurCountVisibility shows count for limited repetition', () => {
+        let countContainerHidden = null;
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'recur-indefinitely') return { checked: false };
+                if (id === 'recur-specific-dates') return { checked: false };
+                if (id === 'recur-count-container') {
+                    return {
+                        classList: {
+                            toggle: (cls, condition) => {
+                                if (cls === 'hidden') countContainerHidden = condition;
+                            }
+                        }
+                    };
+                }
+                return null;
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.updateRecurCountVisibility();
+
+        if (countContainerHidden !== false) {
+            throw new Error('Count should be shown for limited repetition');
+        }
+    });
+
+    // ===== BUTTON VISIBILITY =====
+    resultsDiv.innerHTML += '<h4 class="test-section">🔘 Button Visibility</h4>';
+
+    test('updateRecurringPanelButtonVisibility always shows button (no templates)', () => {
+        let hiddenRemoved = false;
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'open-recurring-panel') {
+                    return {
+                        classList: {
+                            remove: (cls) => {
+                                if (cls === 'hidden') hiddenRemoved = true;
+                            }
+                        }
+                    };
+                }
+                return null;
+            },
+            AppState: {
+                get: () => ({
+                    data: { routine: {
+                            'cycle-1': { recurringTemplates: {} }
+                        }
+                    },
+                    appState: { activeRoutineId: 'cycle-1' }
+                }),
+                update: (fn) => {},
+                isReady: () => true
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.updateRecurringPanelButtonVisibility();
+
+        if (!hiddenRemoved) {
+            throw new Error('Button should always be visible (hidden class removed)');
+        }
+    });
+
+    test('updateRecurringPanelButtonVisibility always shows button (with templates)', () => {
+        let hiddenRemoved = false;
+
+        setupPanelDeps({
+            getElementById: (id) => {
+                if (id === 'open-recurring-panel') {
+                    return {
+                        classList: {
+                            remove: (cls) => {
+                                if (cls === 'hidden') hiddenRemoved = true;
+                            }
+                        }
+                    };
+                }
+                return null;
+            },
+            AppState: {
+                get: () => ({
+                    data: { routine: {
+                            'cycle-1': {
+                                recurringTemplates: {
+                                    'task-1': { id: 'task-1', text: 'Test' }
+                                }
+                            }
+                        }
+                    },
+                    appState: { activeRoutineId: 'cycle-1' }
+                }),
+                update: (fn) => {},
+                isReady: () => true
+            }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.updateRecurringPanelButtonVisibility();
+
+        if (!hiddenRemoved) {
+            throw new Error('Button should always be visible (hidden class removed)');
+        }
+    });
+
+    // ===== STANDALONE FUNCTIONS =====
+    resultsDiv.innerHTML += '<h4 class="test-section">🔧 Standalone Functions</h4>';
+
+    test('buildRecurringSummaryFromSettings function exists', () => {
+        if (typeof buildRecurringSummaryFromSettings !== 'function') {
+            throw new Error('buildRecurringSummaryFromSettings not exported');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings returns string', () => {
+        const summary = buildRecurringSummaryFromSettings({ frequency: 'daily' });
+
+        if (typeof summary !== 'string') {
+            throw new Error('Should return string');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles daily frequency', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            frequency: 'daily',
+            indefinitely: true
+        });
+
+        if (!summary.includes('daily')) {
+            throw new Error('Summary should mention daily');
+        }
+
+        if (!summary.includes('indefinitely')) {
+            throw new Error('Summary should mention indefinitely');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles count', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            frequency: 'weekly',
+            indefinitely: false,
+            count: 10
+        });
+
+        if (!summary.includes('10')) {
+            throw new Error('Summary should include count');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles specific time', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            frequency: 'daily',
+            useSpecificTime: true,
+            time: {
+                hour: 14,
+                minute: 30,
+                military: true
+            }
+        });
+
+        if (!summary.includes('14:30')) {
+            throw new Error('Summary should include time');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles 12-hour time', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            frequency: 'daily',
+            useSpecificTime: true,
+            time: {
+                hour: 2,
+                minute: 30,
+                meridiem: 'PM',
+                military: false
+            }
+        });
+
+        if (!summary.includes('2:30') || !summary.includes('PM')) {
+            throw new Error('Summary should include 12-hour time with meridiem');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles weekly with days', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            frequency: 'weekly',
+            weekly: {
+                days: ['Monday', 'Wednesday', 'Friday']
+            }
+        });
+
+        if (!summary.includes('Monday') || !summary.includes('Wednesday')) {
+            throw new Error('Summary should include days');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles monthly with days', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            frequency: 'monthly',
+            monthly: {
+                days: [1, 15, 30]
+            }
+        });
+
+        if (!summary.includes('1') || !summary.includes('15')) {
+            throw new Error('Summary should include monthly days');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles specific dates', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            specificDates: {
+                enabled: true,
+                dates: ['2025-10-15', '2025-10-20']
+            }
+        });
+
+        if (!summary.includes('Specific dates')) {
+            throw new Error('Summary should mention specific dates');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles hourly with minute', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            frequency: 'hourly',
+            hourly: {
+                useSpecificMinute: true,
+                minute: 30
+            }
+        });
+
+        if (!summary.includes(':30')) {
+            throw new Error('Summary should include minute for hourly');
+        }
+    });
+
+    test('buildRecurringSummaryFromSettings handles yearly with months', () => {
+        const summary = buildRecurringSummaryFromSettings({
+            frequency: 'yearly',
+            yearly: {
+                months: [1, 6, 12],
+                useSpecificDays: false
+            }
+        });
+
+        if (!summary.includes('Jan') || !summary.includes('Jun') || !summary.includes('Dec')) {
+            throw new Error('Summary should include month names');
+        }
+    });
+
+    // ===== ERROR HANDLING =====
+    resultsDiv.innerHTML += '<h4 class="test-section">⚠️ Error Handling</h4>';
+
+    test('handles missing DOM elements gracefully in setup', () => {
+        setupPanelDeps({
+            getElementById: () => null,
+            showNotification: (msg) => msg
+        });
+        const panel = new RecurringPanelManager();
+
+        // Should not throw
+        panel.setup();
+    });
+
+    await test('handles AppState not ready in openPanel', async () => {
+        // ✅ Test updated: With AppInit, openPanel() now waits for core instead of checking readiness
+        // The old behavior (show notification immediately) no longer applies
+        // New behavior: waits silently via appInit.waitForCore()
+
+        // Mark core ready so the test completes
+        if (window.appInit && !window.appInit.isCoreReady()) {
+            await window.appInit.markCoreSystemsReady();
+        }
+
+        setupPanelDeps({
+            AppState: {
+                get: () => ({
+                    data: { routine: {} },
+                    appState: { activeRoutineId: 'cycle-1' }
+                }),
+                update: (fn) => {},
+                isReady: () => true
+            },
+            getElementById: () => ({ classList: { remove: () => {}, add: () => {} } })
+        });
+        const panel = new RecurringPanelManager();
+
+        // Should complete successfully (waits for core internally)
+        await panel.openPanel();
+
+        // Verify it opened successfully
+        if (!panel.state.panelOpen) {
+            throw new Error('Panel should open after waiting for core');
+        }
+    });
+
+    test('handles missing active cycle in updateRecurringPanel', () => {
+        setupPanelDeps({
+            AppState: {
+                get: () => ({
+                    data: { routine: {} },
+                    appState: { activeRoutineId: null }
+                }),
+                update: (fn) => {},
+                isReady: () => true
+            },
+            getElementById: () => ({ innerHTML: '' })
+        });
+        const panel = new RecurringPanelManager();
+
+        // Should not throw
+        panel.updateRecurringPanel();
+    });
+
+    test('handles null task in showTaskSummaryPreview', () => {
+        setupPanelDeps({
+            getElementById: () => null
+        });
+        const panel = new RecurringPanelManager();
+
+        // Should not throw
+        panel.showTaskSummaryPreview(null);
+    });
+
+    test('showTaskSummaryPreview populates summary text for task with settings', () => {
+        let previewCleared = false;
+        let appendedChildren = [];
+        let summaryContainerShown = false;
+
+        const mockElements = {
+            'recurring-preview-text': {
+                innerHTML: '',
+                set innerHTML(val) { previewCleared = (val === ''); },
+                appendChild: function(el) { appendedChildren.push(el); }
+            },
+            'recurring-summary-preview': {
+                classList: {
+                    remove: function(className) {
+                        if (className === 'hidden') summaryContainerShown = true;
+                    },
+                    add: () => {},
+                    contains: () => false
+                }
+            }
+        };
+
+        const task = {
+            id: 'task-1',
+            text: 'Test Task',
+            recurringSettings: { frequency: 'daily' }
+        };
+
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': {
+                        tasks: [task],
+                        recurringTemplates: {}
+                    }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        setupPanelDeps({
+            getElementById: (id) => mockElements[id] || null,
+            AppState: {
+                get: () => mockState,
+                update: (fn) => {},
+                isReady: () => true
+            },
+            buildRecurringSummary: () => 'Daily',
+            formatNextOccurrence: () => 'Tomorrow'
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.showTaskSummaryPreview(task);
+
+        if (!summaryContainerShown) {
+            throw new Error('Summary container should be shown (hidden class removed)');
+        }
+
+        if (!previewCleared) {
+            throw new Error('Preview text should be cleared before populating');
+        }
+
+        // Should append at least the task name (strong) and a br element
+        if (appendedChildren.length < 2) {
+            throw new Error(`Should append task name and summary elements, got ${appendedChildren.length} children`);
+        }
+    });
+
+    test('showTaskSummaryPreview shows summary container when task has recurring settings', () => {
+        let summaryContainerShown = false;
+        let appendedChildren = [];
+
+        const mockElements = {
+            'recurring-preview-text': {
+                innerHTML: '',
+                set innerHTML(val) {},
+                appendChild: function(el) { appendedChildren.push(el); }
+            },
+            'recurring-summary-preview': {
+                classList: {
+                    remove: function(className) {
+                        if (className === 'hidden') summaryContainerShown = true;
+                    },
+                    add: () => {},
+                    contains: () => false
+                }
+            }
+        };
+
+        const task = {
+            id: 'task-1',
+            text: 'Test Task',
+            recurringSettings: { frequency: 'weekly' }
+        };
+
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': {
+                        tasks: [task],
+                        recurringTemplates: {}
+                    }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        setupPanelDeps({
+            getElementById: (id) => mockElements[id] || null,
+            AppState: {
+                get: () => mockState,
+                update: (fn) => {},
+                isReady: () => true
+            },
+            buildRecurringSummary: () => 'Weekly',
+            formatNextOccurrence: () => 'Next Monday'
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.showTaskSummaryPreview(task);
+
+        if (!summaryContainerShown) {
+            throw new Error('Summary container should be visible when task has recurring settings');
+        }
+
+        // Should have appended a summary span (class 'recurring-summary-text')
+        const hasSummarySpan = appendedChildren.some(el =>
+            el.className === 'recurring-summary-text'
+        );
+        if (!hasSummarySpan) {
+            throw new Error('Should append a summary text span with recurring details');
+        }
+    });
+
+    test('buildRecurringSettingsFromPanel handles errors gracefully', () => {
+        setupPanelDeps({
+            getElementById: () => { throw new Error('DOM error'); },
+            querySelectorAll: () => []
+        });
+        const panel = new RecurringPanelManager();
+
+        const settings = panel.buildRecurringSettingsFromPanel();
+
+        // Should return default settings instead of throwing
+        if (!settings.frequency) {
+            throw new Error('Should return fallback settings on error');
+        }
+    });
+
+    // ===== INTEGRATION TESTS =====
+    resultsDiv.innerHTML += '<h4 class="test-section">🔗 Integration</h4>';
+
+    await test('integrates with AppState for panel updates', async () => {
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': {
+                        tasks: [
+                            { id: 'task-1', text: 'Test Task', recurring: true }
+                        ],
+                        recurringTemplates: {
+                            'task-1': { id: 'task-1', text: 'Test Task' }
+                        }
+                    }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        let stateRead = false;
+        setupPanelDeps({
+            AppState: {
+                get: () => { stateRead = true; return mockState; },
+                update: (fn) => {},
+                isReady: () => true
+            },
+            getElementById: (id) => (id === 'recurring-task-list' ? document.createElement('ul') : null),
+            querySelectorAll: () => []
+        });
+        const panel = new RecurringPanelManager();
+
+        await panel.updateRecurringPanel();
+
+        // updateRecurringPanel reads the active cycle's recurring templates from the
+        // injected AppState. The old test called it and asserted nothing.
+        if (!stateRead) {
+            throw new Error('updateRecurringPanel should read from the injected AppState');
+        }
+    });
+
+    test('uses dependency injection for notifications', () => {
+        let notificationMessage = null;
+
+        setupPanelDeps({
+            showNotification: (msg) => { notificationMessage = msg; }
+        });
+        const panel = new RecurringPanelManager();
+
+        panel.deps.showNotification('Test notification');
+
+        if (notificationMessage !== 'Test notification') {
+            throw new Error('Should use injected notification function');
+        }
+    });
+
+    test('uses dependency injection for AppState', () => {
+        const mockState = {
+            get: () => ({ data: { routine: {} }, appState: { activeRoutineId: null } }),
+            update: (fn) => {},
+            isReady: () => true
+        };
+
+        setupPanelDeps({
+            AppState: mockState
+        });
+        const panel = new RecurringPanelManager();
+
+        const state = panel.deps.AppState;
+
+        if (state !== mockState) {
+            throw new Error('Should use injected AppState function');
+        }
+    });
+
+    // ===== SPECIFIC-DATES CAP =====
+    // The .mcyc importer truncates specificDates to LIMITS.MAX_SPECIFIC_DATES.
+    // The Add button had no cap, so the two producers for the same field
+    // disagreed. It now refuses past the cap AND says why — a silent no-op
+    // would read as a broken button.
+
+    /**
+     * Build the DOM setupSpecificDatesPanel() needs, seed the list with
+     * `seedCount` rows, run setup, click Add, and report what happened.
+     */
+    async function clickAddWithListSize(seedCount) {
+        const { LIMITS } = await import(`../modules/core/constants.js?v=${window.testCacheBuster || Date.now()}`);
+        const ids = ['recur-specific-dates', 'specific-dates-panel', 'specific-date-time-options',
+                     'add-specific-date', 'specific-date-list'];
+        const made = ids.map((id) => {
+            const el = document.createElement(id === 'add-specific-date' ? 'button' : 'div');
+            el.id = id;
+            document.body.appendChild(el);
+            return el;
+        });
+        const [checkbox, , , addBtn, list] = made;
+        checkbox.checked = false;
+
+        for (let i = 0; i < seedCount; i++) {
+            list.appendChild(document.createElement('div'));
+        }
+
+        const notifications = [];
+        try {
+            setupPanelDeps({ showNotification: (msg) => { notifications.push(msg); return msg; } });
+            const panel = new RecurringPanelManager();
+            panel.setupSpecificDatesPanel();
+            const before = list.children.length;
+            addBtn.click();
+            return { before, after: list.children.length, notifications, max: LIMITS.MAX_SPECIFIC_DATES };
+        } finally {
+            made.forEach((el) => el.remove());
+        }
+    }
+
+    await test('Add button appends a date row below the cap', async () => {
+        const r = await clickAddWithListSize(2);
+        if (r.after !== r.before + 1) {
+            throw new Error(`Expected a row to be added (${r.before} -> ${r.after})`);
+        }
+    });
+
+    await test('Add button refuses at the cap and explains why', async () => {
+        const r = await clickAddWithListSize(366);
+        if (r.after !== r.before) {
+            throw new Error(`Expected no row added at the cap (${r.before} -> ${r.after})`);
+        }
+        if (r.notifications.length === 0) {
+            throw new Error('Refusing silently reads as a broken button — expected a notification');
+        }
+        if (!String(r.notifications[0]).includes(String(r.max))) {
+            throw new Error(`Notification should state the limit ${r.max}, got: ${r.notifications[0]}`);
+        }
+    });
+
+    // ===== RESULTS SUMMARY =====
+    const percentage = Math.round((passed.count / total.count) * 100);
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${percentage}%)</h3>`;
+
+    if (passed.count === total.count) {
+        resultsDiv.innerHTML += '<div class="result pass">🎉 All tests passed!</div>';
+    }
+
+    return { passed: passed.count, total: total.count };
+}

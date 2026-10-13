@@ -1,0 +1,1738 @@
+/**
+ * miniCycle Undo/Redo Manager Module (DI-Pure)
+ *
+ * State-based undo/redo system with snapshot management.
+ * Maintains per-cycle undo stacks with configurable limits.
+ *
+ * Features:
+ * - Snapshot-based state capture
+ * - Per-cycle undo/redo stacks
+ * - Keyboard shortcuts (Ctrl+Z, Ctrl+Y)
+ * - Idle-time saves for durability
+ * - Minimum interval between snapshots
+ *
+ * @module ui/undoRedoManager
+ * @see {@link file://docs/architecture/ARCHITECTURE_OVERVIEW.md} - Architecture
+ */
+
+/**
+ * @typedef {import('../core/types.js').Schema25Data} Schema25Data
+ * @typedef {import('../core/types.js').MiniCycleState} MiniCycleState
+ */
+
+/**
+ * @typedef {Object} UndoRedoStack
+ * @property {Schema25Data[]} undoStack - Array of undo snapshots
+ * @property {Schema25Data[]} redoStack - Array of redo snapshots
+ * @property {number} lastSnapshotTime - Timestamp of last snapshot
+ */
+
+import { createDIModule, optional } from '../core/diBase.js';
+import { getLabel } from '../labels/labelResolver.js';
+import { LIMITS, DEBOUNCE, DOM_IDS, APP_VERSION, UI_TIMEOUTS, EVENTS } from '../core/constants.js';
+
+// Change description for undo/redo notifications (Pattern 2, pure). Split out
+// Aug 2026. `describeChange` is re-exported from there for tests only; the
+// parent calls `computeTransactionDiff`, which is the entry point.
+import { computeTransactionDiff } from './undoTransactionDiff.js';
+import { getActiveRoutineId, getRoutine, getRoutines } from '../utils/cycleMode.js';
+
+// Re-exported because it was part of this module's public surface before the
+// split and the test suite imports it from here. Not a `provides` name.
+export { computeTransactionDiff };
+
+// Pure snapshot helpers (Pattern 2). No DI, no state, no side effects — a plain
+// static import is safe, and nothing here needs wiring. Split out Aug 2026;
+// see the header of that file for why these, and not captureStateSnapshot.
+// Boot-critical by virtue of this import: it is in BOOT_CRITICAL.
+import {
+  sanitizeSnapshot,
+  filterValidSnapshots,
+  buildSnapshotSignature,
+  snapshotsEqual
+} from './undoSnapshotUtils.js';
+
+// Re-exported because all three were part of this module's public surface
+// before the split and the test suite imports them from here. None is a
+// `provides` name, so unlike the undoIndexedDB re-exports these are a
+// compatibility surface rather than a registerProvides requirement.
+export { filterValidSnapshots, buildSnapshotSignature, snapshotsEqual };
+
+// Durable per-cycle undo persistence, split out Aug 2026 (Priority 3,
+// LARGE_MODULE_SPLITS_PLAN.md). STATIC, not a dynamic Pattern-1 import: these
+// run from synchronous paths — including the beforeunload flush — where
+// awaiting an import is impossible, and this module has no async init to hang
+// one on. Same call made for notifications.js -> educationalTips.js.
+//
+// CONSEQUENCE: a static import from a boot-critical module makes the target
+// boot-critical. undoIndexedDB.js is in BOOT_CRITICAL in service-worker.js;
+// run `npm run test:sw` if you touch either file — no other gate covers it.
+import {
+  setUndoIndexedDBDependencies,
+  initUndoIndexedDB,
+  closeUndoIndexedDB,
+  saveUndoStackToIndexedDB,
+  loadUndoStackFromIndexedDB,
+  deleteUndoStackFromIndexedDB,
+  renameUndoStackInIndexedDB,
+  clearAllUndoHistoryFromIndexedDB,
+  cancelPendingDbWrite,
+  flushPendingWritesSync,
+  forceSaveStackSync,
+  cancelAllPendingWrites
+} from './undoIndexedDB.js';
+
+// RE-EXPORT, not decoration. `initUndoIndexedDB` and `closeUndoIndexedDB` are
+// named in this module's `provides` list in moduleManifests.js, and
+// registerProvides SILENTLY SKIPS a name it cannot find on the module — the
+// failure that broke three-panel swipe for forty releases after the v2.347
+// statsPanel split. The rest are re-exported because existing callers and the
+// test suite import them from here. `validate:provides` gates the first two.
+export {
+  initUndoIndexedDB,
+  closeUndoIndexedDB,
+  saveUndoStackToIndexedDB,
+  loadUndoStackFromIndexedDB,
+  deleteUndoStackFromIndexedDB,
+  renameUndoStackInIndexedDB,
+  clearAllUndoHistoryFromIndexedDB
+};
+
+// ============ CONSTANTS (from centralized constants.js) ============
+const UNDO_LIMIT = LIMITS.UNDO_STACK;
+const UNDO_MIN_INTERVAL_MS = DEBOUNCE.UNDO_MIN_INTERVAL;
+const UNDO_DB_WRITE_DEBOUNCE_MS = DEBOUNCE.UNDO_DB_WRITE;
+
+// localStorage cache key for instant boot
+const UNDO_CACHE_KEY = '__miniCycle_undoCache__';
+
+// ============ LOCALSTORAGE CACHE (for instant boot) ============
+
+/**
+ * Save active routine's undo stack to localStorage cache
+ * Called on every save for instant boot next time
+ * @param {string} cycleId - The cycle ID
+ * @param {Array} undoStack - The undo stack
+ * @param {Array} redoStack - The redo stack
+ */
+function saveToUndoCache(cycleId, undoStack, redoStack) {
+  if (!cycleId) return;
+
+  try {
+    const cacheData = {
+      cycleId,
+      undoStack: (undoStack || []).slice(),
+      redoStack: (redoStack || []).slice(),
+      timestamp: Date.now()
+    };
+    let serialized = JSON.stringify(cacheData);
+    // Byte cap alongside the UNDO_LIMIT count cap (drift-review C-08): large
+    // routines × 20 full-state snapshots could otherwise grow toward the ~5MB
+    // localStorage quota shared with main app state. Shed oldest undo entries
+    // (index 0) first, then redo entries, until under the cap.
+    // localStorage stores UTF-16, so actual bytes = string length × 2 — the
+    // same convention storageUtils uses to meter the quota (drift-review C-27;
+    // comparing raw length to LIMITS.UNDO_CACHE_MAX_BYTES silently doubled the budget).
+    while (serialized.length * 2 > LIMITS.UNDO_CACHE_MAX_BYTES &&
+           (cacheData.undoStack.length > 1 || cacheData.redoStack.length > 0)) {
+      // Shed redo FIRST: any new user action invalidates the redo stack anyway,
+      // so under byte pressure it is strictly less valuable than undo depth.
+      // (The old order shed oldest undo while a full redo stack survived.)
+      if (cacheData.redoStack.length > 0) {
+        cacheData.redoStack.shift();
+      } else {
+        cacheData.undoStack.shift();
+      }
+      serialized = JSON.stringify(cacheData);
+    }
+    if (serialized.length * 2 > LIMITS.UNDO_CACHE_MAX_BYTES) {
+      // Even a single snapshot exceeds the cap — skip the write rather than
+      // risk evicting quota needed by the main state save.
+      console.warn('⚠️ Undo cache exceeds byte cap even after shedding — skipping cache write');
+      return;
+    }
+    localStorage.setItem(UNDO_CACHE_KEY, serialized);
+  } catch (e) {
+    // Graceful degradation - cache is optional
+    console.warn('⚠️ Failed to save undo cache:', e.message);
+  }
+}
+
+/**
+ * Load undo stack from localStorage cache (synchronous, instant)
+ * @param {string} expectedCycleId - The cycle ID we expect to find
+ * @returns {Object|null} Cache data if found and valid, null otherwise
+ */
+function loadFromUndoCache(expectedCycleId) {
+  if (!expectedCycleId) return null;
+
+  try {
+    const cached = localStorage.getItem(UNDO_CACHE_KEY);
+    if (!cached) return null;
+
+    const data = JSON.parse(cached);
+
+    // Validate cache matches expected cycle
+    if (data.cycleId !== expectedCycleId) {
+      return null;
+    }
+
+    // Validate cache structure
+    if (!Array.isArray(data.undoStack) || !Array.isArray(data.redoStack)) {
+      console.warn('⚠️ Invalid undo cache structure');
+      return null;
+    }
+
+    // Filter out any snapshots that don't belong to this cycle
+    const validUndoStack = filterValidSnapshots(data.undoStack, expectedCycleId);
+    const validRedoStack = filterValidSnapshots(data.redoStack, expectedCycleId);
+
+    return {
+      ...data,
+      undoStack: validUndoStack,
+      redoStack: validRedoStack
+    };
+  } catch (e) {
+    console.warn('⚠️ Failed to load undo cache:', e.message);
+    return null;
+  }
+}
+
+
+
+
+
+/**
+ * Relabel snapshots for a renamed cycle. Snapshots embed the cycle identity
+ * twice — activeCycleId (the cycles-map key) and title (equal to the key in
+ * this app) — so a rename must rewrite BOTH in every snapshot of both stacks,
+ * or validateSnapshot discards the history and Undo restores the old title.
+ * @param {Array} snapshots - Snapshots to relabel
+ * @param {string} newCycleId - The new cycle id (= new title)
+ * @returns {Array} New array with relabeled snapshot copies
+ */
+function relabelSnapshotsForCycle(snapshots, newCycleId) {
+  return (snapshots || []).map(snap => {
+    if (!snap || typeof snap !== 'object') return snap;
+    const relabeled = { ...snap, activeCycleId: newCycleId, title: newCycleId };
+    // The cached signature embeds the OLD id/title (c/ti fields), so carrying
+    // it forward makes the first post-rename capture mismatch the stack top by
+    // construction and push a duplicate. Both consumers (capture dedup,
+    // snapshot comparator) lazily recompute when _sig is absent.
+    delete relabeled._sig;
+    return relabeled;
+  });
+}
+
+
+/**
+ * Clear the undo cache (used on cycle deletion or factory reset)
+ */
+export function clearUndoCache() {
+  try {
+    localStorage.removeItem(UNDO_CACHE_KEY);
+  } catch (e) {
+    console.warn('⚠️ Failed to clear undo cache:', e.message);
+  }
+}
+
+// ============ IDLE-TIME SAVE HELPER ============
+/**
+ * Schedule a state save during idle time for durability without blocking input.
+ * Uses requestIdleCallback with setTimeout fallback.
+ * Captures AppState reference upfront to avoid repeated proxy gets.
+ */
+function scheduleIdleSave() {
+  // Capture reference now to avoid repeated di.resolve() proxy gets
+  const AppState = _deps.AppState;
+  if (!AppState?.isReady?.() || !AppState.forceSave) {
+    return; // Not ready or missing forceSave - skip silently
+  }
+
+  const doSave = () => {
+    AppState.forceSave();
+  };
+
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(doSave, { timeout: 500 });
+  } else {
+    // Fallback for Safari/older browsers
+    setTimeout(doSave, UI_TIMEOUTS.SAVE_DEFER);
+  }
+}
+
+// ============================================================================
+// DEPENDENCY INJECTION SETUP (using diBase.js)
+// ============================================================================
+
+const di = createDIModule('UndoRedoManager', {
+  appInit: optional(null),
+  AppState: optional(null),
+  refreshUIFromState: optional(null),
+  AppGlobalState: optional(null),
+  getElementById: optional(null),
+  safeAddEventListener: optional(null),
+  showNotification: optional(null),
+  // UIOrchestrator for smart UI updates (optional - falls back to refreshUIFromState)
+  UIOrchestrator: optional(null),
+  organizeCompletedTasks: optional(null),  // () => void — re-organize completed dropdown after undo/redo
+  logHistoryEvent: optional(null),  // (type, details) => void — logs undo/redo to routine history
+  refreshHistoryIfOpen: optional(null),  // () => void — re-renders history modal if open (for cleared tasks tab)
+  updateRecurringInfoLink: optional(null),  // () => void — refreshes "X tasks set to recurring" indicator
+  updateHelpWindow: optional(null),  // () => void — refreshes help window status message
+  syncModeFromToggles: optional(null),  // () => void — syncs delete-checked/auto-reset toggles from state
+  refreshThemeLabels: optional(null),  // () => void — refreshes vocab theme labels/colors after undo/redo
+  updateRecurringPanel: optional(null),  // () => void — refreshes recurring panel after undo/redo
+  refreshTaskViewLayout: optional(null)  // () => void — reconciles drag positions after undo/redo restores state.settings.taskViewLayout
+});
+
+// Module-level state: whether the AppState.update wrapper is installed (the
+// single snapshot source). Plain variable, NOT a DI dep — it used to live on
+// the _deps Proxy, which made the DI validator report it as an
+// accessed-but-resolvable-nowhere dependency (drift-review C-24).
+let _wrapperActive = false;
+
+// Late-binding deps via Proxy (standard: _deps with underscore prefix)
+/** @type {{appInit: Object|null, AppState: Object|null, refreshUIFromState: Function|null, AppGlobalState: Object|null, getElementById: Function|null, safeAddEventListener: Function|null, showNotification: Function|null, UIOrchestrator: Object|null}} */
+const _deps = new Proxy({}, {
+  get(target, prop) {
+    return di.resolve()[prop];
+  },
+  set() {
+    return false;
+  }
+});
+
+/**
+ * Inject or override dependencies for the undo/redo manager module.
+ * @param {Object} [overrides] - Dependency overrides to merge into the DI container
+ * @returns {void}
+ */
+export function setUndoRedoManagerDependencies(overrides = {}) {
+  di.setDependencies(overrides);
+
+  // Wire the IndexedDB sub-module from the SAME call, so the two can never end
+  // up half-wired. showNotification goes through a getter on purpose: diBase
+  // uses defineProperties precisely to preserve these, and a plain read here
+  // would capture undefined at boot, before featureBoot supplies it.
+  setUndoIndexedDBDependencies({
+    get showNotification() { return _deps.showNotification; },
+    saveToUndoCache,
+    relabelSnapshotsForCycle
+  });
+}
+
+function assertInjected(name, value) {
+  if (value === null || value === undefined) {
+    throw new Error(`undoRedoManager: missing required dependency '${name}'. Call setUndoRedoManagerDependencies() first.`);
+  }
+}
+
+// ============================================================================
+// IDEMPOTENCY GUARDS
+// ============================================================================
+
+const _initialized = {
+  undoRedoUI: false,
+  undoRedoKeyboard: false
+};
+
+// Module-scope handler reference for cleanup
+let _handleUndoRedoKeydown = null;
+
+// beforeunload handler reference so destroyUndoRedoManager() can remove it (an
+// anonymous listener would accumulate across boot retries and let a torn-down
+// instance still write history on unload).
+let _beforeunloadHandler = null;
+let _visibilityFlushHandler = null;
+
+// ============ UI INITIALIZATION ============
+
+/**
+ * Wire up undo/redo button event listeners
+ * Called once during app initialization
+ */
+export function wireUndoRedoUI() {
+  // ✅ Idempotency guard
+  if (_initialized.undoRedoUI) {
+    return;
+  }
+  _initialized.undoRedoUI = true;
+
+  initUndoRedoButtons();
+
+  const undoBtn = _deps.getElementById(DOM_IDS.UNDO_BTN);
+  const redoBtn = _deps.getElementById(DOM_IDS.REDO_BTN);
+
+  if (!undoBtn || !redoBtn) {
+    console.warn('⚠️ Undo/redo buttons not found in DOM - keyboard shortcuts will still work');
+    return;
+  }
+
+  assertInjected('safeAddEventListener', _deps.safeAddEventListener);
+
+  _deps.safeAddEventListener(undoBtn, 'click', () => performStateBasedUndo());
+  _deps.safeAddEventListener(redoBtn, 'click', () => performStateBasedRedo());
+
+}
+
+/**
+ * Wire up keyboard shortcuts for undo/redo (Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z).
+ *
+ * ⚠️ NOT called during normal boot. Global undo/redo shortcuts are owned by
+ * uiBoot.handleGlobalKeydown (via the public appContext undo API). Calling this
+ * in addition installs a SECOND document keydown listener, making every shortcut
+ * fire undo/redo twice. Kept exported only for standalone/embedded use where uiBoot's
+ * global handler is not present — never wire both in the same document.
+ */
+export function wireUndoRedoKeyboardShortcuts() {
+  // ✅ Idempotency guard
+  if (_initialized.undoRedoKeyboard) {
+    return;
+  }
+  _initialized.undoRedoKeyboard = true;
+
+  assertInjected('safeAddEventListener', _deps.safeAddEventListener);
+
+  _handleUndoRedoKeydown = function handleUndoRedoKeydown(e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+      e.preventDefault();
+      performStateBasedUndo();
+    } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) {
+      e.preventDefault();
+      performStateBasedRedo();
+    }
+  };
+
+  _deps.safeAddEventListener(document, 'keydown', _handleUndoRedoKeydown);
+}
+
+/**
+ * Initialize undo/redo buttons to hidden state
+ */
+export function initUndoRedoButtons() {
+  const undoBtn = _deps.getElementById(DOM_IDS.UNDO_BTN);
+  const redoBtn = _deps.getElementById(DOM_IDS.REDO_BTN);
+
+  if (undoBtn) {
+    undoBtn.hidden = true;
+    undoBtn.disabled = true;
+  }
+  if (redoBtn) {
+    redoBtn.hidden = true;
+    redoBtn.disabled = true;
+  }
+
+}
+
+/**
+ * Capture initial snapshot after data loads
+ */
+export async function captureInitialSnapshot() {
+  assertInjected('AppState', _deps.AppState);
+
+  const currentState = _deps.AppState.get();
+  if (currentState) {
+    await captureStateSnapshot(currentState);
+  }
+}
+
+// ============ STATE SUBSCRIPTION ============
+
+/**
+ * Wrap AppState.update to capture snapshots automatically
+ * This centralizes undo snapshot capture on every state update
+ * @param {Object} appInit - AppInit module for readiness check
+ * @returns {boolean} True if wrapper was installed
+ */
+export function wrapAppStateForUndo(appInit) {
+  assertInjected('AppState', _deps.AppState);
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+
+  // Already wrapped - skip
+  if (_deps.AppGlobalState.wrappedAppStateUpdate) {
+    return false;
+  }
+
+  try {
+    const AppState = _deps.AppState;
+    const globalState = _deps.AppGlobalState;
+
+    // Bind methods to preserve `this`
+    const boundUpdate = AppState.update.bind(AppState);
+    const boundGet = typeof AppState.get === 'function'
+      ? AppState.get.bind(AppState)
+      : null;
+
+    // Not async - snapshot capture is synchronous, just pass through the Promise
+    AppState.update = (producer, immediate, options) => {
+      let refreshButtonsAfterWrite = false;
+      try {
+        // System-driven mutations (recurring watcher recreations, daily
+        // auto-uncheck) pass { system: true } so the no-snapshot intent
+        // travels WITH the call. The older mechanism — raising the shared
+        // AppGlobalState.isSystemMutation flag around an awaited update —
+        // could mis-tag a user update that interleaved during the await
+        // window (review F-005); captureStateSnapshot still honors the flag
+        // as a fallback, but the option is the primary mechanism.
+        const isSystemCall = options?.system === true;
+        // Capture snapshot before update (if core ready and not during undo/redo)
+        if (!isSystemCall && appInit?.isCoreReady?.() && !globalState?.isPerformingUndoRedo && boundGet) {
+          // Let a module with coalesced writes of its own land them first, so
+          // the stack reads in the order the user acted (see EVENTS).
+          try { document.dispatchEvent(new CustomEvent(EVENTS.UNDO_SNAPSHOT_PENDING)); } catch { /* no document — nothing to flush */ }
+          const prev = boundGet();
+          if (prev) {
+            captureStateSnapshot(prev);
+            refreshButtonsAfterWrite = true;
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ Undo snapshot wrapper error:', e);
+      }
+      // Return the Promise from boundUpdate directly (no await needed)
+      const result = boundUpdate(relabelOnRekey(producer, globalState), immediate);
+      // The buttons count stack entries that differ from the CURRENT state, and
+      // captureStateSnapshot refreshes them BEFORE the producer has run — when
+      // the entry just pushed (or the one already on the stack that dedup kept)
+      // still equals the state. Writers that call updateUndoRedoButtons after
+      // their own update never noticed; the first layout drag of a session,
+      // whose pre-drag snapshot is the boot snapshot, left Undo disabled with
+      // the reverting entry sitting right there. Refresh once the write lands.
+      if (refreshButtonsAfterWrite) {
+        Promise.resolve(result).then(() => {
+          try { updateUndoRedoButtons(); } catch { /* buttons are a convenience; the write already landed */ }
+        }, () => { /* a failed write changes nothing the buttons need to show */ });
+      }
+      return result;
+    };
+
+    globalState.wrappedAppStateUpdate = true;
+    globalState.useUpdateWrapper = true;  // wrapper becomes single snapshot source
+    _wrapperActive = true;  // update internal flag
+
+    return true;
+  } catch (e) {
+    console.error('❌ Failed to wrap AppState.update:', e);
+    return false;
+  }
+}
+
+/**
+ * Wrap a producer so a routine RENAME is recognised the instant it happens.
+ *
+ * A rename re-keys the routine (routines[new] = {...old, title}; delete
+ * routines[old]; activeRoutineId = new) inside one producer. AppState then
+ * notifies subscribers SYNCHRONOUSLY, and any of them that calls
+ * AppState.update (the "Renamed to" notification persisting its position did,
+ * measured Oct 2026) makes this wrapper capture a snapshot whose active id is
+ * the NEW key while activeCycleIdForUndo still holds the OLD one. The
+ * capture's self-heal treats that as a routine switch and wipes both stacks —
+ * so renaming a routine erased its undo history every time. onCycleRenamed
+ * could not help: callers invoke it after the awaited update, and it awaited
+ * IndexedDB before touching memory.
+ *
+ * The producer is the only place the rename is unambiguous — old key gone,
+ * new key born, active id moved, all in one call — so the relabel happens
+ * right here, after the producer and before notifyListeners. A deletion that
+ * switches routines fails the "new key did not exist before" test and is left
+ * to onCycleDeleted / onCycleSwitched as before.
+ * @param {Function} producer - The caller's state producer
+ * @param {Object} globalState - AppGlobalState
+ * @returns {Function} producer wrapper with identical return value
+ */
+function relabelOnRekey(producer, globalState) {
+  if (typeof producer !== 'function') return producer;
+  return (state) => {
+    const beforeId = getActiveRoutineId(state);
+    // Snapshot the KEY LIST now: the producer mutates this same routines
+    // object in place, so reading it afterwards would always "find" the new key.
+    const routinesBefore = getRoutines(state);
+    const keysBefore = routinesBefore ? new Set(Object.keys(routinesBefore)) : null;
+    const result = producer(state);
+    const afterId = getActiveRoutineId(state);
+    if (keysBefore && beforeId && afterId && beforeId !== afterId &&
+        globalState.activeCycleIdForUndo === beforeId &&
+        !getRoutine(state, beforeId) && !keysBefore.has(afterId) && getRoutine(state, afterId)) {
+      globalState.activeCycleIdForUndo = afterId;
+      globalState.activeUndoStack = relabelSnapshotsForCycle(globalState.activeUndoStack, afterId);
+      globalState.activeRedoStack = relabelSnapshotsForCycle(globalState.activeRedoStack, afterId);
+    }
+    return result;
+  };
+}
+
+/**
+ * Set up AppState subscription for automatic snapshots
+ */
+export function setupStateBasedUndoRedo() {
+  assertInjected('AppState', _deps.AppState);
+
+  if (!_deps.AppState.isReady?.()) {
+    return;
+  }
+
+  // Skip installing when wrapper is active
+  if (_wrapperActive) {
+    return;
+  }
+
+  try {
+    _deps.AppState.subscribe('undo-system', (newState, oldState) => {
+      // Runtime guard if wrapper activates later
+      if (_wrapperActive) return;
+
+      // Skip during cycle switches
+      if (_deps.AppGlobalState.isSwitchingCycles) return;
+
+      if (!_deps.AppGlobalState.isPerformingUndoRedo &&
+          getRoutines(oldState) && getRoutines(newState)) {
+        const activeCycle = getActiveRoutineId(newState);
+        if (activeCycle && getRoutine(oldState, activeCycle) && getRoutine(newState, activeCycle)) {
+          const oldCycle = getRoutine(oldState, activeCycle);
+          const newCycle = getRoutine(newState, activeCycle);
+
+          const tasksChanged = JSON.stringify(oldCycle.tasks) !== JSON.stringify(newCycle.tasks);
+          const titleChanged = oldCycle.title !== newCycle.title;
+          const settingsChanged = oldCycle.autoReset !== newCycle.autoReset ||
+                                  oldCycle.deleteCheckedTasks !== newCycle.deleteCheckedTasks;
+
+          if (tasksChanged || titleChanged || settingsChanged) {
+            captureStateSnapshot(oldState);
+          }
+        }
+      }
+    });
+  } catch (subscriptionError) {
+    console.warn('⚠️ Failed to subscribe to state changes:', subscriptionError);
+  }
+}
+
+/**
+ * Enable undo system on first user interaction
+ * Call this when user performs their first action
+ */
+export function enableUndoSystemOnFirstInteraction() {
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+
+  if (_deps.AppGlobalState.isInitializing) {
+    _deps.AppGlobalState.isInitializing = false;
+  }
+}
+
+// ============ SNAPSHOT MANAGEMENT ============
+
+/**
+ * Capture complete state snapshot with deduplication
+ */
+export function captureStateSnapshot(state) {
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+
+  // Don't capture snapshots during initial app load
+  if (_deps.AppGlobalState.isInitializing) {
+    return;
+  }
+
+  // Don't capture snapshots during cycle switches
+  if (_deps.AppGlobalState.isSwitchingCycles) {
+    return;
+  }
+
+  // Don't capture snapshots during batch operations (reset, complete all)
+  if (_deps.AppGlobalState.isResetting) {
+    return;
+  }
+
+  // Don't capture snapshots during system-driven mutations (recurring watcher
+  // recreations / wake-time catch-up). These aren't user actions — capturing them
+  // puts a system-created task at the top of the undo stack, so the user's next Undo
+  // removes the recurring task (which then silently reappears on the next tick).
+  // See docs/archive/ARCHITECTURE_REVIEW_FINDINGS.md §1.2.
+  // NOTE: the primary mechanism is now the { system: true } option on
+  // AppState.update, checked in the wrapper before this function is even
+  // called; this ambient-flag check remains as a fallback for direct callers
+  // and tests (review F-005).
+  if (_deps.AppGlobalState.isSystemMutation) {
+    return;
+  }
+
+  if (!getRoutines(state) || !getActiveRoutineId(state)) {
+    console.warn('⚠️ Invalid state for snapshot');
+    return;
+  }
+
+  const activeCycle = getActiveRoutineId(state);
+  const currentCycle = getRoutine(state, activeCycle);
+  if (!currentCycle) return;
+
+  // Safety check: Ensure we're tracking the right cycle
+  // Self-heal via onCycleSwitched — stale activeCycleIdForUndo permanently disables undo
+  if (_deps.AppGlobalState.activeCycleIdForUndo &&
+      _deps.AppGlobalState.activeCycleIdForUndo !== activeCycle) {
+    console.warn(`⚠️ Cycle mismatch: was tracking "${_deps.AppGlobalState.activeCycleIdForUndo}", correcting to "${activeCycle}"`);
+    onCycleSwitched(activeCycle).catch(() => {});
+    return;
+  }
+
+  const snapshot = {
+    activeCycleId: activeCycle,
+    tasks: structuredClone(currentCycle.tasks || []),
+    recurringTemplates: structuredClone(currentCycle.recurringTemplates || {}),
+    title: currentCycle.title || "Untitled miniCycle",
+    autoReset: currentCycle.autoReset,
+    deleteCheckedTasks: currentCycle.deleteCheckedTasks,
+    cycleCount: currentCycle.cycleCount || 0,  // ✅ Include cycle count in snapshot
+    theme: currentCycle.theme || 'classic',
+    clearedTasks: currentCycle.clearedTasks ? structuredClone(currentCycle.clearedTasks) : null,
+    // Task view drag layout is global (state.settings) but captured per
+    // snapshot so undo/redo restores the layout that was active when the
+    // snapshot was taken alongside the per-cycle data.
+    taskViewLayout: state.settings?.taskViewLayout
+      ? structuredClone(state.settings.taskViewLayout)
+      : null,
+    timestamp: Date.now()
+  };
+
+  // ✅ Build and cache signature once for reuse
+  const sig = buildSnapshotSignature(snapshot);
+  snapshot._sig = sig;  // Cache on object
+
+  const now = Date.now();
+
+  // Throttle identical snapshots
+  // Both dedup returns still refresh the buttons: the stack may already hold
+  // the entry that reverts this action (the first layout drag of a session
+  // matched the boot snapshot exactly), and nothing else re-enabled Undo.
+  if (sig === _deps.AppGlobalState.lastSnapshotSignature &&
+      now - _deps.AppGlobalState.lastSnapshotTs < UNDO_MIN_INTERVAL_MS) {
+    updateUndoRedoButtons();
+    return;
+  }
+
+  // Skip if last on stack is identical (use cached signature if available)
+  // [length - 1], not .at(-1): Array.prototype.at is es2022 and the build floor
+  // is es2020 — .at() throws TypeError on Safari <= 15.3 (validate:builtins).
+  const stack = _deps.AppGlobalState.activeUndoStack;
+  const last = stack[stack.length - 1];
+  if (last) {
+    const lastSig = last._sig || buildSnapshotSignature(last);
+    if (lastSig === sig) { updateUndoRedoButtons(); return; }
+  }
+
+  _deps.AppGlobalState.activeUndoStack.push(snapshot);
+  if (_deps.AppGlobalState.activeUndoStack.length > UNDO_LIMIT) {
+    _deps.AppGlobalState.activeUndoStack.shift();
+  }
+
+  // Update dedupe trackers
+  _deps.AppGlobalState.lastSnapshotSignature = sig;
+  _deps.AppGlobalState.lastSnapshotTs = now;
+
+  // Only clear redo stack if this is a genuine user action, not a render-triggered
+  // state update after an undo/redo operation. On mobile, async renderTasks() can
+  // trigger AppState.update() after isPerformingUndoRedo is cleared, which would
+  // wipe the redo stack. The grace period prevents this.
+  const completedAt = _deps.AppGlobalState.undoRedoCompletedAt || 0;
+  if (Date.now() - completedAt > UI_TIMEOUTS.UNDO_REDO_GRACE_PERIOD) {
+    _deps.AppGlobalState.activeRedoStack = [];
+  }
+  updateUndoRedoButtons();
+
+  // ✅ Save to IndexedDB (debounced to avoid excessive writes)
+  saveUndoStackToIndexedDB(
+    activeCycle,
+    _deps.AppGlobalState.activeUndoStack,
+    _deps.AppGlobalState.activeRedoStack
+  );
+}
+
+
+
+
+
+// ============ UNDO/REDO OPERATIONS ============
+
+/**
+ * Handle UI update after undo/redo using UIOrchestrator if available
+ * Falls back to refreshUIFromState for backward compatibility
+ * @param {Object} diff - Transaction diff from computeTransactionDiff
+ * @param {Object} newState - The new state after undo/redo
+ */
+function handleUndoRedoUIUpdate(diff, newState) {
+  const orchestrator = _deps.UIOrchestrator;
+
+  if (orchestrator?.request) {
+    // Use UIOrchestrator for smart updates
+
+    if (diff.requiresFullRender) {
+      // Full render needed
+      orchestrator.request({
+        tasks: { type: 'full' },
+        progress: true,
+        stats: true,
+        completeAllButton: true,
+        arrows: true,
+        mainMenuHeader: diff.cycleChanged
+      });
+    } else {
+      // Patch only changed tasks
+      orchestrator.request({
+        tasks: {
+          type: 'patch',
+          taskIds: diff.changedTaskIds,
+          changedFields: diff.fieldsChanged
+        },
+        progress: true,
+        stats: true,
+        completeAllButton: true
+      });
+    }
+
+    // ✅ FIX: Force synchronous flush so the render happens while
+    // isPerformingUndoRedo is still true. Without this, the deferred rAF
+    // fires after isPerformingUndoRedo is cleared, and any AppState.update()
+    // triggered during rendering captures a snapshot that clears activeRedoStack.
+    if (orchestrator.flush) {
+      orchestrator.flush();
+    }
+  } else {
+    // Fallback to refreshUIFromState
+    _deps.refreshUIFromState(newState);
+  }
+
+  // Re-organize completed tasks dropdown (handles both patch and full render paths)
+  _deps.organizeCompletedTasks?.();
+
+  // Refresh theme labels/colors if theme changed (outside UIOrchestrator scope)
+  if (diff.themeChanged) {
+    _deps.refreshThemeLabels?.();
+  }
+
+  // Refresh recurring panel if templates changed (outside UIOrchestrator scope)
+  if (diff.recurringChanged) {
+    _deps.updateRecurringPanel?.();
+  }
+
+  // Refresh history modal if cleared tasks changed
+  if (diff.clearedTasksChanged) {
+    _deps.refreshHistoryIfOpen?.();
+  }
+}
+
+/**
+ * The undo-relevant slice of a state, in snapshot shape (what captureStateSnapshot
+ * stores and buildSnapshotSignature compares).
+ * @param {Object} state - AppState data
+ * @param {{clone?: boolean}} [options] - clone: deep-copy for pushing onto a stack;
+ *   false for read-only comparison
+ * @returns {Object|null} null when the state has no active routine
+ */
+function snapshotOfState(state, { clone = true } = {}) {
+  const activeCycleId = getActiveRoutineId(state);
+  if (!activeCycleId) return null;
+  const cycle = getRoutine(state, activeCycleId);
+  const copy = clone ? (value) => structuredClone(value) : (value) => value;
+  return {
+    activeCycleId,
+    tasks: copy(cycle?.tasks || []),
+    recurringTemplates: copy(cycle?.recurringTemplates || {}),
+    title: cycle?.title,
+    autoReset: cycle?.autoReset,
+    deleteCheckedTasks: cycle?.deleteCheckedTasks,
+    cycleCount: cycle?.cycleCount || 0,
+    theme: cycle?.theme || 'classic',
+    clearedTasks: cycle?.clearedTasks ? copy(cycle.clearedTasks) : null,
+    taskViewLayout: state.settings?.taskViewLayout ? copy(state.settings.taskViewLayout) : null,
+    timestamp: Date.now()
+  };
+}
+
+/**
+ * How many entries on an undo/redo stack would actually change what is on screen.
+ *
+ * A stack can be non-empty yet hold only entries identical to the current state.
+ * Counting length alone kept the Undo button enabled after everything was undone,
+ * and the next press silently discarded the last entry with no visible change
+ * (measured Sep 2026). Falls back to the raw length when state is not readable.
+ * @param {Array} stack - activeUndoStack or activeRedoStack
+ * @returns {number}
+ */
+function countStepsThatChangeState(stack) {
+  const state = _deps.AppState?.isReady?.() ? _deps.AppState.get() : null;
+  const current = snapshotOfState(state, { clone: false });
+  if (!current) return stack.length;
+  const sig = buildSnapshotSignature(current);
+  return stack.filter(entry => (entry._sig || buildSnapshotSignature(entry)) !== sig).length;
+}
+
+/**
+ * Perform undo operation
+ */
+export async function performStateBasedUndo() {
+  assertInjected('AppState', _deps.AppState);
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+  assertInjected('refreshUIFromState', _deps.refreshUIFromState);
+
+  if (_deps.AppGlobalState.activeUndoStack.length === 0) {
+    console.warn('⚠️ Nothing to undo');
+    return;
+  }
+
+  if (!_deps.AppState.isReady?.()) {
+    console.warn('⚠️ AppState not ready');
+    return;
+  }
+
+  // Only entries identical to what is on screen: leave the stack alone. Popping them
+  // here used to discard the last undo entry with no visible change.
+  if (countStepsThatChangeState(_deps.AppGlobalState.activeUndoStack) === 0) {
+    console.warn('⚠️ Nothing to undo');
+    updateUndoRedoButtons();
+    return;
+  }
+
+  _deps.AppGlobalState.isPerformingUndoRedo = true;
+
+  // ✅ Create rollback points
+  const rollbackState = structuredClone(_deps.AppState.get());
+  const rollbackUndoStack = [..._deps.AppGlobalState.activeUndoStack];
+  const rollbackRedoStack = [..._deps.AppGlobalState.activeRedoStack];
+
+  try {
+    const currentState = _deps.AppState.get();
+    const currentActive = getActiveRoutineId(currentState);
+    const currentSnapshot = snapshotOfState(currentState);
+
+    let snap = null;
+    let skippedDuplicates = 0;
+    while (_deps.AppGlobalState.activeUndoStack.length) {
+      const candidate = _deps.AppGlobalState.activeUndoStack.pop();
+      if (!snapshotsEqual(candidate, currentSnapshot)) {
+        snap = candidate;
+        break;
+      }
+      skippedDuplicates++;
+    }
+    if (!snap) {
+      console.warn('⚠️ No valid undo snapshot found');
+      updateUndoRedoButtons();
+      return;
+    }
+
+    // Sanitize snapshot before restoring to prevent corrupted data
+    sanitizeSnapshot(snap);
+
+    // Cache signature for efficient dedup comparison later
+    currentSnapshot._sig = buildSnapshotSignature(currentSnapshot);
+    _deps.AppGlobalState.activeRedoStack.push(currentSnapshot);
+
+    // Compute transaction diff BEFORE applying state change
+    const transactionDiff = computeTransactionDiff(currentSnapshot, snap);
+    transactionDiff.kind = 'undo';
+
+    // Use non-immediate save for better UI latency (persistence via debounce)
+    // NOTE: Undo NEVER switches cycles - each routine has isolated undo history
+    await _deps.AppState.update(state => {
+      const cid = getActiveRoutineId(state);  // Always use current cycle
+      const routines = getRoutines(state);
+      const cycle = routines[cid] || (routines[cid] = {});
+      cycle.tasks = structuredClone(snap.tasks || []);
+      cycle.recurringTemplates = structuredClone(snap.recurringTemplates || {});
+      if (snap.title) cycle.title = snap.title;
+      if ('autoReset' in snap) cycle.autoReset = snap.autoReset;
+      if ('deleteCheckedTasks' in snap) cycle.deleteCheckedTasks = snap.deleteCheckedTasks;
+      if ('cycleCount' in snap) cycle.cycleCount = snap.cycleCount;  // ✅ Restore cycle count
+      if ('theme' in snap) cycle.theme = snap.theme;
+      if ('clearedTasks' in snap) cycle.clearedTasks = snap.clearedTasks ? structuredClone(snap.clearedTasks) : null;
+      // Task view layout lives in state.settings (global), restored alongside per-cycle data.
+      if ('taskViewLayout' in snap) {
+        if (!state.settings) state.settings = {};
+        state.settings.taskViewLayout = snap.taskViewLayout
+          ? structuredClone(snap.taskViewLayout)
+          : null;
+      }
+
+      // ✅ Delta-based userProgress adjustment
+      // Reverse global counters by the per-routine diff between snapshots
+      const cycleDelta = (snap.cycleCount || 0) - (currentSnapshot.cycleCount || 0);
+      if (cycleDelta !== 0 && state.userProgress) {
+        state.userProgress.cyclesCompleted = Math.max(0,
+          (state.userProgress.cyclesCompleted || 0) + cycleDelta);
+      }
+      const clearedDelta = (snap.clearedTasks?.totalCleared || 0) - (currentSnapshot.clearedTasks?.totalCleared || 0);
+      if (clearedDelta !== 0 && state.userProgress) {
+        state.userProgress.totalTasksCompleted = Math.max(0,
+          (state.userProgress.totalTasksCompleted || 0) + clearedDelta);
+      }
+    }, false);
+
+    // Log undo as a history event
+    _deps.logHistoryEvent?.('undo', { description: transactionDiff.description || 'Undo' });
+
+    // Use UIOrchestrator if available, otherwise fall back to refreshUIFromState
+    handleUndoRedoUIUpdate(transactionDiff, _deps.AppState.get());
+
+    // Refresh peripheral UI elements that aren't covered by UIOrchestrator
+    _deps.refreshHistoryIfOpen?.();
+    _deps.updateRecurringInfoLink?.();
+    _deps.updateHelpWindow?.();
+    _deps.syncModeFromToggles?.();
+    // Reconcile drag positions so the visible task-view layout follows the
+    // restored state.settings.taskViewLayout.positions map.
+    _deps.refreshTaskViewLayout?.();
+
+    updateUndoRedoButtons();
+
+    // ✅ Save updated stacks to IndexedDB (async, doesn't block UI)
+    // Use current cycle (undo never switches cycles)
+    const activeAfterUndo = currentActive;
+    if (activeAfterUndo) {
+      saveUndoStackToIndexedDB(
+        activeAfterUndo,
+        _deps.AppGlobalState.activeUndoStack,
+        _deps.AppGlobalState.activeRedoStack
+      );
+    }
+
+    // ✅ Schedule idle-time save for durability (doesn't block input)
+    scheduleIdleSave();
+
+    // ✅ Show success notification
+    if (_deps.showNotification) {
+      const changeDesc = transactionDiff.description;
+      const stepsLeft = countStepsThatChangeState(_deps.AppGlobalState.activeUndoStack);
+      const stepsText = stepsLeft === 0 ? getLabel('notify.stepsLeftNone') :
+                        stepsLeft === 1 ? getLabel('notify.stepsLeftOne') :
+                        getLabel('notify.stepsLeftMany', { vars: { count: stepsLeft } });
+      _deps.showNotification('↩️ ' + getLabel('notify.undoAction', { vars: { description: changeDesc, steps: stepsText } }), 'success', UI_TIMEOUTS.NOTIFICATION_SHORT);
+    }
+
+    // Clear dedup trackers so the next user-initiated change is always captured
+    _deps.AppGlobalState.lastSnapshotSignature = null;
+    _deps.AppGlobalState.lastSnapshotTs = 0;
+
+  } catch (e) {
+    console.error('❌ Undo failed, rolling back:', e);
+
+    // ✅ Rollback on failure
+    try {
+      // Restore through update() — the sanctioned single door (ADR-003).
+      // NOTE: this previously called AppState.set(), which DOES NOT EXIST on
+      // StateManager — the TypeError was swallowed by the catch below, so the
+      // whole rollback path (state restore, stacks, toast) was silently dead.
+      await restoreFullState(rollbackState);
+      _deps.AppGlobalState.activeUndoStack = rollbackUndoStack;
+      _deps.AppGlobalState.activeRedoStack = rollbackRedoStack;
+
+      // Repaint from the restored state — restoring AppState alone does NOT
+      // redraw the DOM, so without this the screen keeps showing the
+      // half-applied state while the data is already correct (the exact
+      // trust-killer for an undo feature). Full render: after a partial apply
+      // we can't know which tasks changed, so no patch diff is possible.
+      // Runs while isPerformingUndoRedo is still true (finally clears it),
+      // same flush-window rule as the success path.
+      handleUndoRedoUIUpdate({ requiresFullRender: true, cycleChanged: true }, _deps.AppState.get());
+
+      updateUndoRedoButtons();
+
+      if (_deps.showNotification) {
+        _deps.showNotification('⚠️ ' + getLabel('notify.undoFailed'), 'error', UI_TIMEOUTS.NOTIFICATION_LONG);
+      }
+    } catch (rollbackError) {
+      console.error('❌ Rollback also failed:', rollbackError);
+    }
+
+    throw e; // Re-throw so caller knows it failed
+  } finally {
+    _deps.AppGlobalState.isPerformingUndoRedo = false;
+    // Grace period: prevent async render-triggered AppState.update() calls
+    // from clearing the redo stack after undo completes (especially on mobile
+    // where renderTasks() is async and continues after this flag is cleared)
+    _deps.AppGlobalState.undoRedoCompletedAt = Date.now();
+  }
+}
+
+/**
+ * Restore a full state snapshot through AppState.update() (ADR-003: every
+ * change goes through the one door — there is no AppState.set()). Replaces
+ * all top-level keys of the draft with a deep copy of the snapshot.
+ * @param {Object} snapshot - structuredClone of a prior full state
+ */
+async function restoreFullState(snapshot) {
+  const restored = structuredClone(snapshot);
+  await _deps.AppState.update(state => {
+    Object.keys(state).forEach(k => delete state[k]);
+    Object.assign(state, restored);
+  }, false);
+}
+
+/**
+ * Perform redo operation
+ */
+export async function performStateBasedRedo() {
+  assertInjected('AppState', _deps.AppState);
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+  assertInjected('refreshUIFromState', _deps.refreshUIFromState);
+
+  if (_deps.AppGlobalState.activeRedoStack.length === 0) {
+    console.warn('⚠️ Nothing to redo');
+    return;
+  }
+
+  if (!_deps.AppState.isReady?.()) {
+    console.warn('⚠️ AppState not ready');
+    return;
+  }
+
+  // Same rule as undo: nothing that differs from the screen means nothing to redo.
+  if (countStepsThatChangeState(_deps.AppGlobalState.activeRedoStack) === 0) {
+    console.warn('⚠️ Nothing to redo');
+    updateUndoRedoButtons();
+    return;
+  }
+
+  _deps.AppGlobalState.isPerformingUndoRedo = true;
+
+  // ✅ Create rollback points
+  const rollbackState = structuredClone(_deps.AppState.get());
+  const rollbackUndoStack = [..._deps.AppGlobalState.activeUndoStack];
+  const rollbackRedoStack = [..._deps.AppGlobalState.activeRedoStack];
+
+  try {
+    const currentState = _deps.AppState.get();
+    const currentActive = getActiveRoutineId(currentState);
+    const currentSnapshot = snapshotOfState(currentState);
+
+    let snap = null;
+    let skippedDuplicates = 0;
+    while (_deps.AppGlobalState.activeRedoStack.length) {
+      const candidate = _deps.AppGlobalState.activeRedoStack.pop();
+      if (!snapshotsEqual(candidate, currentSnapshot)) {
+        snap = candidate;
+        break;
+      }
+      skippedDuplicates++;
+    }
+    if (!snap) {
+      console.warn('⚠️ No valid redo snapshot found');
+      updateUndoRedoButtons();
+      return;
+    }
+
+    // Sanitize snapshot before restoring to prevent corrupted data
+    sanitizeSnapshot(snap);
+
+    // Cache signature for efficient dedup comparison later
+    currentSnapshot._sig = buildSnapshotSignature(currentSnapshot);
+    _deps.AppGlobalState.activeUndoStack.push(currentSnapshot);
+
+    // Compute transaction diff BEFORE applying state change
+    const transactionDiff = computeTransactionDiff(currentSnapshot, snap);
+    transactionDiff.kind = 'redo';
+
+    // Use non-immediate save for better UI latency (persistence via debounce)
+    // NOTE: Redo NEVER switches cycles - each routine has isolated undo history
+    await _deps.AppState.update(state => {
+      const cid = getActiveRoutineId(state);  // Always use current cycle
+      const routines = getRoutines(state);
+      const cycle = routines[cid] || (routines[cid] = {});
+      cycle.tasks = structuredClone(snap.tasks || []);
+      cycle.recurringTemplates = structuredClone(snap.recurringTemplates || {});
+      if (snap.title) cycle.title = snap.title;
+      if ('autoReset' in snap) cycle.autoReset = snap.autoReset;
+      if ('deleteCheckedTasks' in snap) cycle.deleteCheckedTasks = snap.deleteCheckedTasks;
+      if ('cycleCount' in snap) cycle.cycleCount = snap.cycleCount;  // ✅ Restore cycle count
+      if ('theme' in snap) cycle.theme = snap.theme;
+      if ('clearedTasks' in snap) cycle.clearedTasks = snap.clearedTasks ? structuredClone(snap.clearedTasks) : null;
+      // Task view layout lives in state.settings (global), restored alongside per-cycle data.
+      if ('taskViewLayout' in snap) {
+        if (!state.settings) state.settings = {};
+        state.settings.taskViewLayout = snap.taskViewLayout
+          ? structuredClone(snap.taskViewLayout)
+          : null;
+      }
+
+      // ✅ Delta-based userProgress adjustment
+      // Restore global counters by the per-routine diff between snapshots
+      const cycleDelta = (snap.cycleCount || 0) - (currentSnapshot.cycleCount || 0);
+      if (cycleDelta !== 0 && state.userProgress) {
+        state.userProgress.cyclesCompleted = Math.max(0,
+          (state.userProgress.cyclesCompleted || 0) + cycleDelta);
+      }
+      const clearedDelta = (snap.clearedTasks?.totalCleared || 0) - (currentSnapshot.clearedTasks?.totalCleared || 0);
+      if (clearedDelta !== 0 && state.userProgress) {
+        state.userProgress.totalTasksCompleted = Math.max(0,
+          (state.userProgress.totalTasksCompleted || 0) + clearedDelta);
+      }
+    }, false);
+
+    // Log redo as a history event
+    _deps.logHistoryEvent?.('redo', { description: transactionDiff.description || 'Redo' });
+
+    // Use UIOrchestrator if available, otherwise fall back to refreshUIFromState
+    handleUndoRedoUIUpdate(transactionDiff, _deps.AppState.get());
+
+    // Refresh peripheral UI elements that aren't covered by UIOrchestrator
+    _deps.refreshHistoryIfOpen?.();
+    _deps.updateRecurringInfoLink?.();
+    _deps.updateHelpWindow?.();
+    _deps.syncModeFromToggles?.();
+    // Reconcile drag positions so the visible task-view layout follows the
+    // restored state.settings.taskViewLayout.positions map.
+    _deps.refreshTaskViewLayout?.();
+
+    updateUndoRedoButtons();
+
+    // ✅ Save updated stacks to IndexedDB (async, doesn't block UI)
+    // Use current cycle (redo never switches cycles)
+    const activeAfterRedo = currentActive;
+    if (activeAfterRedo) {
+      saveUndoStackToIndexedDB(
+        activeAfterRedo,
+        _deps.AppGlobalState.activeUndoStack,
+        _deps.AppGlobalState.activeRedoStack
+      );
+    }
+
+    // ✅ Schedule idle-time save for durability (doesn't block input)
+    scheduleIdleSave();
+
+    // ✅ Show success notification
+    if (_deps.showNotification) {
+      const changeDesc = transactionDiff.description;
+      const stepsLeft = countStepsThatChangeState(_deps.AppGlobalState.activeRedoStack);
+      const stepsText = stepsLeft === 0 ? getLabel('notify.stepsLeftNone') :
+                        stepsLeft === 1 ? getLabel('notify.stepsLeftOne') :
+                        getLabel('notify.stepsLeftMany', { vars: { count: stepsLeft } });
+      _deps.showNotification('↪️ ' + getLabel('notify.redoAction', { vars: { description: changeDesc, steps: stepsText } }), 'success', UI_TIMEOUTS.NOTIFICATION_SHORT);
+    }
+
+    // Clear dedup trackers so the next user-initiated change is always captured
+    _deps.AppGlobalState.lastSnapshotSignature = null;
+    _deps.AppGlobalState.lastSnapshotTs = 0;
+
+  } catch (e) {
+    console.error('❌ Redo failed, rolling back:', e);
+
+    // ✅ Rollback on failure
+    try {
+      // Restore through update() — same fix as the undo catch (AppState.set()
+      // never existed; the old call died as a swallowed TypeError).
+      await restoreFullState(rollbackState);
+      _deps.AppGlobalState.activeUndoStack = rollbackUndoStack;
+      _deps.AppGlobalState.activeRedoStack = rollbackRedoStack;
+
+      // Repaint from the restored state — same reasoning as the undo catch:
+      // restoring state alone doesn't redraw, and a failed partial apply means
+      // only a full render is safe. Symmetric fix; keep both in sync.
+      handleUndoRedoUIUpdate({ requiresFullRender: true, cycleChanged: true }, _deps.AppState.get());
+
+      updateUndoRedoButtons();
+
+      if (_deps.showNotification) {
+        _deps.showNotification('⚠️ ' + getLabel('notify.redoFailed'), 'error', UI_TIMEOUTS.NOTIFICATION_LONG);
+      }
+    } catch (rollbackError) {
+      console.error('❌ Rollback also failed:', rollbackError);
+    }
+
+    throw e; // Re-throw so caller knows it failed
+  } finally {
+    _deps.AppGlobalState.isPerformingUndoRedo = false;
+    // Grace period: prevent async render-triggered AppState.update() calls
+    // from clearing the undo stack after redo completes
+    _deps.AppGlobalState.undoRedoCompletedAt = Date.now();
+  }
+}
+
+// ============ UI UPDATES ============
+
+/**
+ * Update undo/redo button enabled/disabled states
+ */
+export function updateUndoRedoButtonStates() {
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+
+  const undoBtn = _deps.getElementById(DOM_IDS.UNDO_BTN);
+  const redoBtn = _deps.getElementById(DOM_IDS.REDO_BTN);
+
+  // Use actual stack lengths (instant with localStorage cache)
+  const hasUndo = countStepsThatChangeState(_deps.AppGlobalState.activeUndoStack) > 0;
+  const hasRedo = countStepsThatChangeState(_deps.AppGlobalState.activeRedoStack) > 0;
+
+  if (undoBtn) {
+    undoBtn.disabled = !hasUndo;
+    undoBtn.style.opacity = undoBtn.disabled ? '0.5' : '1';
+  }
+  if (redoBtn) {
+    redoBtn.disabled = !hasRedo;
+    redoBtn.style.opacity = redoBtn.disabled ? '0.5' : '1';
+  }
+}
+
+/**
+ * Update undo/redo button visibility
+ */
+export function updateUndoRedoButtonVisibility() {
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+
+  const undoBtn = _deps.getElementById(DOM_IDS.UNDO_BTN);
+  const redoBtn = _deps.getElementById(DOM_IDS.REDO_BTN);
+
+  // Use actual stack lengths (instant with localStorage cache)
+  const hasUndo = countStepsThatChangeState(_deps.AppGlobalState.activeUndoStack) > 0;
+  const hasRedo = countStepsThatChangeState(_deps.AppGlobalState.activeRedoStack) > 0;
+
+  if (undoBtn) undoBtn.hidden = !hasUndo;
+  if (redoBtn) redoBtn.hidden = !hasRedo;
+}
+
+/**
+ * Update undo/redo button states and visibility (convenience wrapper)
+ */
+export function updateUndoRedoButtons() {
+  updateUndoRedoButtonStates();
+  updateUndoRedoButtonVisibility();
+}
+
+// ============ CYCLE LIFECYCLE INTEGRATION ============
+
+/**
+ * Handle cycle switch - save current, load new
+ * Called by cycleSwitcher when user switches cycles
+ */
+export async function onCycleSwitched(newCycleId) {
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+
+  const oldCycleId = _deps.AppGlobalState.activeCycleIdForUndo;
+
+  if (oldCycleId === newCycleId) {
+    return;
+  }
+
+  // ✅ Set flag to block snapshot capture during transition
+  _deps.AppGlobalState.isSwitchingCycles = true;
+
+  try {
+    // 1. Save OLD cycle's stacks to IndexedDB (skip cache)
+    if (oldCycleId && _deps.AppGlobalState.activeUndoStack.length > 0) {
+      saveUndoStackToIndexedDB(
+        oldCycleId,
+        _deps.AppGlobalState.activeUndoStack,
+        _deps.AppGlobalState.activeRedoStack,
+        { skipCache: true }
+      );
+    }
+
+    // 2. Clear everything FIRST - undo stack, active ID, and cache
+    _deps.AppGlobalState.activeUndoStack = [];
+    _deps.AppGlobalState.activeRedoStack = [];
+    _deps.AppGlobalState.activeCycleIdForUndo = null;
+    clearUndoCache();
+
+    // 3. Load new cycle's stacks from IndexedDB
+    const loaded = await loadUndoStackFromIndexedDB(newCycleId);
+
+    // 4. Validate loaded data (wait for validation to complete)
+    const validUndoStack = filterValidSnapshots(loaded.undoStack || [], newCycleId);
+    const validRedoStack = filterValidSnapshots(loaded.redoStack || [], newCycleId);
+
+    // 5. NOW set the active ID and populate stacks (after validation)
+    _deps.AppGlobalState.activeCycleIdForUndo = newCycleId;
+    _deps.AppGlobalState.activeUndoStack = validUndoStack;
+    _deps.AppGlobalState.activeRedoStack = validRedoStack;
+
+    // 6. Save validated data to cache for instant boot
+    saveToUndoCache(newCycleId, validUndoStack, validRedoStack);
+
+    // 7. Update UI
+    updateUndoRedoButtons();
+
+    // ✅ Small delay to let cycle fully load before re-enabling snapshots
+    await new Promise(resolve => setTimeout(resolve, UI_TIMEOUTS.CYCLE_SWITCH_TRANSITION));
+  } catch (e) {
+    console.error('❌ Cycle switch failed:', e);
+
+    // On error: clear everything and start fresh for new cycle
+    _deps.AppGlobalState.activeUndoStack = [];
+    _deps.AppGlobalState.activeRedoStack = [];
+    _deps.AppGlobalState.activeCycleIdForUndo = newCycleId;
+    clearUndoCache();
+    updateUndoRedoButtons();
+
+    if (_deps.showNotification) {
+      _deps.showNotification('⚠️ ' + getLabel('notify.undoHistoryUnavailableCycle'), 'warning', UI_TIMEOUTS.NOTIFICATION_LONG);
+    }
+  } finally {
+    // ✅ Always clear the flag, even on error
+    _deps.AppGlobalState.isSwitchingCycles = false;
+  }
+}
+
+/**
+ * Handle cycle creation - initialize empty stacks
+ * Called by cycleManager when new cycle is created
+ */
+export async function onCycleCreated(cycleId) {
+
+  try {
+    // Initialize empty stacks in IndexedDB (also updates cache)
+    await saveUndoStackToIndexedDB(cycleId, [], []);
+
+    // Set as active cycle for undo and clear in-memory stacks
+    // (newly created cycles immediately become active)
+    _deps.AppGlobalState.activeCycleIdForUndo = cycleId;
+    _deps.AppGlobalState.activeUndoStack = [];
+    _deps.AppGlobalState.activeRedoStack = [];
+    updateUndoRedoButtons();
+  } catch (e) {
+    // Error boundary for cycle creation
+    console.error('❌ Failed to initialize undo stack for new cycle:', e);
+
+    // Still set up empty stacks in memory even if IndexedDB fails
+    _deps.AppGlobalState.activeCycleIdForUndo = cycleId;
+    _deps.AppGlobalState.activeUndoStack = [];
+    _deps.AppGlobalState.activeRedoStack = [];
+    updateUndoRedoButtons();
+
+    // Don't notify user - this is an internal operation
+  }
+}
+
+/**
+ * Handle cycle deletion - cleanup IndexedDB and cache
+ * Called by cycleManager when cycle is deleted
+ */
+export async function onCycleDeleted(cycleId) {
+
+  try {
+    // Cancel any pending debounced write FIRST — otherwise it fires after the
+    // delete below and recreates the record we just removed (orphaned history).
+    cancelPendingDbWrite(cycleId);
+
+    // Remove from IndexedDB
+    await deleteUndoStackFromIndexedDB(cycleId);
+
+    // If this was the active cycle, clear memory and cache
+    if (_deps.AppGlobalState.activeCycleIdForUndo === cycleId) {
+      _deps.AppGlobalState.activeUndoStack = [];
+      _deps.AppGlobalState.activeRedoStack = [];
+      _deps.AppGlobalState.activeCycleIdForUndo = null;
+      clearUndoCache(); // Clear localStorage cache
+      updateUndoRedoButtons();
+    }
+  } catch (e) {
+    // Error boundary for cycle deletion
+    console.error('❌ Failed to delete undo stack:', e);
+
+    // Still clean up memory even if IndexedDB fails
+    if (_deps.AppGlobalState.activeCycleIdForUndo === cycleId) {
+      _deps.AppGlobalState.activeUndoStack = [];
+      _deps.AppGlobalState.activeRedoStack = [];
+      _deps.AppGlobalState.activeCycleIdForUndo = null;
+      clearUndoCache(); // Clear localStorage cache
+      updateUndoRedoButtons();
+    }
+
+    // Don't notify user - this is an internal cleanup operation
+  }
+}
+
+/**
+ * Handle cycle rename - migrate IndexedDB entry
+ * Called by cycleSwitcher when cycle is renamed
+ */
+export async function onCycleRenamed(oldCycleId, newCycleId) {
+  // Update in-memory tracking AND relabel the live stacks FIRST, before any
+  // await — they hold the same stale-id snapshots the IDB migration rewrites.
+  // This used to run only after the IndexedDB round-trip; a capture landing in
+  // that window (any AppState.update from a subscriber) saw a tracked id that
+  // no longer existed and self-healed by wiping the stacks. The update wrapper
+  // now relabels during the rename producer itself (relabelOnRekey), so by the
+  // time this runs the ids usually already match; this is the fallback for
+  // callers whose rename did not go through the wrapper.
+  if (_deps.AppGlobalState.activeCycleIdForUndo === oldCycleId) {
+    _deps.AppGlobalState.activeCycleIdForUndo = newCycleId;
+    _deps.AppGlobalState.activeUndoStack =
+      relabelSnapshotsForCycle(_deps.AppGlobalState.activeUndoStack, newCycleId);
+    _deps.AppGlobalState.activeRedoStack =
+      relabelSnapshotsForCycle(_deps.AppGlobalState.activeRedoStack, newCycleId);
+  }
+
+  try {
+    // Cancel any pending write for the OLD id first — otherwise it fires after
+    // the migration below and recreates a stale record under the old name.
+    cancelPendingDbWrite(oldCycleId);
+
+    // Migrate in IndexedDB
+    await renameUndoStackInIndexedDB(oldCycleId, newCycleId);
+  } catch (e) {
+    // Error boundary for cycle rename — memory is already consistent above.
+    console.error('❌ Failed to rename undo stack:', e);
+    // Don't notify user - this is an internal operation
+  }
+}
+
+/**
+ * Initialize undo system for app startup
+ * Uses localStorage cache for instant boot, IndexedDB loads in background for cycle switching
+ */
+export async function initUndoSystemForApp() {
+  assertInjected('AppState', _deps.AppState);
+  assertInjected('AppGlobalState', _deps.AppGlobalState);
+
+  try {
+    // 1. Always initialize IndexedDB (even if no active cycle yet — first-time users
+    //    complete onboarding later, and cycle lifecycle hooks need the DB ready)
+    const dbReady = initUndoIndexedDB();
+
+    // 2. Get current active cycle
+    const currentState = _deps.AppState.get();
+    const activeCycleId = getActiveRoutineId(currentState);
+
+    // A stored-shape migration this boot (2.5 -> 2.6) invalidates every
+    // persisted snapshot: they carry the old task fields and are keyed by the
+    // old routine names. Clearing is the decided answer (SCHEMA_2_6_PLAN.md,
+    // Risks) — far simpler than migrating snapshots, and losing undo across a
+    // version bump is acceptable.
+    if (_deps.AppState.migratedThisBoot) {
+      await dbReady;
+      await clearAllUndoHistory();
+      console.warn('🧹 Undo history cleared after the stored-data migration');
+    }
+
+    if (!activeCycleId) {
+      // Normal for first-time users — onboarding hasn't completed yet
+      return;
+    }
+
+    // 3. Try localStorage cache first (sync, instant!)
+    const cached = loadFromUndoCache(activeCycleId);
+    if (cached) {
+      // Cache hit! Populate stacks instantly
+      _deps.AppGlobalState.activeUndoStack = cached.undoStack;
+      _deps.AppGlobalState.activeRedoStack = cached.redoStack;
+      _deps.AppGlobalState.activeCycleIdForUndo = activeCycleId;
+      updateUndoRedoButtons();
+    } else {
+      // Cache miss - will load from IndexedDB
+      _deps.AppGlobalState.activeUndoStack = [];
+      _deps.AppGlobalState.activeRedoStack = [];
+      _deps.AppGlobalState.activeCycleIdForUndo = activeCycleId;
+    }
+
+    // 4. After IndexedDB is ready, load stacks if cache missed
+    dbReady.then(async () => {
+      if (!cached) {
+        const loaded = await loadUndoStackFromIndexedDB(activeCycleId);
+        // Filter like every other load path — this was the one unfiltered
+        // entry point, where stale-id snapshots (e.g. from a pre-fix rename)
+        // survived into the live stacks and could restore a stale title.
+        _deps.AppGlobalState.activeUndoStack = filterValidSnapshots(loaded.undoStack || [], activeCycleId);
+        _deps.AppGlobalState.activeRedoStack = filterValidSnapshots(loaded.redoStack || [], activeCycleId);
+        updateUndoRedoButtons();
+
+        // Update cache for next boot
+        saveToUndoCache(activeCycleId, loaded.undoStack || [], loaded.redoStack || []);
+      }
+    }).catch(e => {
+      console.warn('⚠️ IndexedDB background init failed:', e);
+    });
+
+    // 4. Update UI with whatever we have so far
+    updateUndoRedoButtons();
+
+    // 5. Set up page unload handler to force immediate save. Store the reference
+    //    and drop any prior one first so re-init (boot retry) can't stack handlers.
+    //    beforeunload alone is unreliable on iOS — frequently NOT fired when the
+    //    app is backgrounded or swiped away — so also flush on pagehide and on
+    //    visibilitychange→hidden, the events that DO fire there. Same trio
+    //    appState uses for its debounced-save flush. The handler is idempotent
+    //    (timers cleared, cache overwritten with same data), so firing on both
+    //    hidden and unload is safe.
+    if (_beforeunloadHandler) {
+      window.removeEventListener('beforeunload', _beforeunloadHandler);
+      window.removeEventListener('pagehide', _beforeunloadHandler);
+    }
+    if (_visibilityFlushHandler) {
+      document.removeEventListener('visibilitychange', _visibilityFlushHandler);
+    }
+    _beforeunloadHandler = () => {
+      // Flush EVERY pending debounced write (not just the active cycle's) so a
+      // fast switch-then-close can't drop a scheduled write, then force-save the
+      // active cycle. Both live in undoIndexedDB.js, which owns the connection.
+      flushPendingWritesSync();
+
+      const cycleId = _deps.AppGlobalState.activeCycleIdForUndo;
+      const undoStack = _deps.AppGlobalState.activeUndoStack || [];
+      const redoStack = _deps.AppGlobalState.activeRedoStack || [];
+
+      // Always save to cache on unload (instant for next boot)
+      saveToUndoCache(cycleId, undoStack, redoStack);
+      forceSaveStackSync(cycleId, undoStack, redoStack);
+    };
+    _visibilityFlushHandler = () => {
+      if (document.visibilityState === 'hidden') _beforeunloadHandler?.();
+    };
+    window.addEventListener('beforeunload', _beforeunloadHandler);
+    window.addEventListener('pagehide', _beforeunloadHandler);
+    document.addEventListener('visibilitychange', _visibilityFlushHandler);
+
+  } catch (e) {
+    // Error boundary for undo system initialization
+    console.error('❌ Undo system initialization failed:', e);
+
+    // Initialize with empty stacks to ensure app still works
+    _deps.AppGlobalState.activeUndoStack = [];
+    _deps.AppGlobalState.activeRedoStack = [];
+    updateUndoRedoButtons();
+
+    if (_deps.showNotification) {
+      _deps.showNotification('⚠️ ' + getLabel('notify.undoHistoryUnavailable'), 'warning', UI_TIMEOUTS.NOTIFICATION_LONG);
+    }
+  }
+}
+
+// ============ INDEXEDDB PERSISTENCE ============
+
+
+// Per-cycle debounced IndexedDB write timers, keyed by cycleId.
+// A SINGLE shared timer used to let a save for one cycle cancel another cycle's
+// pending write (clearTimeout on every call) — dropping the other cycle's undo
+// history on a fast switch, and letting a late write resurrect a deleted/renamed
+// record. Keying by cycleId keeps cycles independent. Each entry also carries the
+// call-time array snapshots so beforeunload can flush every pending write.
+// Map<cycleId, { timer:number, undoSnap:Array, redoSnap:Array }>
+
+
+
+
+
+
+
+
+
+/**
+ * Clear ALL undo/redo history: in-memory stacks, localStorage cache, and IndexedDB.
+ * Called by the Settings "Clear Undo History" button.
+ *
+ * Sets isPerformingUndoRedo guard so any AppState.update() calls that follow
+ * don't immediately recapture a new snapshot
+ * and repopulate the cache we just cleared.
+ */
+export async function clearAllUndoHistory() {
+  // 1. Cancel ALL pending debounced IndexedDB writes that would re-save old data
+  cancelAllPendingWrites();
+
+  // 2. Guard against snapshot recapture during cleanup
+  if (_deps.AppGlobalState) {
+    _deps.AppGlobalState.isPerformingUndoRedo = true;
+    _deps.AppGlobalState.activeUndoStack = [];
+    _deps.AppGlobalState.activeRedoStack = [];
+    // Reset dedup trackers so next real user action gets captured fresh
+    _deps.AppGlobalState.lastSnapshotSignature = null;
+    _deps.AppGlobalState.lastSnapshotTs = 0;
+  }
+
+  // 3. Clear persistent storage
+  clearUndoCache();
+  await clearAllUndoHistoryFromIndexedDB();
+
+  // 4. Update button states
+  updateUndoRedoButtons();
+
+  // 5. Release guard after a macrotask so caller's synchronous AppState.update()
+  //    doesn't recapture a snapshot
+  if (_deps.AppGlobalState) {
+    setTimeout(() => {
+      _deps.AppGlobalState.isPerformingUndoRedo = false;
+    }, 0);
+  }
+
+}
+
+/**
+ * Clean up listeners and reset state for boot retry.
+ */
+function destroyUndoRedoManager() {
+  if (_handleUndoRedoKeydown) {
+    document.removeEventListener('keydown', _handleUndoRedoKeydown);
+    _handleUndoRedoKeydown = null;
+  }
+  // Remove the unload handlers so retries don't stack listeners (and a torn-down
+  // instance can't still write history on unload).
+  if (_beforeunloadHandler) {
+    window.removeEventListener('beforeunload', _beforeunloadHandler);
+    window.removeEventListener('pagehide', _beforeunloadHandler);
+    _beforeunloadHandler = null;
+  }
+  if (_visibilityFlushHandler) {
+    document.removeEventListener('visibilitychange', _visibilityFlushHandler);
+    _visibilityFlushHandler = null;
+  }
+  // Cancel any pending debounced writes so they don't fire after teardown.
+  cancelAllPendingWrites();
+  _initialized.undoRedoUI = false;
+  _initialized.undoRedoKeyboard = false;
+}
+
+// ============ INIT FUNCTION (for moduleLoader) ============
+
+/**
+ * Initialize UndoRedoManager (called by moduleLoader)
+ * @param {Object} dependencies - Injected dependencies
+ * @returns {Object} Module exports for registration
+ */
+export async function initUndoRedoManager(dependencies = {}) {
+  // Set dependencies
+  setUndoRedoManagerDependencies(dependencies);
+
+  // Wrap AppState for undo tracking (if appInit is available)
+  if (dependencies.appInit) {
+    wrapAppStateForUndo(dependencies.appInit);
+  }
+
+  // Wire up undo/redo button event listeners
+  wireUndoRedoUI();
+
+  // NOTE: Global keyboard shortcuts (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z) are owned by
+  // uiBoot.attachGlobalEventListeners → handleGlobalKeydown, which drives undo/redo
+  // through the public appContext undo API (getUndoApi().undo/redo). Do NOT also call
+  // wireUndoRedoKeyboardShortcuts() here — a second document-level keydown listener
+  // makes every shortcut fire undo/redo TWICE (see run-journey-tests undo/redo journey).
+
+  // Setup state-based undo/redo system
+  setupStateBasedUndoRedo();
+
+  // Initialize undo system for the app
+  await initUndoSystemForApp();
+
+  // Return exports for registration
+  return {
+    performStateBasedUndo,
+    performStateBasedRedo,
+    captureStateSnapshot,
+    updateUndoRedoButtons,
+    enableUndoSystemOnFirstInteraction,
+    wireUndoRedoUI,
+    wireUndoRedoKeyboardShortcuts,
+    wrapAppStateForUndo,
+    setupStateBasedUndoRedo,
+    initUndoSystemForApp,
+    // Cycle lifecycle hooks
+    onCycleCreated,
+    onCycleSwitched,
+    onCycleDeleted,
+    onCycleRenamed,
+    // Cache helpers
+    clearUndoCache,
+    clearAllUndoHistory,
+    closeUndoIndexedDB,
+    initUndoIndexedDB,
+    // Cleanup
+    destroy: destroyUndoRedoManager
+  };
+}
+
+// ============ EXPORTS ============
+

@@ -1,0 +1,2522 @@
+#!/bin/bash
+# update-version.sh - Enhanced Interactive Version Updater for miniCycle
+# Version: 5.5 - Added automatic CSP hash verification/update (Mar 2026)
+#
+# Features:
+#  - Generates version.js as single source of truth (using globalThis)
+#  - Auto-updates docs/PROJECT_STATS.md with new version
+#  - Multi-mode: Update all, one-by-one, or custom selection
+#  - Automatic backup with restore scripts
+#  - macOS and Linux compatible
+#  - Debug markers derive from globalThis.APP_VERSION at runtime (no script updates)
+#  - Git tag automation with optional remote push
+#  - --auto flag for fully automated sequential version bumps
+#  - --changelog flag for auto-generated changelog from git commits
+#  - --lite flag for optional lite version updates
+#  - --lite-only flag for updating ONLY the lite version (independent of main app)
+#  - --dry-run flag to preview changes without writing
+#  - --samples flag to regenerate sample routine manifest from .mcyc files
+#  - --chrome flag to rebuild the Chrome (full) extension into chrome/full/
+#  - --android flag to rebuild the Capacitor web payload + sync the native version
+#  - --android-run flag to also build the debug APK and install/launch it on a device
+#  - --ios flag to rebuild the iOS Capacitor payload + sync MARKETING_VERSION/build number
+#  - --desktop flag to rebuild the Electron payload + sync desktop/package.json; --desktop-dist smoke-boots + builds installers
+#  - Automatic CSP hash verification — detects new/changed inline scripts and updates netlify.toml
+
+# ============================================
+# INSTRUCTIONS & DOCUMENTATION
+# ============================================
+#
+# 🚀 HOW TO USE THIS SCRIPT:
+#
+# 1️⃣ First time setup (make it executable):
+#    chmod +x scripts/update-version.sh
+#
+# 2️⃣ Run from web/ directory:
+#    ./scripts/update-version.sh
+#
+# 3️⃣ Follow the prompts to enter new version numbers
+#
+# 🤖 AUTO MODE:
+#    ./scripts/update-version.sh --auto          # Auto-bump versions, no prompts
+#    ./scripts/update-version.sh --auto --tag    # Auto-bump + create git tag
+#    ./scripts/update-version.sh -a -p           # Auto-bump + tag + push to remote
+#    ./scripts/update-version.sh --auto -c       # Auto-bump + update changelog
+#
+# Auto mode:
+# • Increments app version by 0.001 (e.g., 1.738 → 1.739)
+# • Increments SW cache version by 1 (e.g., v271 → v272)
+# • Updates all files automatically
+# • Skips all confirmation prompts
+# • Use --tag to auto-create git tag
+# • Use --push to auto-push tag to remote
+# • Use --changelog to auto-generate changelog from git commits
+#
+# 📱 LITE-ONLY MODE (v5.2+):
+#    ./scripts/update-version.sh --lite-only         # Update only lite version (interactive)
+#    ./scripts/update-version.sh --lite-only --auto  # Auto-bump lite version only
+#    ./scripts/update-version.sh --lite-only -n      # Dry run lite-only update
+#
+# Lite-only mode:
+# • Updates ONLY the lite version files (independent of main app)
+# • Skips version.js, main CSS, main manifests, package.json
+# • Reads current version from lite/miniCycle-lite.html
+# • Useful for frozen lite version updates without touching main app
+#
+# 🔍 DRY RUN MODE:
+#    ./scripts/update-version.sh --dry-run       # Preview changes without writing
+#    ./scripts/update-version.sh --auto -n       # Auto-bump dry run
+#
+# 📝 PLATFORM NOTES:
+# • macOS: Uses sed -i "" (empty string after -i) ✅ Already handled
+# • Linux: Uses sed -i (no quotes) ✅ Already handled
+# • Windows: Use Git Bash or WSL ✅ Cross-platform compatible
+#
+# 🛡️ SAFETY FEATURES:
+# • ✅ Automatic backups created in backup/ folder with timestamps
+# • ✅ Auto-generated restore.sh script in each backup folder
+# • ✅ Automatic cleanup of old backups (keeps only newest 3)
+# • ✅ No manual backups needed - script handles everything!
+# • ✅ Validation stage checks that files updated correctly
+#
+# 🏷️ GIT TAG AUTOMATION:
+# • ✅ Optional git tag creation after version update
+# • ✅ Creates annotated tags with version info
+# • ✅ Handles existing tag detection/replacement
+# • ✅ Optional push to remote origin
+# • Manual: git tag -a v1.738 -m "Release v1.738"
+#
+# 🧹 BACKUP CLEANUP:
+# • ✅ Automatically removes backups older than the newest 3
+# • ✅ Runs cleanup before creating new backup
+# • ✅ Shows backup status after completion
+# • ✅ Always maintains restore capability for recent versions
+#
+# 🔄 TO RESTORE PREVIOUS VERSION:
+#    cd backup/version_update_YYYYMMDD_HHMMSS
+#    ./restore.sh
+#
+# ============================================
+# 🎯 FILES UPDATED BY THIS SCRIPT:
+# ============================================
+#
+# Core files (version parameters + meta tags):
+# • version.js                    - Single source of truth (auto-generated)
+# • miniCycle.html                - ?v= params, currentVersion, meta tags
+# • styles/main.css               - @import ?v= parameters
+#
+# Lite version (with --lite or --lite-only flag):
+# • lite/miniCycle-lite.html      - ?v= params, meta tags
+# • lite/miniCycle-lite-scripts.js - currentVersion variable
+# • manifest-lite.json            - version field
+#
+# Other pages:
+# • pages/product.html            - ?v= params, meta tags, JSON-LD softwareVersion,
+#                                   "Built Different" module-count stat (data-stat="modules")
+#
+# Manifests & package:
+# • manifest.json                 - version field
+# • package.json                  - version field
+# • package-lock.json             - top-level + root-package version fields (kept in
+#                                   sync so npm install stops regenerating the drift)
+#
+# Documentation:
+# • docs/PROJECT_STATS.md         - App Version + auto-counted metrics (modules, tests, test files,
+#                                   CSS, JSDoc, docs, lite version, boot file lines, per-directory counts)
+#
+# Security (auto-detected):
+# • netlify.toml                  - CSP script-src hashes (auto-updated when inline scripts change)
+#
+# Project metrics (counted by scripts/collect-stats.cjs — the ONE counter):
+# • docs/PROJECT_STATS.md         - human-readable table (Stage 5B, above)
+# • dist/stats.json               - public JSON endpoint, written by the BUILD, not
+#                                   by this script; ships automatically on deploy.
+#   Retired Aug 2026: a Stage 5C used to write stats.json into ../../SparkinCreations,
+#   which then needed its own commit + deploy to publish. It didn't get one, so that
+#   site served July's v2.277 numbers for six weeks. It now fetches
+#   https://minicycle.app/stats.json directly — no cross-repo write, nothing to skip.
+#
+# ============================================
+# 📦 MODULE VERSIONING (DI-PURE)
+# ============================================
+#
+# Modules do NOT have hardcoded versions. The version flows via DI:
+#
+#   version.js (this script generates it)
+#       ↓
+#   globalThis.APP_VERSION (set by version.js)
+#       ↓
+#   modules/boot/orchestrator.js builds: window.AppMeta = { version: globalThis.APP_VERSION }
+#       ↓
+#   initModule({ AppMeta: window.AppMeta, ... })
+#       ↓
+#   this.version = mergedDeps.AppMeta?.version
+#       ↓
+#   const version = this.version || 'dev-local'
+#       ↓
+#   import(`./submodule.js?v=${version}`)
+#
+# Benefits:
+# • No hardcoded versions in 40+ module files
+# • Single source of truth (version.js)
+# • Modules are fully DI-pure (no window.* version access)
+# • Cache-busting via dynamic imports works automatically
+#
+# Notes:
+# • Debug markers (APPCONTEXT_VERSION, etc.) derive from globalThis.APP_VERSION at runtime
+# • Modules use 'dev-local' fallback if AppMeta not provided
+# • AppMeta object is built in modules/boot/orchestrator.js, not version.js
+# • See docs/developer-guides/TASKDOM_DI_GUIDE.md for patterns
+#
+
+# ============================================
+# STRICT MODE
+# ============================================
+# Exit on error, undefined vars, pipe failures
+set -euo pipefail
+
+# ============================================
+# FLAG VARIABLES
+# ============================================
+
+# Single source of truth for this script's own version (keep in sync with the
+# `# Version:` header comment above). Used in --help and the runtime banners.
+SCRIPT_VERSION="5.6"
+
+AUTO_MODE=false
+AUTO_GIT_TAG=false
+AUTO_GIT_PUSH=false
+INCLUDE_LITE=false
+LITE_ONLY=false
+AUTO_CHANGELOG=false
+# Describes uncommitted work that ships in this release. Supplied via --note,
+# or prompted for interactively; empty falls back to a TODO marker.
+RELEASE_NOTE=""
+AUTO_SAMPLES=false
+BUILD_CHROME=false
+BUILD_ANDROID=false
+DEPLOY_ANDROID=false
+BUILD_IOS=false
+BUILD_DESKTOP=false
+DIST_DESKTOP=false
+DRY_RUN=false
+
+# ============================================
+# PARSE COMMAND LINE ARGUMENTS
+# ============================================
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --auto|-a)
+            AUTO_MODE=true
+            shift
+            ;;
+        --tag|-t)
+            AUTO_GIT_TAG=true
+            shift
+            ;;
+        --push|-p)
+            AUTO_GIT_PUSH=true
+            AUTO_GIT_TAG=true  # Push implies tag
+            shift
+            ;;
+        --lite|-l)
+            INCLUDE_LITE=true
+            shift
+            ;;
+        --lite-only)
+            LITE_ONLY=true
+            INCLUDE_LITE=true  # LITE_ONLY implies INCLUDE_LITE
+            shift
+            ;;
+        --changelog|-c)
+            AUTO_CHANGELOG=true
+            shift
+            ;;
+        --note|-m)
+            # Describes uncommitted work shipping in this release. Implies
+            # --changelog: a note with nothing to write it into is a silent no-op.
+            if [ -z "${2:-}" ]; then
+                echo "❌ --note requires a description (e.g. --note 'fix(games): read Schema 2.5')"
+                exit 1
+            fi
+            RELEASE_NOTE="$2"
+            AUTO_CHANGELOG=true
+            shift 2
+            ;;
+        --samples|-s)
+            AUTO_SAMPLES=true
+            shift
+            ;;
+        --chrome|-C)
+            BUILD_CHROME=true
+            shift
+            ;;
+        --android|-A)
+            BUILD_ANDROID=true
+            shift
+            ;;
+        --android-run|-R)
+            DEPLOY_ANDROID=true
+            BUILD_ANDROID=true  # deploy implies rebuild the payload first
+            shift
+            ;;
+        --ios|-I)
+            BUILD_IOS=true
+            shift
+            ;;
+        --desktop|-D)
+            BUILD_DESKTOP=true
+            shift
+            ;;
+        --desktop-dist)
+            DIST_DESKTOP=true
+            BUILD_DESKTOP=true  # installers imply rebuilding the payload first
+            shift
+            ;;
+        --dry-run|-n)
+            DRY_RUN=true
+            shift
+            ;;
+        --help|-h)
+            echo "🎯 miniCycle Version Updater v$SCRIPT_VERSION"
+            echo ""
+            echo "Usage: ./update-version.sh [options]"
+            echo ""
+            echo "Options:"
+            echo "  --auto, -a      Auto-bump versions and update all files (no prompts)"
+            echo "  --changelog, -c Auto-generate changelog from git commits"
+            echo "  --note, -m TEXT Changelog line for uncommitted work (implies --changelog)"
+            echo "  --samples, -s   Regenerate sample routine manifest from .mcyc files"
+            echo "  --chrome, -C    Rebuild the Chrome (full) extension to chrome/full/"
+            echo "  --android, -A   Rebuild the Android (Capacitor) web payload + sync versionName"
+            echo "  --android-run, -R  Also build the debug APK + install/launch on a connected device"
+            echo "  --ios, -I       Rebuild the iOS (Capacitor) web payload + sync MARKETING_VERSION"
+            echo "  --desktop, -D   Rebuild the desktop (Electron) web payload + sync desktop/package.json"
+            echo "  --desktop-dist  Also smoke-boot the shell and build the macOS + Windows + Linux installers (desktop/dist/)"
+            echo "  --lite, -l      Include lite version files (normally static)"
+            echo "  --lite-only     Update ONLY lite version files (independent of main app)"
+            echo "  --tag, -t       Auto-create git tag (use with --auto)"
+            echo "  --push, -p      Auto-push tag to remote (implies --tag)"
+            echo "  --dry-run, -n   Preview changes without writing any files"
+            echo "  --help, -h      Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  ./update-version.sh              # Interactive mode"
+            echo "  ./update-version.sh --dry-run    # Preview what would change"
+            echo "  ./update-version.sh --auto       # Auto-bump, no git tag"
+            echo "  ./update-version.sh --auto -n    # Auto-bump dry run"
+            echo "  ./update-version.sh --auto -c    # Auto-bump + update changelog"
+            echo "  ./update-version.sh --auto --tag # Auto-bump + create tag"
+            echo "  ./update-version.sh -a -c -t     # Auto-bump + changelog + tag"
+            echo "  ./update-version.sh -a -p        # Auto-bump + tag + push"
+            echo "  ./update-version.sh -a -p -m 'fix(x): thing'  # ...describing uncommitted work"
+            echo ""
+            echo "Lite-only examples:"
+            echo "  ./update-version.sh --lite-only        # Update only lite version (interactive)"
+            echo "  ./update-version.sh --lite-only --auto # Auto-bump lite version only"
+            echo "  ./update-version.sh --lite-only -n     # Dry run lite-only update"
+            echo ""
+            exit 0
+            ;;
+        *)
+            echo "❌ Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# ============================================
+# HEADER
+# ============================================
+
+if [ "$DRY_RUN" = true ]; then
+    echo "🔍 miniCycle Version Updater v$SCRIPT_VERSION (DRY RUN MODE)"
+    echo "================================================="
+    echo "⚠️  No files will be modified - preview only"
+elif [ "$LITE_ONLY" = true ]; then
+    echo "📱 miniCycle Version Updater v$SCRIPT_VERSION (LITE ONLY MODE)"
+    echo "=================================================="
+    echo "⚠️  Only lite version files will be updated"
+elif [ "$AUTO_MODE" = true ]; then
+    echo "🤖 miniCycle Version Updater v$SCRIPT_VERSION (AUTO MODE)"
+    echo "=============================================="
+else
+    echo "🎯 miniCycle Version Updater v$SCRIPT_VERSION"
+    echo "================================="
+fi
+echo ""
+
+# ============================================
+# PRE-RUN WORKING TREE SNAPSHOT
+# ============================================
+# Captured BEFORE this script edits a single file, so it records the USER's own
+# uncommitted work rather than the version bumps written further down.
+#
+# Why it exists: the changelog is generated from a commit range (see
+# changelog-range.sh), but
+# the release commit later sweeps the whole tree with `git add -A`. Anything
+# uncommitted when this script starts therefore SHIPS in the release while
+# contributing no commit message for the changelog to read — v2.430 went out
+# with no entry at all exactly this way. Snapshotting here (rather than keeping
+# a list of the files this script writes) means the check cannot drift as new
+# build targets are added.
+PRERUN_DIRTY=""
+if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    # No --untracked-files=no: `git add -A` stages new files too, so they ship
+    # as well and belong in this set. Ignored paths (backup/) never appear.
+    PRERUN_DIRTY=$(git status --porcelain 2>/dev/null || true)
+fi
+
+# ============================================
+# FILE CATEGORIES
+# ============================================
+
+CORE_HTML_FILES=(
+    "miniCycle.html"
+    "pages/product.html"
+)
+
+CSS_FILES=(
+    "styles/main.css"
+)
+
+# Note: JS files now read from globalThis.APP_VERSION at runtime - no manual updates needed
+
+# Lite version files (only included with --lite flag)
+LITE_HTML_FILES=(
+    "lite/miniCycle-lite.html"
+)
+LITE_JS_FILES=(
+    "lite/miniCycle-lite-scripts.js"
+)
+LITE_CSS_FILES=(
+    "lite/miniCycle-lite-styles.css"
+)
+
+MANIFEST_FILES=(
+    "manifest.json"
+)
+
+# Lite manifest only included with --lite flag
+LITE_MANIFEST_FILES=(
+    "manifest-lite.json"
+)
+
+PACKAGE_FILES=(
+    "package.json"
+)
+
+# ============================================
+# INFO MESSAGES
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    echo "📱 LITE ONLY MODE: Only updating lite version files"
+    echo "   Main app files will NOT be modified"
+else
+    echo "ℹ️  Module files use DI for versioning (no updates needed)"
+    echo "ℹ️  Debug markers derive from globalThis.APP_VERSION at runtime"
+    if [ "$INCLUDE_LITE" = true ]; then
+        echo "📱 Lite version files INCLUDED (--lite flag)"
+    else
+        echo "📱 Lite version files excluded (use --lite to include)"
+    fi
+fi
+echo ""
+
+# ============================================
+# SETUP & CONFIGURATION
+# ============================================
+
+BACKUP_DIR="backup"
+BACKUP_FOLDER=""
+
+# Only create backup structure if not dry run
+if [ "$DRY_RUN" = false ]; then
+    # Create backup directory if it doesn't exist
+    if [ ! -d "$BACKUP_DIR" ]; then
+        mkdir -p "$BACKUP_DIR"
+        echo "📁 Created backup directory: $BACKUP_DIR"
+    fi
+
+    # Create backup folder structure
+    mkdir -p "$BACKUP_DIR/lite" 2>/dev/null || true
+    mkdir -p "$BACKUP_DIR/pages" 2>/dev/null || true
+    mkdir -p "$BACKUP_DIR/styles" 2>/dev/null || true
+    mkdir -p "$BACKUP_DIR/modules/boot" 2>/dev/null || true
+    mkdir -p "$BACKUP_DIR/docs" 2>/dev/null || true
+
+    # Clean up old backups (keep only last 3)
+    cleanup_old_backups() {
+        echo "🧹 Checking for old backups to clean up..."
+        BACKUP_COUNT=$(find "$BACKUP_DIR" -maxdepth 1 -type d -name "version_update_*" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$BACKUP_COUNT" -gt 3 ]; then
+            echo "📊 Found $BACKUP_COUNT existing backups (keeping newest 3)"
+            find "$BACKUP_DIR" -maxdepth 1 -type d -name "version_update_*" -print0 2>/dev/null \
+              | xargs -0 ls -td 2>/dev/null \
+              | tail -n +4 \
+              | while read -r old_backup; do
+                    echo "🗑️  Removing old backup: $(basename "$old_backup")"
+                    rm -rf "$old_backup"
+                done
+            echo "✅ Cleanup completed - kept newest 3 backups"
+        else
+            echo "📦 Found $BACKUP_COUNT existing backups (no cleanup needed)"
+        fi
+        echo ""
+    }
+
+    # Run cleanup before creating new backup
+    cleanup_old_backups
+
+    # Create timestamped backup subfolder for this update
+    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+    BACKUP_FOLDER="$BACKUP_DIR/version_update_$TIMESTAMP"
+    mkdir -p "$BACKUP_FOLDER"
+
+    echo "📂 New backup folder: $BACKUP_FOLDER"
+    echo ""
+fi
+
+# ============================================
+# PORTABLE SED (macOS vs Linux)
+# ============================================
+
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  SED_INPLACE=(sed -i "")
+else
+  SED_INPLACE=(sed -i)
+fi
+
+# ============================================
+# GET CURRENT VERSIONS
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    # Read lite version from lite HTML file (using ?v= parameter)
+    CURRENT_LITE_VERSION=$(grep -oE 'miniCycle-lite-styles\.css\?v=[0-9.]+' lite/miniCycle-lite.html 2>/dev/null | sed -E 's/.*\?v=([0-9.]+).*/\1/' | head -1 || echo "")
+
+    echo "📊 Current lite version (from lite/miniCycle-lite.html):"
+    echo "   Lite version: ${CURRENT_LITE_VERSION:-"Not set"}"
+    echo ""
+else
+    CURRENT_VERSION=$(grep -oE "APP_VERSION = '[^']*'" version.js 2>/dev/null | sed -E "s/.*'([^']*)'.*/\1/" || echo "")
+    CURRENT_CACHE_VERSION=$(grep -oE "CACHE_VERSION = [0-9]+" version.js 2>/dev/null | sed -E "s/.*= ([0-9]+).*/\1/" || echo "")
+
+    echo "📊 Current versions (from version.js):"
+    echo "   App version: ${CURRENT_VERSION:-"Not set"}"
+    echo "   Cache version: ${CURRENT_CACHE_VERSION:-"Not set"}"
+
+    # Also read lite version when --lite is included (lite has independent versioning)
+    if [ "$INCLUDE_LITE" = true ]; then
+        CURRENT_LITE_VERSION=$(grep -oE 'miniCycle-lite-styles\.css\?v=[0-9.]+' lite/miniCycle-lite.html 2>/dev/null | sed -E 's/.*\?v=([0-9.]+).*/\1/' | head -1 || echo "")
+        echo "   Lite version: ${CURRENT_LITE_VERSION:-"Not set"} (independent)"
+    fi
+    echo ""
+fi
+
+# ============================================
+# GET NEW VERSION
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    # LITE ONLY MODE - separate version handling
+    if [ "$AUTO_MODE" = true ]; then
+        # Auto-bump lite version by 0.001
+        if [[ "$CURRENT_LITE_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            # Use bc for decimal arithmetic, printf to ensure 3 decimal places
+            NEW_LITE_VERSION=$(printf "%.3f" "$(echo "$CURRENT_LITE_VERSION + 0.001" | bc)")
+            # Remove unnecessary trailing zeros but keep at least one decimal place
+            # 2.100 → 2.1, 2.101 → 2.101, 2.110 → 2.11
+            NEW_LITE_VERSION=$(echo "$NEW_LITE_VERSION" | sed 's/0*$//' | sed 's/\.$//')
+        else
+            echo "❌ Cannot parse current lite version for auto-bump: $CURRENT_LITE_VERSION"
+            exit 1
+        fi
+
+        echo "🤖 Auto-calculated new lite version:"
+        echo "   Lite version: $CURRENT_LITE_VERSION → $NEW_LITE_VERSION"
+        echo ""
+    else
+        # Interactive mode for lite
+        read -p "🔢 Enter new lite version (e.g., 2.0): " NEW_LITE_VERSION
+
+        # Validate input
+        if [[ ! "$NEW_LITE_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Invalid version format. Use format like 2.0"
+            exit 1
+        fi
+    fi
+
+    # Lite mode doesn't use cache version, set placeholder
+    NEW_CACHE_VERSION="N/A"
+    NEW_VERSION="$NEW_LITE_VERSION"  # Use NEW_VERSION for consistency in later logic
+elif [ "$AUTO_MODE" = true ]; then
+    # Auto-bump app version (increment by 1)
+    if [[ "$CURRENT_VERSION" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        MAJOR="${BASH_REMATCH[1]}"
+        MINOR="${BASH_REMATCH[2]}"
+        MINOR_LEN=${#MINOR}   # Preserve zero-padding width (e.g. "000" → 3)
+        NEW_MINOR=$((10#$MINOR + 1))  # 10# forces base-10 (avoids octal issues)
+        NEW_VERSION=$(printf "${MAJOR}.%0${MINOR_LEN}d" $NEW_MINOR)
+    else
+        echo "❌ Cannot parse current version for auto-bump: $CURRENT_VERSION"
+        exit 1
+    fi
+
+    # Auto-bump cache version (increment by 1)
+    if [[ "$CURRENT_CACHE_VERSION" =~ ^[0-9]+$ ]]; then
+        NEW_CACHE_VERSION=$((CURRENT_CACHE_VERSION + 1))
+    else
+        echo "❌ Cannot parse current cache version for auto-bump: $CURRENT_CACHE_VERSION"
+        exit 1
+    fi
+
+    echo "🤖 Auto-calculated new versions:"
+    echo "   App version: $CURRENT_VERSION → $NEW_VERSION"
+    echo "   Cache version: $CURRENT_CACHE_VERSION → $NEW_CACHE_VERSION"
+
+    # Auto-bump lite version independently when --lite is included
+    if [ "$INCLUDE_LITE" = true ] && [ "$LITE_ONLY" = false ]; then
+        if [[ "$CURRENT_LITE_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            NEW_LITE_VERSION=$(printf "%.3f" "$(echo "$CURRENT_LITE_VERSION + 0.001" | bc)")
+            NEW_LITE_VERSION=$(echo "$NEW_LITE_VERSION" | sed 's/0*$//' | sed 's/\.$//')
+        else
+            NEW_LITE_VERSION="$CURRENT_LITE_VERSION"
+            echo "   ⚠️  Could not parse lite version, keeping: $CURRENT_LITE_VERSION"
+        fi
+        echo "   Lite version: $CURRENT_LITE_VERSION → $NEW_LITE_VERSION (independent)"
+    fi
+    echo ""
+else
+    # Interactive mode - prompt user
+    read -p "🔢 Enter new app version (e.g., 1.599): " NEW_VERSION
+    read -p "🗄️  Enter new cache version (e.g., 392): " NEW_CACHE_VERSION
+
+    # Validate input
+    if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        echo "❌ Invalid version format. Use format like 1.599"
+        exit 1
+    fi
+
+    if [[ ! "$NEW_CACHE_VERSION" =~ ^[0-9]+$ ]]; then
+        echo "❌ Invalid cache version. Use a number like 392"
+        exit 1
+    fi
+
+    # Prompt for lite version separately when --lite is included
+    if [ "$INCLUDE_LITE" = true ] && [ "$LITE_ONLY" = false ]; then
+        echo ""
+        echo "📱 Lite version has independent versioning (current: ${CURRENT_LITE_VERSION:-"Not set"})"
+        read -p "🔢 Enter new lite version (Enter to auto-bump, or type version): " NEW_LITE_VERSION
+        if [ -z "$NEW_LITE_VERSION" ]; then
+            # Auto-bump by 0.001
+            if [[ "$CURRENT_LITE_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                NEW_LITE_VERSION=$(printf "%.3f" "$(echo "$CURRENT_LITE_VERSION + 0.001" | bc)")
+                NEW_LITE_VERSION=$(echo "$NEW_LITE_VERSION" | sed 's/0*$//' | sed 's/\.$//')
+                echo "   Auto-bumped lite: $CURRENT_LITE_VERSION → $NEW_LITE_VERSION"
+            else
+                NEW_LITE_VERSION="$CURRENT_LITE_VERSION"
+                echo "   ⚠️  Could not parse lite version, keeping: $CURRENT_LITE_VERSION"
+            fi
+        fi
+    fi
+fi
+
+# ============================================
+# SELECT UPDATE MODE
+# ============================================
+
+if [ "$AUTO_MODE" = true ]; then
+    UPDATE_MODE="1"
+    echo "📦 Auto mode: Updating ALL files"
+else
+    echo ""
+    echo "📝 Select update mode:"
+    echo "   [1] Update ALL files (default)"
+    echo "   [2] Select files ONE-BY-ONE"
+    echo "   [3] Custom file selection (enter file names)"
+    echo "   [4] Cancel"
+    echo ""
+    read -p "Choice [1-4]: " UPDATE_MODE
+
+    # Default to mode 1 if empty
+    UPDATE_MODE=${UPDATE_MODE:-1}
+fi
+
+# ============================================
+# FILE SELECTION TRACKING (bash 3 compatible)
+# ============================================
+
+FILES_TO_UPDATE=""
+
+# ============================================
+# MODE HANDLING
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    # LITE ONLY MODE - skip mode selection, just update lite files
+    echo ""
+    echo "📱 LITE ONLY MODE: Updating lite version files"
+    UPDATE_MODE="1"  # Set to "all" mode for file marking
+
+    # Only mark lite files for update
+    for file in "${LITE_HTML_FILES[@]}"; do
+        FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+    done
+    for file in "${LITE_JS_FILES[@]}"; do
+        FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+    done
+    for file in "${LITE_CSS_FILES[@]}"; do
+        FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+    done
+    for file in "${LITE_MANIFEST_FILES[@]}"; do
+        FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+    done
+
+elif [ "$UPDATE_MODE" == "1" ]; then
+    echo ""
+    if [ "$INCLUDE_LITE" = true ]; then
+        echo "📦 Mode: Update ALL files (including lite version)"
+    else
+        echo "📦 Mode: Update ALL files (excluding lite version)"
+    fi
+
+    # Mark all files for update
+    for file in "${CORE_HTML_FILES[@]}"; do
+        FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+    done
+    # Note: CORE_JS_FILES removed - JS files now derive from globalThis.APP_VERSION
+    for file in "${CSS_FILES[@]}"; do
+        FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+    done
+    for file in "${MANIFEST_FILES[@]}"; do
+        FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+    done
+    for file in "${PACKAGE_FILES[@]}"; do
+        FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+    done
+
+    # Include lite files only if --lite flag is set
+    if [ "$INCLUDE_LITE" = true ]; then
+        for file in "${LITE_HTML_FILES[@]}"; do
+            FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+        done
+        for file in "${LITE_JS_FILES[@]}"; do
+            FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+        done
+        for file in "${LITE_CSS_FILES[@]}"; do
+            FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+        done
+        for file in "${LITE_MANIFEST_FILES[@]}"; do
+            FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+        done
+    fi
+
+elif [ "$UPDATE_MODE" == "2" ]; then
+    echo ""
+    echo "📋 Mode: Select files ONE-BY-ONE"
+    echo "   (Press Enter for Yes, n for No)"
+    echo ""
+
+    echo "--- Core HTML Files ---"
+    for file in "${CORE_HTML_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            read -p "Update $file? (Y/n): " -n 1 -r
+            echo ""
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+                echo "✅ Will update $file"
+            else
+                echo "⏭️  Skipping $file"
+            fi
+        fi
+    done
+    echo ""
+
+    echo "--- CSS Files ---"
+    for file in "${CSS_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            read -p "Update $file? (Y/n): " -n 1 -r
+            echo ""
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+                echo "✅ Will update $file"
+            else
+                echo "⏭️  Skipping $file"
+            fi
+        fi
+    done
+    echo ""
+
+    echo "--- Manifest Files ---"
+    for file in "${MANIFEST_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            read -p "Update $file? (Y/n): " -n 1 -r
+            echo ""
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+                echo "✅ Will update $file"
+            else
+                echo "⏭️  Skipping $file"
+            fi
+        fi
+    done
+    echo ""
+
+    echo "--- Package Files ---"
+    for file in "${PACKAGE_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            read -p "Update $file? (Y/n): " -n 1 -r
+            echo ""
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+                echo "✅ Will update $file"
+            else
+                echo "⏭️  Skipping $file"
+            fi
+        fi
+    done
+    echo ""
+
+    if [ "$INCLUDE_LITE" = true ]; then
+        echo "--- Lite Version Files ---"
+        for file in "${LITE_HTML_FILES[@]}" "${LITE_JS_FILES[@]}" "${LITE_MANIFEST_FILES[@]}"; do
+            if [ -f "$file" ]; then
+                read -p "Update $file? (Y/n): " -n 1 -r
+                echo ""
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+                    echo "✅ Will update $file"
+                else
+                    echo "⏭️  Skipping $file"
+                fi
+            fi
+        done
+        echo ""
+    fi
+
+elif [ "$UPDATE_MODE" == "3" ]; then
+    echo ""
+    echo "📝 Mode: Custom file selection"
+    echo "   Enter file names separated by spaces or commas"
+    echo "   Example: miniCycle.html manifest.json lite/miniCycle-lite.html"
+    echo ""
+    read -p "Files: " CUSTOM_FILES
+
+    CUSTOM_FILES=$(echo "$CUSTOM_FILES" | tr ',' ' ')
+
+    echo ""
+    echo "📋 Files to update:"
+    for file in $CUSTOM_FILES; do
+        if [ -f "$file" ]; then
+            FILES_TO_UPDATE="$FILES_TO_UPDATE|$file|"
+            echo "  ✅ $file"
+        else
+            echo "  ⚠️  $file (not found, will skip)"
+        fi
+    done
+    echo ""
+
+elif [ "$UPDATE_MODE" == "4" ]; then
+    echo ""
+    echo "❌ Update cancelled."
+    [ -n "$BACKUP_FOLDER" ] && rm -rf "$BACKUP_FOLDER" 2>/dev/null || true
+    exit 0
+
+else
+    echo "❌ Invalid choice. Exiting."
+    [ -n "$BACKUP_FOLDER" ] && rm -rf "$BACKUP_FOLDER" 2>/dev/null || true
+    exit 1
+fi
+
+# ============================================
+# COUNT FILES (safer method using array)
+# ============================================
+
+# Convert pipe-delimited string to count
+TOTAL_FILES=0
+if [ -n "$FILES_TO_UPDATE" ]; then
+    # Remove leading/trailing pipes, then count remaining pipes + 1
+    CLEANED=$(echo "$FILES_TO_UPDATE" | sed 's/^|//;s/|$//')
+    if [ -n "$CLEANED" ]; then
+        TOTAL_FILES=$(echo "$CLEANED" | tr -cd '|' | wc -c)
+        TOTAL_FILES=$((TOTAL_FILES / 2 + 1))
+    fi
+fi
+
+# ============================================
+# CONFIRMATION / DRY RUN SUMMARY
+# ============================================
+
+echo ""
+echo "📝 Summary:"
+echo "   App version: ${CURRENT_VERSION:-"?"} → $NEW_VERSION"
+echo "   Cache version: ${CURRENT_CACHE_VERSION:-"?"} → $NEW_CACHE_VERSION"
+if [ "$INCLUDE_LITE" = true ] && [ -n "${NEW_LITE_VERSION:-}" ]; then
+    echo "   Lite version: ${CURRENT_LITE_VERSION:-"?"} → $NEW_LITE_VERSION (independent)"
+fi
+echo "   Files to update: $TOTAL_FILES"
+if [ "$DRY_RUN" = false ]; then
+    echo "   Backups will be saved to: $BACKUP_FOLDER"
+fi
+echo ""
+
+if [ "$DRY_RUN" = true ]; then
+    echo "🔍 DRY RUN - Previewing changes..."
+    echo ""
+elif [ "$AUTO_MODE" = true ]; then
+    echo "🤖 Auto mode: Proceeding with update..."
+else
+    read -p "🤔 Continue? (Y/N): " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "❌ Update cancelled."
+        rm -rf "$BACKUP_FOLDER" 2>/dev/null || true
+        exit 1
+    fi
+fi
+
+echo ""
+if [ "$DRY_RUN" = true ]; then
+    echo "🔍 Files that WOULD be updated:"
+else
+    echo "🔄 Updating files..."
+fi
+echo ""
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+should_update() {
+    local file=$1
+    [[ "$FILES_TO_UPDATE" == *"|$file|"* ]]
+}
+
+backup_file() {
+    local file=$1
+    if [ "$DRY_RUN" = true ]; then
+        return 0
+    fi
+    if [ -f "$file" ]; then
+        local backup_path="$BACKUP_FOLDER/$file"
+        mkdir -p "$(dirname "$backup_path")"
+        cp "$file" "$backup_path"
+        echo "💾 Backed up: $file"
+        return 0
+    fi
+    return 1
+}
+
+# Dry run wrapper for sed
+do_sed() {
+    local file=$1
+    shift
+    if [ "$DRY_RUN" = true ]; then
+        return 0
+    fi
+    "${SED_INPLACE[@]}" "$@" "$file"
+}
+
+# ============================================
+# STAGE 1: GENERATE version.js (Single Source of Truth)
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    echo "📝 Stage 1: Skipping version.js (LITE ONLY mode)"
+    echo "   Lite version has its own independent versioning"
+    echo ""
+else
+    echo "📝 Stage 1: Generating version.js..."
+
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would generate version.js with:"
+        echo "   - globalThis.APP_VERSION = '$NEW_VERSION'"
+        echo "   - globalThis.CACHE_VERSION = $NEW_CACHE_VERSION"
+    else
+        # Backup existing version.js
+        if [ -f "version.js" ]; then
+            backup_file "version.js"
+        fi
+
+        # Generate new version.js using globalThis (cleaner, works everywhere)
+        cat > "version.js" << EOF
+// Version file - Auto-generated by update-version.sh
+// Single source of truth for all version info
+
+// Use globalThis for universal compatibility (window, self, Node, SW)
+globalThis.APP_VERSION = '$NEW_VERSION';
+globalThis.CACHE_VERSION = $NEW_CACHE_VERSION;
+
+// Debug markers in modules derive from globalThis.APP_VERSION at runtime
+// No separate version constants needed - true single source of truth
+EOF
+
+        echo "✅ Generated version.js (app: $NEW_VERSION, cache: $NEW_CACHE_VERSION)"
+    fi
+    echo ""
+fi
+
+# ============================================
+# STAGE 1B: UPDATE SERVICE WORKER VERSION CONSTANTS
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    echo "📝 Stage 1B: Skipping service-worker.js (LITE ONLY mode)"
+    echo ""
+else
+    echo "📝 Stage 1B: Updating service-worker.js version constants..."
+
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update service-worker.js with:"
+        echo "   - APP_VERSION = '$NEW_VERSION'"
+        echo "   - CACHE_VERSION = 'v$NEW_CACHE_VERSION'"
+    else
+        if [ -f "service-worker.js" ]; then
+            backup_file "service-worker.js"
+            do_sed "service-worker.js" "s/var APP_VERSION = '[^']*'/var APP_VERSION = '$NEW_VERSION'/g"
+            do_sed "service-worker.js" "s/var CACHE_VERSION = 'v[0-9]*'/var CACHE_VERSION = 'v$NEW_CACHE_VERSION'/g"
+            do_sed "service-worker.js" "s/var CACHE_VERSION_NUMBER = [0-9]*/var CACHE_VERSION_NUMBER = $NEW_CACHE_VERSION/g"
+            echo "✅ Updated service-worker.js (app: $NEW_VERSION, cache: v$NEW_CACHE_VERSION)"
+        else
+            echo "⚠️  service-worker.js not found"
+        fi
+    fi
+    echo ""
+fi
+
+# ============================================
+# STAGE 2: UPDATE HTML FILES
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    echo "📝 Stage 2: Updating lite HTML files..."
+else
+    echo "📝 Stage 2: Updating HTML files..."
+fi
+STAGE2_SUCCESS=true
+
+# Main app HTML (skipped in LITE_ONLY mode)
+if [ "$LITE_ONLY" = false ] && should_update "miniCycle.html"; then
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: miniCycle.html"
+    elif [ ! -f "miniCycle.html" ]; then
+        echo "⏭️  Skipping miniCycle.html (not found)"
+    elif backup_file "miniCycle.html"; then
+        # Use [0-9.]+ (one or more) to avoid matching ?v=${APP_VERSION} which has no digits after =
+        do_sed "miniCycle.html" 's/?v=[0-9.]\{1,\}/?v='"$NEW_VERSION"'/g'
+        do_sed "miniCycle.html" "s/var currentVersion = '[0-9.]*'/var currentVersion = '$NEW_VERSION'/g"
+        do_sed "miniCycle.html" "s/const currentVersion = '[0-9.]*'/const currentVersion = '$NEW_VERSION'/g"
+        do_sed "miniCycle.html" "s|<meta name=\"app-version\" content=\"[^\"]*\">|<meta name=\"app-version\" content=\"$NEW_VERSION\">|g"
+        echo "✅ Updated miniCycle.html"
+    else
+        echo "⚠️  Failed to update miniCycle.html"
+        STAGE2_SUCCESS=false
+    fi
+fi
+
+# Lite HTML (uses NEW_LITE_VERSION for independent versioning)
+LITE_VER="${NEW_LITE_VERSION:-$NEW_VERSION}"
+if should_update "lite/miniCycle-lite.html"; then
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: lite/miniCycle-lite.html (lite version: $LITE_VER)"
+    elif [ ! -f "lite/miniCycle-lite.html" ]; then
+        echo "⏭️  Skipping lite/miniCycle-lite.html (not found)"
+    elif backup_file "lite/miniCycle-lite.html"; then
+        do_sed "lite/miniCycle-lite.html" 's/?v=[0-9.]\{1,\}/?v='"$LITE_VER"'/g'
+        do_sed "lite/miniCycle-lite.html" "s/miniCycle-lite-styles\.css\"/miniCycle-lite-styles.css?v=$LITE_VER\"/g"
+        do_sed "lite/miniCycle-lite.html" "s/miniCycle-lite-scripts\.js\"/miniCycle-lite-scripts.js?v=$LITE_VER\"/g"
+        do_sed "lite/miniCycle-lite.html" "s|<meta name=\"app-version\" content=\"[^\"]*\">|<meta name=\"app-version\" content=\"$LITE_VER\">|g"
+        # Update "Last meaningful update: vX.XXX" in header comment
+        do_sed "lite/miniCycle-lite.html" "s/Last meaningful update: v[0-9.]*/Last meaningful update: v$LITE_VER/g"
+        echo "✅ Updated lite/miniCycle-lite.html (v$LITE_VER)"
+    else
+        echo "⚠️  Failed to update lite/miniCycle-lite.html"
+        STAGE2_SUCCESS=false
+    fi
+fi
+
+# Product HTML (skipped in LITE_ONLY mode)
+if [ "$LITE_ONLY" = false ] && should_update "pages/product.html"; then
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: pages/product.html"
+    elif [ ! -f "pages/product.html" ]; then
+        echo "⏭️  Skipping pages/product.html (not found)"
+    elif backup_file "pages/product.html"; then
+        do_sed "pages/product.html" "s|<meta name=\"app-version\" content=\"[^\"]*\">|<meta name=\"app-version\" content=\"$NEW_VERSION\">|g"
+        do_sed "pages/product.html" 's/?v=[0-9.]\{1,\}/?v='"$NEW_VERSION"'/g'
+        do_sed "pages/product.html" 's/"softwareVersion": "[^"]*"/"softwareVersion": "'"$NEW_VERSION"'"/g'
+        # "Built Different" module-count stat — round DOWN to nearest 10 so the
+        # "+" figure (e.g. 120+) never overstates. Anchored on data-stat="modules".
+        PROD_MODULES=$(find modules -name "*.js" -type f 2>/dev/null | wc -l | xargs)
+        PROD_MODULES_ROUNDED=$(( PROD_MODULES / 10 * 10 ))
+        do_sed "pages/product.html" 's#\(data-stat="modules">\)[0-9][0-9]*+\{0,1\}<#\1'"$PROD_MODULES_ROUNDED"'+<#g'
+        echo "✅ Updated pages/product.html (modules stat: ${PROD_MODULES_ROUNDED}+)"
+    else
+        echo "⚠️  Failed to update pages/product.html"
+        STAGE2_SUCCESS=false
+    fi
+fi
+
+if [ "$STAGE2_SUCCESS" = true ]; then
+    echo "✅ Stage 2 complete"
+else
+    echo "⚠️  Stage 2 completed with warnings"
+fi
+echo ""
+
+# ============================================
+# STAGE 3: UPDATE CSS @IMPORT VERSIONS
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    echo "📝 Stage 3: Skipping main CSS (LITE ONLY mode)"
+    echo ""
+else
+    echo "📝 Stage 3: Updating CSS @import versions..."
+    STAGE3_SUCCESS=true
+
+    if should_update "styles/main.css"; then
+        if [ "$DRY_RUN" = true ]; then
+            echo "   Would update: styles/main.css (@import ?v= parameters)"
+        elif backup_file "styles/main.css"; then
+            # Update all ?v=X.XXX parameters in @import statements
+            do_sed "styles/main.css" 's/\.css?v=[0-9.]\{1,\}/.css?v='"$NEW_VERSION"'/g'
+            echo "✅ Updated styles/main.css (@import versions)"
+        else
+            echo "⚠️  Failed to update styles/main.css"
+            STAGE3_SUCCESS=false
+        fi
+    fi
+
+    if [ "$STAGE3_SUCCESS" = true ]; then
+        echo "✅ Stage 3 complete"
+    else
+        echo "⚠️  Stage 3 completed with warnings"
+    fi
+    echo ""
+fi
+
+# ============================================
+# STAGE 4: UPDATE LITE JS (if applicable)
+# ============================================
+
+if should_update "lite/miniCycle-lite-scripts.js"; then
+    echo "📝 Stage 4: Updating lite JS files..."
+    LITE_VER="${NEW_LITE_VERSION:-$NEW_VERSION}"
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: lite/miniCycle-lite-scripts.js (lite version: $LITE_VER)"
+    elif backup_file "lite/miniCycle-lite-scripts.js"; then
+        do_sed "lite/miniCycle-lite-scripts.js" "s/var currentVersion = '[0-9.]*'/var currentVersion = '$LITE_VER'/g"
+        do_sed "lite/miniCycle-lite-scripts.js" "s/const currentVersion = '[0-9.]*'/const currentVersion = '$LITE_VER'/g"
+        # Update "Last meaningful update: vX.XXX" in header comment
+        do_sed "lite/miniCycle-lite-scripts.js" "s/Last meaningful update: v[0-9.]*/Last meaningful update: v$LITE_VER/g"
+        echo "✅ Updated lite/miniCycle-lite-scripts.js (v$LITE_VER)"
+    fi
+    echo "✅ Stage 4 complete"
+    echo ""
+fi
+
+# ============================================
+# STAGE 4B: UPDATE LITE CSS
+# ============================================
+
+if should_update "lite/miniCycle-lite-styles.css"; then
+    echo "📝 Stage 4B: Updating lite CSS files..."
+    LITE_VER="${NEW_LITE_VERSION:-$NEW_VERSION}"
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: lite/miniCycle-lite-styles.css (lite version: $LITE_VER)"
+    elif backup_file "lite/miniCycle-lite-styles.css"; then
+        # Update "Last meaningful update: vX.XXX" in header comment
+        do_sed "lite/miniCycle-lite-styles.css" "s/Last meaningful update: v[0-9.]*/Last meaningful update: v$LITE_VER/g"
+        echo "✅ Updated lite/miniCycle-lite-styles.css (v$LITE_VER)"
+    fi
+    echo "✅ Stage 4B complete"
+    echo ""
+fi
+
+# ============================================
+# STAGE 5: UPDATE MANIFESTS & PACKAGE
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    echo "📝 Stage 5: Updating lite manifest..."
+else
+    echo "📝 Stage 5: Updating manifests & package.json..."
+fi
+STAGE5_SUCCESS=true
+
+# Main manifest (skipped in LITE_ONLY mode)
+if [ "$LITE_ONLY" = false ] && should_update "manifest.json"; then
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: manifest.json"
+    elif [ ! -f "manifest.json" ]; then
+        echo "⏭️  Skipping manifest.json (not found)"
+    elif backup_file "manifest.json"; then
+        do_sed "manifest.json" "s/\"version\": \"[0-9.]*\"/\"version\": \"$NEW_VERSION\"/g"
+        echo "✅ Updated manifest.json"
+    else
+        STAGE5_SUCCESS=false
+    fi
+fi
+
+# Lite manifest (uses independent lite version)
+if should_update "manifest-lite.json"; then
+    LITE_VER="${NEW_LITE_VERSION:-$NEW_VERSION}"
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: manifest-lite.json (lite version: $LITE_VER)"
+    elif [ ! -f "manifest-lite.json" ]; then
+        echo "⏭️  Skipping manifest-lite.json (not found)"
+    elif backup_file "manifest-lite.json"; then
+        do_sed "manifest-lite.json" "s/\"version\": \"[0-9.]*\"/\"version\": \"$LITE_VER\"/g"
+        echo "✅ Updated manifest-lite.json (v$LITE_VER)"
+    else
+        STAGE5_SUCCESS=false
+    fi
+fi
+
+# Package.json (skipped in LITE_ONLY mode)
+if [ "$LITE_ONLY" = false ] && should_update "package.json"; then
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: package.json"
+    elif [ ! -f "package.json" ]; then
+        echo "⏭️  Skipping package.json (not found)"
+    elif backup_file "package.json"; then
+        do_sed "package.json" "s/\"version\": \"[0-9.]*\"/\"version\": \"$NEW_VERSION\"/g"
+        echo "✅ Updated package.json"
+    else
+        STAGE5_SUCCESS=false
+    fi
+fi
+
+# Package-lock.json rides along with package.json — kept in sync so npm install
+# doesn't regenerate the version drift on every fresh checkout. A blanket sed is
+# NOT safe here (the lockfile has a "version" field for every dependency), so
+# node edits only the two fields that mirror package.json: the top-level version
+# and packages[""].version. npm serializes lockfiles as 2-space JSON + trailing
+# newline, which JSON.stringify reproduces byte-for-byte.
+if [ "$LITE_ONLY" = false ] && should_update "package.json"; then
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Would update: package-lock.json"
+    elif [ ! -f "package-lock.json" ]; then
+        echo "⏭️  Skipping package-lock.json (not found)"
+    elif backup_file "package-lock.json"; then
+        if node -e '
+            const fs = require("fs");
+            const f = "package-lock.json";
+            const lock = JSON.parse(fs.readFileSync(f, "utf8"));
+            lock.version = process.argv[1];
+            if (lock.packages && lock.packages[""]) lock.packages[""].version = process.argv[1];
+            fs.writeFileSync(f, JSON.stringify(lock, null, 2) + "\n");
+        ' "$NEW_VERSION"; then
+            echo "✅ Updated package-lock.json"
+        else
+            echo "⚠️  Failed to update package-lock.json"
+            STAGE5_SUCCESS=false
+        fi
+    else
+        STAGE5_SUCCESS=false
+    fi
+fi
+
+if [ "$STAGE5_SUCCESS" = true ]; then
+    echo "✅ Stage 5 complete"
+else
+    echo "⚠️  Stage 5 completed with warnings"
+fi
+echo ""
+
+# ============================================
+# STAGE 5B: UPDATE PROJECT_STATS.md
+# ============================================
+
+if [ "$LITE_ONLY" = true ]; then
+    echo "📝 Stage 5B: Skipping PROJECT_STATS.md (LITE ONLY mode)"
+    echo ""
+else
+    echo "📝 Stage 5B: Updating PROJECT_STATS.md with auto-counted metrics..."
+    STAGE5B_SUCCESS=true
+
+    PROJECT_STATS_FILE="docs/PROJECT_STATS.md"
+
+    if [ -f "$PROJECT_STATS_FILE" ]; then
+        if [ "$DRY_RUN" = true ]; then
+            echo "   Would update: $PROJECT_STATS_FILE"
+            echo "   - Version → $NEW_VERSION"
+            echo "   - Auto-count modules, tests, CSS, JSDoc, docs"
+            echo "   - Auto-count test files, boot file lines, per-directory modules"
+            echo "   - Auto-detect lite version"
+            echo "   - Update last modified date"
+        elif backup_file "$PROJECT_STATS_FILE"; then
+            # Count current metrics.
+            #
+            # Counting lives in scripts/collect-stats.cjs — ONE implementation
+            # shared with the build (dist/stats.json). It
+            # used to be inline here AND duplicated in 5C, which is two ways for
+            # two public surfaces (docs.minicycle.app, the SparkinCreations
+            # homepage) to disagree about the same repo.
+            echo "   📊 Counting metrics..."
+            if ! eval "$(node scripts/collect-stats.cjs --shell)"; then
+                echo "   ⚠️  collect-stats.cjs failed — leaving PROJECT_STATS.md untouched"
+                echo "      (better a stale number than a wrong one; these are published)"
+                STAGE5B_SUCCESS=false
+            else
+            MODULE_COUNT="$STATS_MODULES"
+            TEST_COUNT="$STATS_TESTS"
+            CSS_COUNT="$STATS_CSSFILES"
+            JSDOC_COUNT="$STATS_JSDOCBLOCKS"
+            DOC_COUNT="$STATS_DOCFILES"
+            CURRENT_DATE=$(date +"%B %d, %Y")
+
+            TEST_FILE_COUNT="$STATS_TESTFILES"
+            LITE_VER="$STATS_LITEVERSION"
+
+            MAIN_JS_LINES="$STATS_BOOT_MINICYCLE_MAIN"
+            ORCH_LINES="$STATS_BOOT_ORCHESTRATOR"
+            COREBOOT_LINES="$STATS_BOOT_COREBOOT"
+            FEATBOOT_LINES="$STATS_BOOT_FEATUREBOOT"
+            UIBOOT_LINES="$STATS_BOOT_UIBOOT"
+            BOOT_TOTAL="$STATS_BOOTTOTAL"
+
+            echo "   - Modules: $MODULE_COUNT"
+            echo "   - Tests: $TEST_COUNT"
+            echo "   - Test Files: $TEST_FILE_COUNT"
+            echo "   - CSS Files: $CSS_COUNT"
+            echo "   - JSDoc Blocks: $JSDOC_COUNT"
+            echo "   - Documentation Files: $DOC_COUNT"
+            echo "   - Lite Version: $LITE_VER"
+            echo "   - Boot Files Total: ~$BOOT_TOTAL lines"
+
+            # Update Quick Reference table
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*App Version\*\* | [0-9.]* |/| **App Version** | $NEW_VERSION |/g"
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*Total Modules\*\* | [0-9,]* |/| **Total Modules** | $MODULE_COUNT |/g"
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*Total Tests\*\* | [0-9,]* |/| **Total Tests** | $TEST_COUNT |/g"
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*CSS Files\*\* | [0-9,]* |/| **CSS Files** | $CSS_COUNT |/g"
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*JSDoc Blocks\*\* | [0-9,]* |/| **JSDoc Blocks** | $JSDOC_COUNT |/g"
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*Documentation Files\*\* | [0-9,]* |/| **Documentation Files** | $DOC_COUNT |/g"
+
+            # Update Lite Version
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*Lite Version\*\* | [0-9.]* (frozen) |/| **Lite Version** | $LITE_VER (frozen) |/g"
+
+            # Update "Last Updated" date at top
+            do_sed "$PROJECT_STATS_FILE" "s/\*\*Last Updated\*\*: .*/\*\*Last Updated\*\*: $CURRENT_DATE/g"
+
+            # Update Total in Module Breakdown table (should match MODULE_COUNT)
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*Total\*\* | \*\*[0-9,]*\*\* |/| **Total** | **$MODULE_COUNT** |/g"
+
+            # Update per-directory module counts.
+            #
+            # DERIVED from modules/*/ , not a hardcoded list. The previous version
+            # named 13 directories explicitly and sed only REWRITES rows that
+            # already exist — so when modules/platform/ was added it was silently
+            # absent from the table, and the per-directory rows summed to one less
+            # than the stated Total for months (found Aug 2026). A new folder now
+            # updates automatically, and one without a row is reported below
+            # instead of vanishing.
+            ROW_SUM=0
+            MISSING_ROWS=""
+            for MODULE_DIR in modules/*/; do
+                DIR_NAME=$(basename "$MODULE_DIR")
+                # From collect-stats.cjs (STATS_DIR_<name>); find is the fallback
+                # so an unexpected directory name can't blank the row.
+                eval "DIR_COUNT=\${STATS_DIR_$(printf '%s' "$DIR_NAME" | tr -c 'A-Za-z0-9' '_' | tr 'a-z' 'A-Z'):-}"
+                if [ -z "$DIR_COUNT" ]; then
+                    DIR_COUNT=$(find "$MODULE_DIR" -name "*.js" -type f 2>/dev/null | wc -l | xargs)
+                fi
+                if grep -q '| `'"$DIR_NAME"'/` |' "$PROJECT_STATS_FILE"; then
+                    do_sed "$PROJECT_STATS_FILE" 's#| `'"$DIR_NAME"'/` | [0-9]* |#| `'"$DIR_NAME"'/` | '"$DIR_COUNT"' |#g'
+                    # Sum only what the TABLE shows, so the gap below is the real
+                    # under-report rather than always zero.
+                    ROW_SUM=$((ROW_SUM + DIR_COUNT))
+                else
+                    MISSING_ROWS="$MISSING_ROWS $DIR_NAME/"
+                fi
+            done
+
+            # The invariant that actually broke: rows must sum to Total Modules.
+            if [ -n "$MISSING_ROWS" ]; then
+                echo "   ⚠️  PROJECT_STATS.md Module Breakdown has NO ROW for:$MISSING_ROWS"
+                echo "      Add the row(s) — until then the table under-reports by $((MODULE_COUNT - ROW_SUM))."
+            elif [ "$ROW_SUM" != "$MODULE_COUNT" ]; then
+                echo "   ⚠️  PROJECT_STATS.md rows sum to $ROW_SUM but Total Modules is $MODULE_COUNT."
+            fi
+
+            # Update Test Coverage section
+            do_sed "$PROJECT_STATS_FILE" "s/| Total Tests | [0-9,]* |/| Total Tests | $TEST_COUNT |/g"
+            do_sed "$PROJECT_STATS_FILE" "s/| Test Files | [0-9,]* |/| Test Files | $TEST_FILE_COUNT |/g"
+
+            # Update Boot Files line counts
+            do_sed "$PROJECT_STATS_FILE" 's#| `miniCycle-main.js` | ~[0-9,]* |#| `miniCycle-main.js` | ~'"$MAIN_JS_LINES"' |#g'
+            do_sed "$PROJECT_STATS_FILE" 's#| `modules/boot/orchestrator.js` | ~[0-9,]* |#| `modules/boot/orchestrator.js` | ~'"$ORCH_LINES"' |#g'
+            do_sed "$PROJECT_STATS_FILE" 's#| `modules/boot/coreBoot.js` | ~[0-9,]* |#| `modules/boot/coreBoot.js` | ~'"$COREBOOT_LINES"' |#g'
+            do_sed "$PROJECT_STATS_FILE" 's#| `modules/boot/featureBoot.js` | ~[0-9,]* |#| `modules/boot/featureBoot.js` | ~'"$FEATBOOT_LINES"' |#g'
+            do_sed "$PROJECT_STATS_FILE" 's#| `modules/boot/uiBoot.js` | ~[0-9,]* |#| `modules/boot/uiBoot.js` | ~'"$UIBOOT_LINES"' |#g'
+            do_sed "$PROJECT_STATS_FILE" "s/| \*\*Total\*\* | \*\*~[0-9,]*\*\* |/| **Total** | **~$BOOT_TOTAL** |/g"
+
+            echo "✅ Updated $PROJECT_STATS_FILE with auto-counted metrics"
+            fi   # end collect-stats guard
+        else
+            echo "⚠️  Failed to update $PROJECT_STATS_FILE"
+            STAGE5B_SUCCESS=false
+        fi
+    else
+        echo "ℹ️  $PROJECT_STATS_FILE not found (skipping)"
+    fi
+
+    if [ "$STAGE5B_SUCCESS" = true ]; then
+        echo "✅ Stage 5B complete"
+    else
+        echo "⚠️  Stage 5B completed with warnings"
+    fi
+    echo ""
+
+    # ============================================
+    # NOTE: Debug markers now derive from globalThis
+    # ============================================
+
+    echo "ℹ️  Debug markers (APPCONTEXT_VERSION, CONSTANTS_VERSION, DIBASE_VERSION)"
+    echo "   now derive from globalThis.APP_VERSION at runtime - no script updates needed"
+    echo ""
+fi
+
+# ============================================
+# STAGE 6: GENERATE RESTORE SCRIPT
+# ============================================
+
+if [ "$DRY_RUN" = false ]; then
+    echo "📝 Stage 6: Generating restore script..."
+
+    # Delegate to scripts/generate_restore_script.py (splits-plan Priority 7, the
+    # last scheduled stage). It takes the file list on stdin and owns the template.
+    # Extracted so restore.sh — the undo button for a release, written every time
+    # and read only in an emergency — can finally be TESTED:
+    # scripts/test-generate-restore-script.py builds a throwaway web root and runs
+    # a generated restore for real, including the two-levels-up path resolution
+    # whose one-level-up ancestor silently restored into backup/ and recovered
+    # nothing. Output verified byte-identical to the heredoc this replaced.
+    {
+        echo "version.js"
+        echo "service-worker.js"
+        printf '%s\n' "${CORE_HTML_FILES[@]}"
+        printf '%s\n' "${CSS_FILES[@]}"
+        printf '%s\n' "${MANIFEST_FILES[@]}"
+        printf '%s\n' "${PACKAGE_FILES[@]}"
+        echo "docs/PROJECT_STATS.md"
+        # Lite files: backed up during --lite / --lite-only runs. Without these a
+        # --lite-only release produced a restore.sh restoring none of what it changed.
+        printf '%s\n' "${LITE_HTML_FILES[@]}" "${LITE_JS_FILES[@]}" "${LITE_CSS_FILES[@]}" "${LITE_MANIFEST_FILES[@]}"
+        # Deploy configs: rewritten in place by the CSP hash stage.
+        printf '%s\n' netlify.toml .htaccess nginx-security.conf
+    } | python3 "$(dirname "$0")/generate_restore_script.py" --out "$BACKUP_FOLDER/restore.sh"
+    echo "✅ Stage 6 complete"
+    echo ""
+fi
+
+# ============================================
+# STAGE 7: VALIDATION
+# ============================================
+
+if [ "$DRY_RUN" = false ]; then
+    echo "📝 Stage 7: Validating updated files..."
+    VALIDATION_ERRORS=0
+
+    if [ "$LITE_ONLY" = true ]; then
+        # Validate lite files only
+        if should_update "lite/miniCycle-lite.html" && [ -f "lite/miniCycle-lite.html" ]; then
+            if ! grep -q "?v=$NEW_VERSION" lite/miniCycle-lite.html; then
+                echo "⚠️  Warning: lite/miniCycle-lite.html may not have updated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            else
+                echo "✅ lite/miniCycle-lite.html validated"
+            fi
+        fi
+
+        if should_update "manifest-lite.json" && [ -f "manifest-lite.json" ]; then
+            if ! grep -q "\"version\": \"$NEW_VERSION\"" manifest-lite.json; then
+                echo "⚠️  Warning: manifest-lite.json may not have updated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            else
+                echo "✅ manifest-lite.json validated"
+            fi
+        fi
+    else
+        # Validate version.js
+        if [ -f "version.js" ]; then
+            if ! grep -q "globalThis.APP_VERSION = '$NEW_VERSION'" version.js; then
+                echo "⚠️  Warning: version.js APP_VERSION may not have generated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            elif ! grep -q "globalThis.CACHE_VERSION = $NEW_CACHE_VERSION" version.js; then
+                echo "⚠️  Warning: version.js CACHE_VERSION may not have generated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            else
+                echo "✅ version.js validated"
+            fi
+        else
+            echo "❌ Error: version.js was not generated"
+            VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        fi
+
+        # Validate service-worker.js
+        if [ -f "service-worker.js" ]; then
+            if ! grep -q "var APP_VERSION = '$NEW_VERSION'" service-worker.js; then
+                echo "⚠️  Warning: service-worker.js APP_VERSION may not have updated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            elif ! grep -q "var CACHE_VERSION = 'v$NEW_CACHE_VERSION'" service-worker.js; then
+                echo "⚠️  Warning: service-worker.js CACHE_VERSION may not have updated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            elif ! grep -q "var CACHE_VERSION_NUMBER = $NEW_CACHE_VERSION" service-worker.js; then
+                echo "⚠️  Warning: service-worker.js CACHE_VERSION_NUMBER may not have updated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            else
+                echo "✅ service-worker.js validated"
+            fi
+        fi
+
+        # Validate HTML files
+        if should_update "miniCycle.html" && [ -f "miniCycle.html" ]; then
+            if ! grep -q "content=\"$NEW_VERSION\"" miniCycle.html; then
+                echo "⚠️  Warning: miniCycle.html may not have updated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            fi
+        fi
+
+        # Validate manifests
+        if should_update "manifest.json" && [ -f "manifest.json" ]; then
+            if ! grep -q "\"version\": \"$NEW_VERSION\"" manifest.json; then
+                echo "⚠️  Warning: manifest.json may not have updated correctly"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+            fi
+        fi
+    fi
+
+    if [ $VALIDATION_ERRORS -eq 0 ]; then
+        echo "✅ All files validated successfully!"
+        echo "✅ Stage 7 complete"
+    else
+        echo "⚠️  Found $VALIDATION_ERRORS potential issues - check files manually"
+        echo "💡 If needed, restore with: cd $BACKUP_FOLDER && ./restore.sh"
+    fi
+    echo ""
+fi
+
+# ============================================
+# CSP HASH AUTO-UPDATE
+# ============================================
+# Scans inline <script> blocks in the HTML source files, computes SHA-256
+# hashes, and syncs the script-src directive in ALL deployment configs
+# (netlify.toml, .htaccess, nginx-security.conf) when hashes are new or stale.
+
+echo "🔒 CSP Hash Verification"
+echo "------------------------"
+
+if [ "$DRY_RUN" = true ]; then
+    echo "🔍 [DRY RUN] Would verify CSP hashes..."
+elif [ "$LITE_ONLY" = true ]; then
+    echo "⏭️  Skipping CSP hashes (LITE ONLY mode)"
+else
+    # Canonical CSP hash set comes from the inline <script> blocks in the three
+    # source files below, then is applied to ALL deployment configs in their
+    # native script-src format (netlify.toml + nginx = single line; .htaccess =
+    # Apache multi-line "\" continuation). Only the script-src hash list is
+    # touched — every other directive is preserved, and configs may legitimately
+    # differ in those other directives.
+
+    # Back up the deploy configs BEFORE the Python rewrites them in place — the
+    # Python writes without backing up, so without this restore.sh couldn't
+    # recover a botched CSP edit. Missing files are skipped (|| true).
+    for cfg in netlify.toml .htaccess nginx-security.conf; do
+        [ -f "$cfg" ] && backup_file "$cfg" || true
+    done
+
+    # The hashing + config-rewrite logic lives in scripts/csp_hash_sync.py so it
+    # can be run and TESTED on its own (scripts/test-csp-hash-sync.py, 17 cases)
+    # instead of only as a side effect of cutting a release. Same model as
+    # changelog-range.sh. Behaviour is unchanged — the extraction was verified by
+    # running both implementations against perturbed configs and diffing: all
+    # three came out byte-identical.
+    python3 "$(dirname "$0")/csp_hash_sync.py"
+fi
+
+echo ""
+
+# ============================================
+# CORE FILE UPDATES COMPLETE
+# ============================================
+
+echo ""
+echo "════════════════════════════════════════"
+if [ "$DRY_RUN" = true ]; then
+    echo "🔍 DRY RUN COMPLETE - No files were modified"
+elif [ "$LITE_ONLY" = true ]; then
+    echo "✅ LITE VERSION UPDATE COMPLETE"
+else
+    echo "✅ CORE FILE UPDATES COMPLETE"
+fi
+echo "════════════════════════════════════════"
+echo ""
+echo "📊 Summary:"
+if [ "$LITE_ONLY" = true ]; then
+    echo "   Lite version: $NEW_VERSION"
+else
+    echo "   App version: $NEW_VERSION"
+    echo "   Cache version: $NEW_CACHE_VERSION"
+    if [ "$INCLUDE_LITE" = true ] && [ -n "${NEW_LITE_VERSION:-}" ]; then
+        echo "   Lite version: $NEW_LITE_VERSION (independent)"
+    fi
+fi
+if [ "$DRY_RUN" = false ]; then
+    echo "   Files updated: $TOTAL_FILES"
+    echo "   Backup location: $BACKUP_FOLDER"
+fi
+echo ""
+
+# Exit here if dry run
+if [ "$DRY_RUN" = true ]; then
+    echo "💡 Run without --dry-run to apply these changes"
+    exit 0
+fi
+
+# ============================================
+# OPTIONAL: CHANGELOG GENERATION
+# ============================================
+
+echo "📝 Optional: Changelog"
+echo "----------------------"
+
+UPDATE_CHANGELOG=false
+if [ "$LITE_ONLY" = true ]; then
+    echo "⏭️  Skipping changelog (LITE ONLY mode)"
+elif [ "$AUTO_MODE" = true ]; then
+    if [ "$AUTO_CHANGELOG" = true ]; then
+        UPDATE_CHANGELOG=true
+        echo "🤖 Auto mode: Generating changelog..."
+    else
+        echo "⏭️  Skipping changelog (use --changelog to auto-generate)"
+    fi
+else
+    read -p "Update CHANGELOG.md with git commits? (y/N): " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        UPDATE_CHANGELOG=true
+    fi
+fi
+
+# ============================================
+# UNCOMMITTED WORK WARNING
+# ============================================
+# Deliberately OUTSIDE the --changelog stage. `git add -A` in the tag step
+# sweeps the working tree whether or not a changelog was requested, so work
+# shipping with nothing to describe it is a property of the RELEASE, not of the
+# changelog. Scoped to --changelog, `--auto --push` alone still shipped it
+# silently — which is the same shape as the bug this whole guard exists for.
+#
+# Runs before the changelog stage so an abort leaves CHANGELOG.md exactly as
+# found; otherwise the re-run after committing stacks a second entry for the
+# same version.
+PENDING_FILES=""
+if [ -n "$PRERUN_DIRTY" ]; then
+    # Strip the 2-char status column, and keep the destination half of any
+    # "old -> new" rename line.
+    PENDING_FILES=$(printf '%s\n' "$PRERUN_DIRTY" | sed -e 's/^...//' -e 's/.* -> //' | sort -u)
+fi
+
+if [ -n "$PENDING_FILES" ]; then
+    PENDING_COUNT=$(printf '%s\n' "$PENDING_FILES" | wc -l | tr -d ' ')
+    echo ""
+    echo "⚠️  $PENDING_COUNT uncommitted file(s) will ship in this release with no"
+    echo "    commit message to describe them:"
+    printf '%s\n' "$PENDING_FILES" | head -20 | sed 's/^/       /'
+    if [ "$PENDING_COUNT" -gt 20 ]; then
+        echo "       … and $((PENDING_COUNT - 20)) more"
+    fi
+    if [ "$UPDATE_CHANGELOG" = false ]; then
+        echo "    (no --changelog, so nothing will record them at all)"
+    fi
+
+    if [ -n "$RELEASE_NOTE" ]; then
+        # --note already describes them; nothing to prompt about.
+        echo "    📝 Described by --note: $RELEASE_NOTE"
+    elif [ "$AUTO_MODE" = false ] && [ "$DRY_RUN" = false ]; then
+        # Interactive runs can still bail out and commit properly first.
+        echo ""
+        # Line-oriented on purpose. With `-n 1` this returns on the keypress and
+        # leaves the user's Enter in the buffer, where it instantly satisfies the
+        # changelog prompt below with an empty answer — silently reinstating the
+        # TODO marker that prompt exists to avoid. `|| true` because set -e would
+        # treat EOF (piped/closed stdin) as a fatal error mid-release.
+        REPLY=""
+        read -r -p "Abort so you can commit these first? (y/N): " REPLY || true
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo "🛑 Aborted before tagging — commit your work, then re-run."
+            exit 1
+        fi
+        # Shipping anyway: take the changelog line now, while someone is here to
+        # give it. Blank falls through to the TODO marker below.
+        if [ "$UPDATE_CHANGELOG" = true ]; then
+            read -r -p "Changelog line for this work (blank = TODO marker): " RELEASE_NOTE || true
+            RELEASE_NOTE=$(printf '%s' "$RELEASE_NOTE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        fi
+    elif [ "$AUTO_MODE" = true ] && [ "$UPDATE_CHANGELOG" = true ]; then
+        # Unattended: no prompt to answer, so a TODO marker records the gap
+        # rather than blocking the release. --note is how you avoid it.
+        echo "    (no --note, so CHANGELOG.md gets a TODO marker to fill in)"
+    fi
+    echo ""
+fi
+
+if [ "$UPDATE_CHANGELOG" = true ]; then
+    if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+        CHANGELOG_FILE="CHANGELOG.md"
+        LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+        # Where the previous release ended. Resolution (and the reasoning
+        # behind not using the last git tag) lives in changelog-range.sh, so the
+        # release path and its regression test share one definition.
+        RANGE_LABEL_FILE=$(mktemp)
+        RANGE_START=$(bash "$(dirname "$0")/changelog-range.sh" "$CHANGELOG_FILE" "$LAST_TAG" 3>"$RANGE_LABEL_FILE" || true)
+        RANGE_LABEL=$(cat "$RANGE_LABEL_FILE" 2>/dev/null || true)
+        rm -f "$RANGE_LABEL_FILE"
+
+        if [ -n "$RANGE_START" ]; then
+            echo "📋 Getting commits since $RANGE_LABEL..."
+            COMMITS=$(git log "$RANGE_START"..HEAD --oneline --no-merges 2>/dev/null | grep -v -E "^[a-f0-9]+ (chore: [Bb]ump|chore\\(release\\): [Uu]pdate version|Bump version|Update version)" || true)
+        else
+            echo "📋 Getting recent commits..."
+            COMMITS=$(git log --oneline --no-merges -20 2>/dev/null | grep -v -E "^[a-f0-9]+ (chore: [Bb]ump|chore\\(release\\): [Uu]pdate version|Bump version|Update version)" || true)
+        fi
+
+        if [ -n "$COMMITS" ] || [ -n "$PENDING_FILES" ]; then
+            TODAY=$(date +"%Y-%m-%d")
+            NEW_ENTRY="## [$NEW_VERSION] - $TODAY"$'\n'
+            if [ -n "$COMMITS" ]; then
+                while IFS= read -r commit; do
+                    MSG=$(echo "$commit" | sed 's/^[a-f0-9]* //')
+                    # Backstop: skip anything CHANGELOG.md already says verbatim.
+                    #
+                    # The range above now stops at the previous release's heading,
+                    # which is what actually keeps the backlog out. This catches
+                    # the rest: an entry someone wrote by hand ahead of the
+                    # release, or a commit cherry-picked forward.
+                    #
+                    # It can only match subjects that were NOT reworded, which is
+                    # precisely why it cannot be the primary defence — see the
+                    # RANGE_START comment above.
+                    #
+                    # -F -x so a subject containing regex metacharacters (parens in
+                    # a conventional-commit scope, brackets, dots) matches literally
+                    # and as a whole line, never as a substring of a longer entry.
+                    if [ -f "$CHANGELOG_FILE" ] && grep -F -x -q -- "- $MSG" "$CHANGELOG_FILE"; then
+                        continue
+                    fi
+                    NEW_ENTRY+="- $MSG"$'\n'
+                done <<< "$COMMITS"
+            fi
+            if [ -n "$PENDING_FILES" ]; then
+                if [ -n "$RELEASE_NOTE" ]; then
+                    NEW_ENTRY+="- ${RELEASE_NOTE}"$'\n'
+                else
+                    NEW_ENTRY+="- TODO(changelog): uncommitted work shipped in this release — describe it here"$'\n'
+                fi
+            fi
+            NEW_ENTRY+=$'\n'
+
+            if [ -f "$CHANGELOG_FILE" ]; then
+                TEMP_FILE=$(mktemp)
+                echo "$NEW_ENTRY" > "$TEMP_FILE"
+                cat "$CHANGELOG_FILE" >> "$TEMP_FILE"
+                mv "$TEMP_FILE" "$CHANGELOG_FILE"
+            else
+                echo "# Changelog" > "$CHANGELOG_FILE"
+                echo "" >> "$CHANGELOG_FILE"
+                echo "$NEW_ENTRY" >> "$CHANGELOG_FILE"
+            fi
+
+            if [ -n "$COMMITS" ]; then
+                COMMIT_COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+                echo "✅ Changelog updated ($COMMIT_COUNT commits added)"
+            else
+                echo "✅ Changelog entry created for v$NEW_VERSION"
+            fi
+
+            if [ -n "$PENDING_FILES" ]; then
+                if [ -n "$RELEASE_NOTE" ]; then
+                    echo "   📝 Uncommitted work recorded as: $RELEASE_NOTE"
+                else
+                    echo "   ⚠️  Includes a TODO(changelog) line for the uncommitted work —"
+                    echo "       edit $CHANGELOG_FILE before pushing."
+                fi
+            fi
+        else
+            echo "ℹ️  No new commits to add"
+        fi
+    else
+        echo "⚠️  Not in a git repository - skipping changelog"
+    fi
+else
+    echo "⏭️  Skipping changelog"
+fi
+
+echo ""
+
+# ============================================
+# OPTIONAL: SAMPLE ROUTINE MANIFEST
+# ============================================
+
+echo "📦 Optional: Sample Routine Manifest"
+echo "-------------------------------------"
+
+UPDATE_SAMPLES=false
+if [ "$LITE_ONLY" = true ]; then
+    echo "⏭️  Skipping samples (LITE ONLY mode)"
+elif [ "$AUTO_MODE" = true ]; then
+    if [ "$AUTO_SAMPLES" = true ]; then
+        UPDATE_SAMPLES=true
+        echo "🤖 Auto mode: Regenerating sample manifest..."
+    else
+        echo "⏭️  Skipping samples (use --samples to regenerate)"
+    fi
+else
+    if [ "$AUTO_SAMPLES" = true ]; then
+        UPDATE_SAMPLES=true
+    else
+        read -p "Regenerate sample routine manifest? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            UPDATE_SAMPLES=true
+        fi
+    fi
+fi
+
+if [ "$UPDATE_SAMPLES" = true ]; then
+    SAMPLES_DIR="examples/sample-routines"
+    if [ -d "$SAMPLES_DIR" ]; then
+        if [ "$DRY_RUN" = true ]; then
+            echo "🔍 [DRY RUN] Would regenerate $SAMPLES_DIR/manifest.json"
+            MCYC_COUNT=$(find "$SAMPLES_DIR" -maxdepth 1 -name "*.mcyc" | wc -l | tr -d ' ')
+            echo "   Found $MCYC_COUNT .mcyc files"
+        else
+            python3 -c "
+import json, os, glob, unicodedata
+
+def is_emoji_char(c):
+    return unicodedata.category(c) == 'So' or c in '\uFE0F\u200D' or ord(c) > 0x1F000
+
+def extract_emoji_and_name(title):
+    title = title.strip()
+    # Try leading emoji
+    i = 0
+    while i < len(title) and is_emoji_char(title[i]):
+        i += 1
+    if i > 0:
+        return title[:i].rstrip(), title[i:].strip()
+    # Try trailing emoji
+    j = len(title) - 1
+    while j >= 0 and is_emoji_char(title[j]):
+        j -= 1
+    if j < len(title) - 1:
+        return title[j+1:].lstrip(), title[:j+1].strip()
+    return '\U0001F4CB', title
+
+samples_dir = '$SAMPLES_DIR'
+manifest = []
+for f in sorted(glob.glob(os.path.join(samples_dir, '*.mcyc'))):
+    with open(f) as fh:
+        data = json.load(fh)
+    title = data.get('title', os.path.basename(f).replace('.mcyc', '').replace('_', ' '))
+    emoji, name = extract_emoji_and_name(title)
+    manifest.append({'file': os.path.basename(f), 'name': name, 'emoji': emoji})
+
+with open(os.path.join(samples_dir, 'manifest.json'), 'w') as fh:
+    json.dump(manifest, fh, indent=2, ensure_ascii=False)
+    fh.write('\n')
+print(f'✅ Generated manifest.json ({len(manifest)} samples)')
+"
+        fi
+    else
+        echo "⚠️  $SAMPLES_DIR directory not found"
+    fi
+else
+    echo "⏭️  Skipping samples"
+fi
+
+echo ""
+
+# ============================================
+# PRE-PLATFORM: SWEEP iCLOUD DUPLICATE CRUFT
+# ============================================
+# iCloud (repo lives under ~/Documents) mints "<name> 2.<ext>" duplicates that
+# broke the v2.273 Android release: a stray "assets 2/" made the payload
+# rebuild throw ENOTEMPTY, the non-fatal stage carried on, and the APK shipped
+# versionName X over an X-1 payload with git status clean. Sweep BEFORE any
+# platform stage so the class can't recur. Deletes only when the original
+# sibling exists; never touches archives. See scripts/sweep-icloud-cruft.cjs.
+if [ "$BUILD_CHROME" = true ] || [ "$BUILD_ANDROID" = true ] || [ "$BUILD_IOS" = true ] || [ "$BUILD_DESKTOP" = true ]; then
+    node scripts/sweep-icloud-cruft.cjs || echo "⚠️  Cruft sweep failed (continuing — builds may hit ENOTEMPTY on duplicates)"
+fi
+
+# ============================================
+# OPTIONAL: REBUILD CHROME (FULL) EXTENSION
+# ============================================
+# Regenerates chrome/full/ from web/ (externalizes inline scripts, strips the
+# service worker, prunes assets, writes the MV3 manifest with $NEW_VERSION).
+# Runs BEFORE the git-tag stage so the rebuilt extension is included in the
+# release commit/tag. Bundles the full app, including the unlockable Task Order
+# mini-game (games/), with its back-link rewritten for the index.html entry.
+# See web/scripts/build-chrome-full.cjs.
+
+echo "🧩 Optional: Chrome (full) Extension"
+echo "------------------------------------"
+
+REBUILD_CHROME=false
+if [ "$LITE_ONLY" = true ]; then
+    echo "⏭️  Skipping Chrome extension (LITE ONLY mode)"
+elif [ "$AUTO_MODE" = true ]; then
+    if [ "$BUILD_CHROME" = true ]; then
+        REBUILD_CHROME=true
+        echo "🤖 Auto mode: Rebuilding Chrome (full) extension..."
+    else
+        echo "⏭️  Skipping Chrome extension (use --chrome to rebuild)"
+    fi
+else
+    if [ "$BUILD_CHROME" = true ]; then
+        REBUILD_CHROME=true
+    else
+        read -p "Rebuild Chrome (full) extension to chrome/full/? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            REBUILD_CHROME=true
+        fi
+    fi
+fi
+
+if [ "$REBUILD_CHROME" = true ]; then
+    if [ -f "scripts/build-chrome-full.cjs" ]; then
+        # Don't let a build failure abort the whole run (set -e) — the version
+        # files are already updated; just warn that chrome/full/ may be stale.
+        if node scripts/build-chrome-full.cjs; then
+            echo "✅ Rebuilt chrome/full/ (v$NEW_VERSION) — load unpacked or zip for the Web Store"
+        else
+            echo "⚠️  Chrome extension build failed — chrome/full/ may be stale (version files already updated)"
+        fi
+    else
+        echo "⚠️  scripts/build-chrome-full.cjs not found - skipping"
+    fi
+else
+    echo "⏭️  Skipping Chrome extension"
+fi
+
+echo ""
+
+# ============================================
+# OPTIONAL: REBUILD ANDROID (CAPACITOR) PAYLOAD
+# ============================================
+# Regenerates mobile/android/www/ from web/ (drops the PWA/SW blocks, prunes
+# assets), syncs the native versionName to $NEW_VERSION, and bumps versionCode
+# (Play requires a strictly-increasing integer). Runs BEFORE the git-tag stage so
+# the rebuilt payload + version bump are part of the release commit/tag. The
+# payload bundles the unlockable Task Order mini-game (games/); the following
+# cap sync propagates it into the native project.
+# See web/scripts/build-android-www.cjs and mobile/android/docs/ANDROID_BUILD_AND_DIFFERENCES.md.
+
+echo "🤖 Optional: Android (Capacitor) App"
+echo "------------------------------------"
+
+REBUILD_ANDROID=false
+if [ "$LITE_ONLY" = true ]; then
+    echo "⏭️  Skipping Android app (LITE ONLY mode)"
+elif [ "$AUTO_MODE" = true ]; then
+    if [ "$BUILD_ANDROID" = true ]; then
+        REBUILD_ANDROID=true
+        echo "🤖 Auto mode: Rebuilding Android web payload..."
+    else
+        echo "⏭️  Skipping Android app (use --android to rebuild)"
+    fi
+else
+    if [ "$BUILD_ANDROID" = true ]; then
+        REBUILD_ANDROID=true
+    else
+        read -p "Rebuild Android (Capacitor) web payload to mobile/android/www/? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            REBUILD_ANDROID=true
+        fi
+    fi
+fi
+
+if [ "$REBUILD_ANDROID" = true ]; then
+    if [ -f "scripts/build-android-www.cjs" ]; then
+        # Don't let a build failure abort the whole run (set -e) — the version
+        # files are already updated; just warn that the payload may be stale.
+        ANDROID_BUILD_OK=false
+        if node scripts/build-android-www.cjs; then
+            echo "✅ Rebuilt mobile/android/www/ (v$NEW_VERSION)"
+            ANDROID_BUILD_OK=true
+        else
+            echo "⚠️  Android web payload build failed — mobile/android/www/ is stale"
+            echo "    ↳ SKIPPING native versionName/versionCode bump + cap sync so the build can't"
+            echo "      be stamped v$NEW_VERSION while still running old code. Fix the build, then"
+            echo "      re-run: ./scripts/update-version.sh --android (no version bump needed)."
+        fi
+
+        # Sync the native versionName to NEW_VERSION and bump versionCode. The
+        # native build.gradle is committed (not generated), so patch it in place.
+        # Gated on a SUCCESSFUL payload rebuild — bumping the version over a stale
+        # www/ is exactly the version/code mismatch we want to avoid.
+        ANDROID_GRADLE="../mobile/android/android/app/build.gradle"
+        if [ "$ANDROID_BUILD_OK" = false ] && [ "$DRY_RUN" = false ]; then
+            :  # build failed — already warned above; leave build.gradle + cap sync untouched
+        elif [ "$DRY_RUN" = true ]; then
+            echo "🔍 [dry-run] would set versionName \"$NEW_VERSION\" and bump versionCode in $ANDROID_GRADLE"
+        elif [ -f "$ANDROID_GRADLE" ]; then
+            "${SED_INPLACE[@]}" "s/versionName \"[^\"]*\"/versionName \"$NEW_VERSION\"/" "$ANDROID_GRADLE"
+            CURRENT_CODE=$(grep -oE 'versionCode[[:space:]]+[0-9]+' "$ANDROID_GRADLE" | grep -oE '[0-9]+' | head -1)
+            if [ -n "$CURRENT_CODE" ]; then
+                NEW_CODE=$((CURRENT_CODE + 1))
+                "${SED_INPLACE[@]}" "s/versionCode [0-9][0-9]*/versionCode $NEW_CODE/" "$ANDROID_GRADLE"
+                echo "✅ Android version: versionName $NEW_VERSION, versionCode $CURRENT_CODE → $NEW_CODE"
+            else
+                echo "⚠️  Could not read versionCode from build.gradle — bump it manually"
+            fi
+
+            # Copy the rebuilt payload into the native project if Capacitor is installed.
+            if [ -d "../mobile/android/node_modules/@capacitor/cli" ]; then
+                ( cd ../mobile/android && npx cap sync android ) \
+                    && echo "✅ cap sync complete" \
+                    || echo "⚠️  cap sync failed — run 'npm run sync' in mobile/android before building"
+            else
+                echo "ℹ️  Capacitor not installed in mobile/android — run 'npm install && npm run sync' there before building the APK"
+            fi
+
+            # ── Optional dev-loop deploy: build the debug APK and install/launch
+            #    it on a connected device so the just-rebuilt payload goes live.
+            #    Opt in with --android-run; or answer the prompt in interactive
+            #    mode. Skipped in dry-run, and in --auto unless --android-run.
+            DO_DEPLOY=false
+            if [ "$DRY_RUN" = true ]; then
+                :
+            elif [ "$DEPLOY_ANDROID" = true ]; then
+                DO_DEPLOY=true
+            elif [ "$AUTO_MODE" = false ]; then
+                read -p "Build & install the debug APK on a connected device now? (y/N): " -n 1 -r
+                echo ""
+                if [[ $REPLY =~ ^[Yy]$ ]]; then DO_DEPLOY=true; fi
+            fi
+
+            if [ "$DO_DEPLOY" = true ]; then
+                # Resolve adb / ANDROID_HOME / a JDK 17+ (Gradle needs it; the
+                # Capacitor plugins compile at language level 21) without relying
+                # on the caller having exported them.
+                _java_ok() { [ -n "${1:-}" ] && [ -x "$1/bin/java" ] && "$1/bin/java" -version 2>&1 | grep -qE '"(1[7-9]|2[0-9])'; }
+                DEPLOY_ADB="$(command -v adb || true)"
+                if [ -z "$DEPLOY_ADB" ]; then
+                    for cand in "${ANDROID_HOME:-}" "$HOME/Library/Android/sdk" "/opt/homebrew/share/android-commandlinetools" "/usr/local/share/android-commandlinetools"; do
+                        if [ -n "$cand" ] && [ -x "$cand/platform-tools/adb" ]; then
+                            DEPLOY_ADB="$cand/platform-tools/adb"
+                            export ANDROID_HOME="${ANDROID_HOME:-$cand}"
+                            break
+                        fi
+                    done
+                fi
+                if ! _java_ok "${JAVA_HOME:-}"; then
+                    for jh in "/opt/homebrew/opt/openjdk@21" "/opt/homebrew/opt/openjdk@17" "$(/usr/libexec/java_home -v 21 2>/dev/null || true)" "$(/usr/libexec/java_home -v 17 2>/dev/null || true)"; do
+                        if _java_ok "$jh"; then export JAVA_HOME="$jh"; break; fi
+                    done
+                fi
+
+                if [ -z "$DEPLOY_ADB" ]; then
+                    echo "⚠️  adb not found — set ANDROID_HOME or add platform-tools to PATH; skipping APK install"
+                elif ! _java_ok "${JAVA_HOME:-}"; then
+                    echo "⚠️  No JDK 17+ found (Gradle requirement) — set JAVA_HOME; skipping APK build"
+                elif ! "$DEPLOY_ADB" devices | grep -qE "[[:space:]]device$"; then
+                    echo "⚠️  No connected device/emulator — start one (check 'adb devices') before --android-run; skipping APK build/install"
+                else
+                    echo "📦 Building debug APK (JDK: $JAVA_HOME)…"
+                    if ( cd ../mobile/android/android && ./gradlew assembleDebug -q ); then
+                        APK="../mobile/android/android/app/build/outputs/apk/debug/app-debug.apk"
+                        if "$DEPLOY_ADB" install -r "$APK"; then
+                            PKG="$(grep -oE 'applicationId "[^"]*"' "$ANDROID_GRADLE" | head -1 | sed -E 's/.*"([^"]*)".*/\1/')"
+                            if [ -n "$PKG" ]; then
+                                "$DEPLOY_ADB" shell am force-stop "$PKG" >/dev/null 2>&1 || true
+                                if "$DEPLOY_ADB" shell am start -n "$PKG/.MainActivity" >/dev/null 2>&1; then
+                                    echo "✅ Installed & launched $PKG (v$NEW_VERSION) on device"
+                                else
+                                    echo "✅ Installed $PKG (v$NEW_VERSION) — could not auto-launch; open it manually"
+                                fi
+                            else
+                                echo "✅ Installed APK (could not parse applicationId to auto-launch)"
+                            fi
+                        else
+                            echo "⚠️  adb install failed — is the device authorized?"
+                        fi
+                    else
+                        echo "⚠️  Gradle assembleDebug failed — APK not installed (version files already updated)"
+                    fi
+                fi
+            fi
+        else
+            echo "⚠️  $ANDROID_GRADLE not found — skipping native version sync"
+        fi
+    else
+        echo "⚠️  scripts/build-android-www.cjs not found - skipping"
+    fi
+else
+    echo "⏭️  Skipping Android app"
+fi
+
+echo ""
+
+# ============================================
+# OPTIONAL: REBUILD IOS (CAPACITOR) PAYLOAD
+# ============================================
+# Regenerates mobile/ios/www/ from web/ (same shared transform as Android —
+# build-capacitor-www.cjs), syncs the native MARKETING_VERSION to $NEW_VERSION,
+# and bumps CURRENT_PROJECT_VERSION (App Store Connect requires a strictly-
+# increasing build number per version). Runs BEFORE the git-tag stage so the
+# rebuilt payload + version bump are part of the release commit/tag. The payload
+# bundles the unlockable Task Order mini-game (games/); the following cap sync
+# propagates it into the native project.
+# See web/scripts/build-ios-www.cjs and mobile/ios/docs/IOS_BUILD_AND_DIFFERENCES.md.
+
+echo "🍎 Optional: iOS (Capacitor) App"
+echo "--------------------------------"
+
+REBUILD_IOS=false
+if [ "$LITE_ONLY" = true ]; then
+    echo "⏭️  Skipping iOS app (LITE ONLY mode)"
+elif [ "$AUTO_MODE" = true ]; then
+    if [ "$BUILD_IOS" = true ]; then
+        REBUILD_IOS=true
+        echo "🍎 Auto mode: Rebuilding iOS web payload..."
+    else
+        echo "⏭️  Skipping iOS app (use --ios to rebuild)"
+    fi
+else
+    if [ "$BUILD_IOS" = true ]; then
+        REBUILD_IOS=true
+    else
+        read -p "Rebuild iOS (Capacitor) web payload to mobile/ios/www/? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            REBUILD_IOS=true
+        fi
+    fi
+fi
+
+if [ "$REBUILD_IOS" = true ]; then
+    if [ -f "scripts/build-ios-www.cjs" ]; then
+        # Don't let a build failure abort the whole run (set -e) — the version
+        # files are already updated; just warn that the payload may be stale.
+        IOS_BUILD_OK=false
+        if node scripts/build-ios-www.cjs; then
+            echo "✅ Rebuilt mobile/ios/www/ (v$NEW_VERSION)"
+            IOS_BUILD_OK=true
+        else
+            echo "⚠️  iOS web payload build failed — mobile/ios/www/ is stale"
+            echo "    ↳ SKIPPING native MARKETING_VERSION/build-number bump + cap sync so the build"
+            echo "      can't be stamped v$NEW_VERSION while still running old code. Fix the build,"
+            echo "      then re-run: ./scripts/update-version.sh --ios (no version bump needed)."
+        fi
+
+        # Sync MARKETING_VERSION to NEW_VERSION and bump CURRENT_PROJECT_VERSION.
+        # The Xcode project is committed (not generated), so patch it in place —
+        # both occurrences (Debug + Release configs) are kept in lockstep by /g.
+        # Gated on a SUCCESSFUL payload rebuild — bumping the version over a stale
+        # www/ is exactly the version/code mismatch we want to avoid.
+        IOS_PBXPROJ="../mobile/ios/ios/App/App.xcodeproj/project.pbxproj"
+        if [ "$IOS_BUILD_OK" = false ] && [ "$DRY_RUN" = false ]; then
+            :  # build failed — already warned above; leave the Xcode project + cap sync untouched
+        elif [ "$DRY_RUN" = true ]; then
+            echo "🔍 [dry-run] would set MARKETING_VERSION = $NEW_VERSION and bump CURRENT_PROJECT_VERSION in $IOS_PBXPROJ"
+        elif [ -f "$IOS_PBXPROJ" ]; then
+            "${SED_INPLACE[@]}" "s/MARKETING_VERSION = [^;]*;/MARKETING_VERSION = $NEW_VERSION;/g" "$IOS_PBXPROJ"
+            CURRENT_BUILD=$(grep -oE 'CURRENT_PROJECT_VERSION = [0-9]+' "$IOS_PBXPROJ" | grep -oE '[0-9]+' | head -1)
+            if [ -n "$CURRENT_BUILD" ]; then
+                NEW_BUILD=$((CURRENT_BUILD + 1))
+                "${SED_INPLACE[@]}" "s/CURRENT_PROJECT_VERSION = [0-9][0-9]*;/CURRENT_PROJECT_VERSION = $NEW_BUILD;/g" "$IOS_PBXPROJ"
+                echo "✅ iOS version: MARKETING_VERSION $NEW_VERSION, build $CURRENT_BUILD → $NEW_BUILD"
+            else
+                echo "⚠️  Could not read CURRENT_PROJECT_VERSION from project.pbxproj — bump it manually"
+            fi
+
+            # Copy the rebuilt payload into the native project if Capacitor is installed.
+            if [ -d "../mobile/ios/node_modules/@capacitor/cli" ]; then
+                ( cd ../mobile/ios && npx cap sync ios ) \
+                    && echo "✅ cap sync complete" \
+                    || echo "⚠️  cap sync failed — run 'npm run sync' in mobile/ios before building"
+            else
+                echo "ℹ️  Capacitor not installed in mobile/ios — run 'npm install && npm run sync' there before building in Xcode"
+            fi
+        else
+            echo "⚠️  $IOS_PBXPROJ not found — skipping native version sync"
+        fi
+    else
+        echo "⚠️  scripts/build-ios-www.cjs not found - skipping"
+    fi
+else
+    echo "⏭️  Skipping iOS app"
+fi
+
+echo ""
+
+# ============================================
+# OPTIONAL: REBUILD DESKTOP (ELECTRON) PAYLOAD
+# ============================================
+# Regenerates desktop/www/ from web/ with the same engine as Android/iOS (drops
+# the PWA/SW blocks, prunes assets), then syncs desktop/package.json's version
+# to $NEW_VERSION — electron-builder stamps the installers and the About box
+# from that field, so a stale value would ship an installer named for a version
+# it does not contain. Runs BEFORE the git-tag stage so the version sync is
+# part of the release commit/tag. www/ itself is gitignored (main.js serves it
+# straight from desktop/www/; there is no cap sync step).
+# With --desktop-dist the shell is smoke-booted (screenshot + exit code) and the
+# macOS + Windows installers are built into desktop/dist/ (gitignored, unsigned).
+# See web/scripts/build-desktop-www.cjs and desktop/docs/DESKTOP_BUILD_AND_DIFFERENCES.md.
+
+echo "🖥️  Optional: Desktop (Electron) App"
+echo "------------------------------------"
+
+REBUILD_DESKTOP=false
+if [ "$LITE_ONLY" = true ]; then
+    echo "⏭️  Skipping desktop app (LITE ONLY mode)"
+elif [ "$AUTO_MODE" = true ]; then
+    if [ "$BUILD_DESKTOP" = true ]; then
+        REBUILD_DESKTOP=true
+        echo "🤖 Auto mode: Rebuilding desktop (Electron) payload..."
+    else
+        echo "⏭️  Skipping desktop app (use --desktop to rebuild)"
+    fi
+else
+    if [ "$BUILD_DESKTOP" = true ]; then
+        REBUILD_DESKTOP=true
+    else
+        read -p "Rebuild desktop (Electron) web payload to desktop/www/? (y/N): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            REBUILD_DESKTOP=true
+        fi
+    fi
+fi
+
+if [ "$REBUILD_DESKTOP" = true ]; then
+    if [ -f "scripts/build-desktop-www.cjs" ]; then
+        # Don't let a build failure abort the whole run (set -e) — the version
+        # files are already updated; just warn that the payload may be stale.
+        DESKTOP_BUILD_OK=false
+        if node scripts/build-desktop-www.cjs; then
+            echo "✅ Rebuilt desktop/www/ (v$NEW_VERSION)"
+            DESKTOP_BUILD_OK=true
+        else
+            echo "⚠️  Desktop web payload build failed — desktop/www/ is stale"
+            echo "    ↳ SKIPPING desktop/package.json version sync + installers so a build can't"
+            echo "      be stamped v$NEW_VERSION while still running old code. Fix the build,"
+            echo "      then re-run: ./scripts/update-version.sh --desktop (no version bump needed)."
+        fi
+
+        # Sync the shell's package.json version to NEW_VERSION. Gated on a
+        # SUCCESSFUL payload rebuild, same as the Android/iOS native bumps.
+        # electron-builder rejects a two-part version ("Invalid version: 2.576"
+        # — it needs semver), so the shell carries APP_VERSION plus ".0"; the
+        # installers are named miniCycle-2.576.0-… and About shows the same.
+        DESKTOP_PKG="../desktop/package.json"
+        DESKTOP_SEMVER="$NEW_VERSION.0"
+        if [ "$DESKTOP_BUILD_OK" = false ] && [ "$DRY_RUN" = false ]; then
+            :  # build failed — already warned above; leave package.json untouched
+        elif [ "$DRY_RUN" = true ]; then
+            echo "🔍 [dry-run] would set \"version\": \"$DESKTOP_SEMVER\" in $DESKTOP_PKG"
+        elif [ -f "$DESKTOP_PKG" ]; then
+            # A targeted edit of the one field (not `npm version`, which needs a
+            # node_modules and rewrites formatting).
+            "${SED_INPLACE[@]}" -E "s/^(  \"version\": )\"[^\"]*\"/\1\"$DESKTOP_SEMVER\"/" "$DESKTOP_PKG"
+            if grep -q "\"version\": \"$DESKTOP_SEMVER\"" "$DESKTOP_PKG"; then
+                echo "✅ Desktop version: desktop/package.json → $DESKTOP_SEMVER"
+            else
+                echo "⚠️  Could not set the version in $DESKTOP_PKG — set it manually"
+            fi
+            # package-lock.json records the same version twice (top level and the
+            # root package entry); npm rewrites it on the next install if they
+            # drift, which then rides into an unrelated commit (MJ hand-fixed
+            # 2.576 -> 2.578.0 on Sep 23 2026). Keep both in step here.
+            DESKTOP_LOCK="../desktop/package-lock.json"
+            if [ -f "$DESKTOP_LOCK" ]; then
+                node -e '
+                    const fs = require("fs"); const [file, v] = process.argv.slice(1);
+                    const lock = JSON.parse(fs.readFileSync(file, "utf8"));
+                    lock.version = v;
+                    if (lock.packages && lock.packages[""]) lock.packages[""].version = v;
+                    fs.writeFileSync(file, JSON.stringify(lock, null, 2) + "\n");
+                ' "$DESKTOP_LOCK" "$DESKTOP_SEMVER" \
+                    && echo "✅ Desktop version: desktop/package-lock.json → $DESKTOP_SEMVER" \
+                    || echo "⚠️  Could not sync $DESKTOP_LOCK — run 'npm install' in desktop/ to refresh it"
+            fi
+
+            # ── Optional: smoke-boot + installers. Opt in with --desktop-dist;
+            #    or answer the prompt in interactive mode. Skipped in dry-run,
+            #    and in --auto unless --desktop-dist.
+            DO_DIST=false
+            if [ "$DRY_RUN" = true ]; then
+                :
+            elif [ "$DIST_DESKTOP" = true ]; then
+                DO_DIST=true
+            elif [ "$AUTO_MODE" = false ]; then
+                read -p "Smoke-boot the shell and build the macOS + Windows installers now? (y/N): " -n 1 -r
+                echo ""
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    DO_DIST=true
+                fi
+            fi
+
+            if [ "$DO_DIST" = true ]; then
+                if [ ! -d "../desktop/node_modules/electron" ]; then
+                    echo "⚠️  Electron not installed in desktop/ — run 'npm install' there first; skipping installers"
+                else
+                    # The smoke boot is the gate: a payload that cannot boot
+                    # must not be packaged into installers named v$NEW_VERSION.
+                    # env -u ELECTRON_RUN_AS_NODE: VS Code's extension host sets it, and
+                    # with it set the Electron binary runs as plain Node and main.js dies
+                    # on `protocol` being undefined (hit Sep 2026).
+                    # MINICYCLE_SMOKE_OFFLINE=1: boot with every http(s) request cancelled
+                    # at the session level, and require a live fetch to FAIL — a payload
+                    # that boots this way needs nothing from the network.
+                    if ( cd ../desktop && env -u ELECTRON_RUN_AS_NODE MINICYCLE_SMOKE="dist/smoke-$NEW_VERSION.png" MINICYCLE_SMOKE_OFFLINE=1 npx electron . ); then
+                        echo "✅ Desktop shell smoke boot passed OFFLINE (desktop/dist/smoke-$NEW_VERSION.png)"
+                        # CSC_IDENTITY_AUTO_DISCOVERY=false: no signing identity is set up
+                        # yet; stop electron-builder hunting the keychain for one.
+                        if ( cd ../desktop && env -u ELECTRON_RUN_AS_NODE CSC_IDENTITY_AUTO_DISCOVERY=false npm run installers ); then
+                            echo "✅ Desktop installers built:"
+                            ls -1 ../desktop/dist/*.dmg ../desktop/dist/*.exe ../desktop/dist/*.zip ../desktop/dist/*.AppImage ../desktop/dist/*.deb 2>/dev/null | sed 's/^/     /'
+                        else
+                            echo "⚠️  Desktop installer build failed — see electron-builder output above"
+                        fi
+                    else
+                        echo "⚠️  Desktop shell smoke boot FAILED — installers not built (payload v$NEW_VERSION is on disk; run 'npm run smoke' in desktop/ to debug)"
+                    fi
+                fi
+            fi
+        else
+            echo "⚠️  $DESKTOP_PKG not found — skipping version sync"
+        fi
+    else
+        echo "⚠️  scripts/build-desktop-www.cjs not found - skipping"
+    fi
+else
+    echo "⏭️  Skipping desktop app"
+fi
+
+echo ""
+
+# ============================================
+# PRE-PUSH GATE: CSP COVERS EVERY INLINE SCRIPT
+# ============================================
+# Runs BEFORE tag/push so a broken CSP can never reach production. A missing
+# hash silently blocks that inline script in the browser — the build succeeds,
+# the tests pass, and nothing else notices. v2.316 shipped exactly that and
+# blocked the async main-CSS loader + the boot failsafe. See scripts/validate-csp.py.
+# NOTE: this script has no `set -e`, so the exit code must be checked explicitly.
+
+echo "🔒 Pre-push gate: CSP inline-script coverage"
+echo "--------------------------------------------"
+
+# (No --dry-run branch needed: dry runs exit at the "DRY RUN COMPLETE" block above.)
+if [ ! -f "scripts/validate-csp.py" ]; then
+    echo "⚠️  scripts/validate-csp.py not found — skipping (cannot verify CSP coverage)"
+else
+    if python3 scripts/validate-csp.py; then
+        echo "✅ CSP gate passed"
+    else
+        echo ""
+        echo "════════════════════════════════════════"
+        echo "🛑 RELEASE ABORTED — CSP would block inline scripts"
+        echo "════════════════════════════════════════"
+        echo ""
+        echo "Nothing was tagged or pushed. Version/cache files ARE already bumped."
+        echo ""
+        echo "Fix, then re-run this script:"
+        echo "  • If a source file changed after the CSP stage, just re-run the release."
+        echo "  • If a deploy config was hand-edited, restore it from the backup below."
+        echo ""
+        if [ -n "$BACKUP_FOLDER" ]; then
+            echo "🔄 Restore: cd $BACKUP_FOLDER && ./restore.sh"
+        fi
+        exit 1
+    fi
+fi
+
+echo ""
+
+# ============================================
+# OPTIONAL: GIT TAG
+# ============================================
+
+echo "🏷️  Optional: Git Tag"
+echo "---------------------"
+
+CREATE_TAG=false
+if [ "$LITE_ONLY" = true ]; then
+    echo "⏭️  Skipping git tag (LITE ONLY mode)"
+elif [ "$AUTO_MODE" = true ]; then
+    if [ "$AUTO_GIT_TAG" = true ]; then
+        CREATE_TAG=true
+        echo "🤖 Auto mode: Creating git tag..."
+    else
+        echo "⏭️  Skipping tag (use --tag to auto-create)"
+    fi
+else
+    read -p "Create git tag v$NEW_VERSION? (y/N): " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        CREATE_TAG=true
+    fi
+fi
+
+if [ "$CREATE_TAG" = true ]; then
+    if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+        # ✅ Commit the version-bump changes FIRST so the tag points at the
+        # release commit, not the pre-bump HEAD. `git tag` tags the current HEAD,
+        # and this script's file updates are still uncommitted at this point.
+        # backup/ is gitignored, so `git add -A` won't sweep the backup folder.
+        if [ "$DRY_RUN" = false ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+            # Sweep iCloud "conflict copy" duplicates BEFORE staging so they can't
+            # ride into the release commit via `git add -A` (this repo lives under
+            # iCloud Drive). Removes only untracked dupes; tracked matches are just
+            # reported. See scripts/check-duplicates.sh.
+            bash "$(dirname "$0")/check-duplicates.sh" --prune-untracked || true
+            git add -A
+            if git commit -q -m "chore(release): update version to $NEW_VERSION"; then
+                echo "✅ Committed release changes (tag will point here)"
+            else
+                echo "⚠️  Release commit failed — tag will point at current HEAD"
+            fi
+        fi
+
+        SKIP_TAG=false
+        # Set when a push that was meant to happen did not. Read by the final
+        # banner, which must not claim success over a half-completed release.
+        RELEASE_PUSH_FAILED=false
+
+        if git rev-parse "v$NEW_VERSION" > /dev/null 2>&1; then
+            echo "⚠️  Tag v$NEW_VERSION already exists"
+            if [ "$AUTO_MODE" = true ]; then
+                git tag -d "v$NEW_VERSION" 2>/dev/null || true
+                echo "🤖 Deleted existing tag"
+            else
+                read -p "Delete and recreate? (y/N): " -n 1 -r
+                echo ""
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    git tag -d "v$NEW_VERSION" 2>/dev/null || true
+                else
+                    SKIP_TAG=true
+                fi
+            fi
+        fi
+
+        if [ "$SKIP_TAG" = false ]; then
+            if git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION
+
+App version: $NEW_VERSION
+Cache version: $NEW_CACHE_VERSION
+Generated by update-version.sh"; then
+                echo "✅ Created tag: v$NEW_VERSION"
+
+                PUSH_TAG=false
+                if [ "$AUTO_MODE" = true ] && [ "$AUTO_GIT_PUSH" = true ]; then
+                    PUSH_TAG=true
+                elif [ "$AUTO_MODE" = false ]; then
+                    read -p "Push tag to remote? (y/N): " -n 1 -r
+                    echo ""
+                    if [[ $REPLY =~ ^[Yy]$ ]]; then
+                        PUSH_TAG=true
+                    fi
+                fi
+
+                if [ "$PUSH_TAG" = true ]; then
+                    # The BRANCH push is what deploys — Netlify builds on a push to
+                    # main, not on a tag. So the tag push is strictly conditional on
+                    # the branch push succeeding.
+                    #
+                    # It used to be unconditional. When the branch push failed (a
+                    # network timeout to github.com, or a rejected non-fast-forward
+                    # after someone else pushed), the tag went out anyway and the
+                    # script still printed ALL DONE. That leaves the remote holding a
+                    # release tag pointing at a commit on no branch, nothing deployed,
+                    # and a success message saying otherwise. Hit twice: v2.424
+                    # (timeout) and the v2.42x series.
+                    PUSH_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+                    BRANCH_PUSHED=false
+                    if [ -z "$PUSH_BRANCH" ] || [ "$PUSH_BRANCH" = "HEAD" ]; then
+                        # Detached HEAD — there is no branch to carry the commit, so
+                        # pushing the tag would create exactly the orphan state above.
+                        echo "⚠️  Detached HEAD — no branch to push, so the tag is NOT being pushed either"
+                        echo "   (a tag with no branch behind it deploys nothing and looks like a release)"
+                    elif git push origin "$PUSH_BRANCH"; then
+                        echo "✅ Pushed branch $PUSH_BRANCH to remote"
+                        BRANCH_PUSHED=true
+                    else
+                        echo "❌ Failed to push branch $PUSH_BRANCH"
+                    fi
+
+                    if [ "$BRANCH_PUSHED" = true ]; then
+                        if git push origin "v$NEW_VERSION"; then
+                            echo "✅ Pushed tag to remote"
+                        else
+                            echo "❌ Failed to push tag v$NEW_VERSION (branch IS pushed — the deploy will still run)"
+                            echo "   Retry just the tag:  git push origin v$NEW_VERSION"
+                            RELEASE_PUSH_FAILED=true
+                        fi
+                    else
+                        RELEASE_PUSH_FAILED=true
+                        echo ""
+                        echo "🛑 Tag v$NEW_VERSION was NOT pushed, on purpose — the branch push failed first."
+                        echo "   Nothing has deployed. The release commit and tag exist LOCALLY only."
+                        echo ""
+                        echo "   Recover with:"
+                        echo "     git fetch origin"
+                        echo "     git rev-list --left-right --count origin/main...HEAD   # 0 0 when in sync"
+                        echo "     # if origin moved ahead:  git pull --rebase origin main  (then re-run your tests)"
+                        echo "     git push origin HEAD && git push origin v$NEW_VERSION"
+                    fi
+                else
+                    echo "💡 Push later: git push origin HEAD && git push origin v$NEW_VERSION"
+                fi
+            else
+                echo "⚠️  Failed to create tag"
+            fi
+        fi
+    else
+        echo "⚠️  Not in a git repository"
+    fi
+else
+    echo "⏭️  Skipping tag"
+fi
+
+echo ""
+# A half-completed push must NOT read as success. The banner used to print
+# "ALL DONE" and exit 0 even when the branch push had just failed, which is how a
+# broken release got mistaken for a shipped one.
+if [ "${RELEASE_PUSH_FAILED:-false}" = true ]; then
+    echo "════════════════════════════════════════"
+    echo "❌ RELEASE INCOMPLETE"
+    echo "════════════════════════════════════════"
+    echo ""
+    echo "Version files were updated and committed locally, but the push did not"
+    echo "complete — see the push errors above. Until the BRANCH lands on origin,"
+    echo "nothing is deployed (Netlify builds on a push to the branch, not a tag)."
+    echo ""
+    echo "🔄 To restore: cd $BACKUP_FOLDER && ./restore.sh"
+    echo ""
+    exit 1
+fi
+
+echo "════════════════════════════════════════"
+echo "✅ ALL DONE!"
+echo "════════════════════════════════════════"
+echo ""
+echo "🧪 Recommended next steps:"
+echo "1. Test the app locally"
+echo "2. Hard refresh; check version in console"
+echo "3. Verify update prompt flow"
+echo ""
+echo "🔄 To restore: cd $BACKUP_FOLDER && ./restore.sh"
+echo ""

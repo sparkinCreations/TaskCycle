@@ -1,0 +1,428 @@
+// ==========================================
+// 🧪 AUTOMATED TESTING INTEGRATION (DI-Pure)
+// ==========================================
+// Embeds the test runner from a SEPARATE ORIGIN (test.minicycle.app) as a cross-origin
+// iframe and displays its results in the testing modal.
+//
+// The runner's storage is physically isolated from real user data by the browser
+// (different origin = different localStorage/IndexedDB), so there is NO backup/restore,
+// no save-gate, and no cleanup handshake — results arrive purely via postMessage.
+
+/**
+ * Automated Testing Integration for Testing Modal (DI-Pure)
+ * @module testing-modal-integration
+ */
+
+import { DOM_IDS, getTestOrigin, UI_TIMEOUTS } from '../core/constants.js';
+import { getLabel } from '../labels/labelResolver.js';
+import { createDIModule, required, optional } from '../core/diBase.js';
+
+const di = createDIModule('TestingModalIntegration', {
+    safeAddEventListenerById: required(),
+    showNotification: optional(fallbackShowNotification)
+});
+
+export const setTestingModalDependencies = di.setDependencies;
+
+function fallbackShowNotification(message, type, duration) {
+}
+
+function getSafeAddEventListenerById() {
+    return di.resolve().safeAddEventListenerById;
+}
+
+function getShowNotification() {
+    return di.resolve().showNotification;
+}
+
+// Setup automated testing event listeners
+function setupAutomatedTestingFunctions() {
+
+    const safeAddEventListenerById = getSafeAddEventListenerById();
+
+    // Run all tests button
+    safeAddEventListenerById("run-all-automated-tests", "click", async () => {
+        await runAllAutomatedTests();
+    });
+
+}
+
+// Display test results in the output area
+/**
+ * Replace the Quick Test hint with the size of the run that just finished.
+ *
+ * The markup deliberately carries NO total. It used to claim "1600+ tests" and had
+ * drifted to less than half the real figure. There is no static source that could
+ * have kept it honest either: stats.json counts lines matching /test(/ across
+ * tests/ — which sweeps in `test(s) failed` strings and `async function test(...)`
+ * definitions — while `await test(` UNDER-counts, because several suites call
+ * test() inside loops. The only number that is true is the one the runner reports
+ * when it finishes, so that is what goes here.
+ *
+ * Session-scoped on purpose: nothing is persisted. A diagnostics artifact does not
+ * belong in state.settings, where it would ride along in exports and backups.
+ * @param {number} totalTests
+ * @param {number} duration - seconds
+ * @returns {void}
+ */
+function updateQuickTestHint(totalTests, duration) {
+    const hint = document.getElementById(DOM_IDS.QUICK_TEST_HINT);
+    if (!hint || !Number.isFinite(totalTests) || totalTests <= 0) return;
+    hint.textContent = `Runs the full suite and shows a pass/fail summary. `
+        + `Last run: ${totalTests.toLocaleString()} tests in ${Number(duration).toFixed(1)}s.`;
+}
+
+function displayTestResults(resultData) {
+    const { totalPassed, totalTests, duration, allPassed, failedModules, suiteWentHidden, incompleteModules = [] } = resultData;
+    updateQuickTestHint(totalTests, duration);
+
+    // Clear any waiting message
+    const output = getAutomatedTestOutput();
+    if (output) {
+        output.textContent = '';
+    }
+
+    // Clean pass (no failures, no timeouts).
+    if (allPassed) {
+        appendToAutomatedTestResults(`✅ ALL TESTS PASSED\n\n`);
+        appendToAutomatedTestResults(`${totalPassed}/${totalTests} tests passed (100%)\n`);
+        appendToAutomatedTestResults(`Completed in ${duration}s\n`);
+        getShowNotification()(`✅ All ${totalTests} tests passed!`, "success", 5000);
+        return;
+    }
+
+    // Backgrounded-run banner: throttled timers / paused requestAnimationFrame make
+    // timing-sensitive tests fail OR time out spuriously, so anything below may be
+    // false. (Foreground runs are 100%.)
+    if (suiteWentHidden) {
+        appendToAutomatedTestResults(`⏸️ THIS RUN WAS BACKGROUNDED — results below may be FALSE.\n`);
+        appendToAutomatedTestResults(`Hidden tabs pause animation frames and throttle timers, so timing-sensitive tests stall. Re-run with this tab kept in the foreground (don't switch tabs/apps) before treating anything below as a real bug.\n\n`);
+    }
+
+    // Real failures = failed assertions in modules that did NOT time out. Timed-out
+    // modules are reported as "incomplete" separately (their rendered subset may have
+    // all passed, but later tests may never have run — don't call those "failures").
+    const realFailures = failedModules.filter(m => !m.timedOut);
+
+    appendToAutomatedTestResults(realFailures.length > 0
+        ? `⚠️ SOME TESTS FAILED\n\n`
+        : `⏱️ TESTS INCOMPLETE (timeouts, no real failures)\n\n`);
+    appendToAutomatedTestResults(`${totalPassed}/${totalTests} tests passed\n\n`);
+
+    if (realFailures.length > 0) {
+        appendToAutomatedTestResults(`Failed modules:\n`);
+        realFailures.forEach(m => {
+            const errorMsg = m.error ? ` - ${m.error}` : '';
+            appendToAutomatedTestResults(`  ❌ ${m.name}: ${m.passed}/${m.total}${errorMsg}\n`);
+        });
+    }
+
+    if (incompleteModules.length > 0) {
+        appendToAutomatedTestResults(`\n⏱️ Timed out — may be incomplete (count is the rendered subset; later tests may not have run):\n`);
+        incompleteModules.forEach(m => {
+            const tag = m.backgrounded ? ' — while tab was backgrounded' : '';
+            appendToAutomatedTestResults(`  ⏱️ ${m.name}: ${m.passed}/${m.total} rendered${tag}\n`);
+        });
+        appendToAutomatedTestResults(`Re-run (tab focused) to confirm these.\n`);
+    }
+
+    appendToAutomatedTestResults(`\nCompleted in ${duration}s\n`);
+    appendToAutomatedTestResults(`\nSee Test Suite Browser for detailed debugging.\n`);
+
+    if (suiteWentHidden) {
+        getShowNotification()(`⏸️ Run was backgrounded — re-run with the tab focused`, "warning", 6000);
+    } else if (realFailures.length > 0) {
+        getShowNotification()(`⚠️ ${realFailures.length} module(s) have failures`, "warning", 5000);
+    } else {
+        getShowNotification()(`⏱️ ${incompleteModules.length} module(s) timed out (incomplete) — re-run`, "warning", 6000);
+    }
+
+}
+
+// Get the automated test output element
+function getAutomatedTestOutput() {
+    // Try to find a dedicated automated output, fallback to main testing output
+    return document.getElementById(DOM_IDS.AUTOMATED_TEST_OUTPUT) || document.getElementById(DOM_IDS.TESTING_OUTPUT);
+}
+
+// Append results to automated test output
+function appendToAutomatedTestResults(message) {
+    const output = getAutomatedTestOutput();
+    if (output) {
+        output.textContent += message;
+        output.scrollTop = output.scrollHeight;
+    }
+}
+
+// Current test runner modal reference
+let testRunnerModal = null;
+
+// Create and show the test runner iframe modal
+function createTestRunnerModal() {
+    // Tests are network-only BY DESIGN (the SW never caches /tests/ so results
+    // always match deployed code) — say so instead of showing a dead iframe.
+    if (!navigator.onLine) {
+        getShowNotification()('📡 ' + getLabel('notify.testsRequireNetwork'), 'warning', UI_TIMEOUTS.NOTIFICATION_EXTENDED);
+        return;
+    }
+    // Remove any existing modal
+    if (testRunnerModal) {
+        testRunnerModal.remove();
+        testRunnerModal = null;
+    }
+
+    const modal = document.createElement('dialog');
+    modal.id = 'test-runner-modal';
+    modal.className = 'test-runner-overlay';
+
+    const container = document.createElement('div');
+    container.className = 'test-runner-content';
+
+    const header = document.createElement('div');
+    header.className = 'test-runner-header';
+    header.innerHTML = `
+        <span id="test-runner-title" class="test-runner-title">🧪 Running Tests...</span>
+        <button id="close-test-runner" class="test-runner-close-btn">✕ Close</button>
+    `;
+
+    // Progress section - main content area
+    const progressSection = document.createElement('div');
+    progressSection.id = 'test-progress-section';
+    progressSection.className = 'test-runner-progress';
+    progressSection.innerHTML = `
+        <div class="test-runner-emoji">🧪</div>
+        <div id="test-status-text" class="test-runner-status">
+            ⏳ Initializing tests...
+        </div>
+        <div id="test-time-estimate" class="test-runner-time">
+            Estimating time...
+        </div>
+        <div class="test-runner-bar-track">
+            <div id="test-progress-bar" class="test-runner-bar-fill"></div>
+        </div>
+        <div class="test-runner-warning">
+            <span class="test-runner-warning-text">
+                ⚠️ Please do not close this window while tests are running
+            </span>
+        </div>
+    `;
+
+    // Hidden iframe - runs tests on a SEPARATE ORIGIN so its localStorage/IndexedDB is
+    // physically isolated from this app's real user data. parentOrigin tells the runner
+    // where to postMessage results back to.
+    const iframe = document.createElement('iframe');
+    iframe.id = DOM_IDS.TEST_RUNNER_IFRAME;
+    iframe.className = 'test-runner-iframe';
+    iframe.src = `${getTestOrigin()}/tests/module-test-suite.html`
+        + `?autorun=true&embedded=true&parentOrigin=${encodeURIComponent(window.location.origin)}`;
+
+    container.appendChild(header);
+    container.appendChild(progressSection);
+    container.appendChild(iframe);
+    modal.appendChild(container);
+
+    // Close button handler
+    const closeBtn = header.querySelector('#close-test-runner');
+    closeBtn.addEventListener('click', () => closeTestRunnerModal());
+
+    // Click on backdrop (::backdrop) fires click on dialog itself
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) {
+            closeTestRunnerModal();
+        }
+    });
+
+    // Native dialog handles Escape via 'cancel' event
+    modal.addEventListener('cancel', (e) => {
+        e.preventDefault(); // Prevent default close so we run our cleanup
+        closeTestRunnerModal();
+    });
+
+    document.body.appendChild(modal);
+    modal.showModal();
+    testRunnerModal = modal;
+
+    return { modal, iframe };
+}
+
+// Close the test runner modal
+function closeTestRunnerModal() {
+    if (testRunnerModal) {
+        if (testRunnerModal.open) {
+            testRunnerModal.close();
+        }
+        testRunnerModal.remove();
+        testRunnerModal = null;
+    }
+}
+
+// Run all automated tests via embedded cross-origin iframe modal
+function runAllAutomatedTests() {
+    const output = getAutomatedTestOutput();
+    if (output) {
+        output.textContent = '';
+    }
+
+    appendToAutomatedTestResults("🧪 Opening Test Runner (separate origin)...\n\n");
+
+    // Create and show the iframe modal (loads the runner from the test origin)
+    createTestRunnerModal();
+
+    appendToAutomatedTestResults("⏳ Tests running...\n");
+    appendToAutomatedTestResults("Modal will close automatically when complete.\n\n");
+
+    // Listen for progress and results via postMessage from the cross-origin iframe.
+    let resultsReceived = false;
+    let testStartTime = Date.now();
+
+    // Tear down the iframe and show results. No AppState reload: the runner is on a
+    // separate origin and never touched this origin's storage.
+    const finalizeTeardown = (data) => {
+        window.removeEventListener('message', handleTestMessages);
+        try {
+            closeTestRunnerModal();
+            displayTestResults(data);
+        } catch (error) {
+            console.warn('⚠️ Post-test processing failed:', error);
+        }
+    };
+
+    const expectedTestOrigin = getTestOrigin();
+    const handleTestMessages = (event) => {
+        // Only trust messages from the test-runner origin (cross-origin hardening),
+        // and only from the frame THIS modal embedded — another page on that
+        // origin could otherwise post a result shape here.
+        if (event.origin !== expectedTestOrigin) return;
+        const frame = document.getElementById(DOM_IDS.TEST_RUNNER_IFRAME);
+        if (!frame || event.source !== frame.contentWindow) return;
+        if (!event.data || !event.data.type) return;
+
+        // Handle progress updates
+        if (event.data.type === 'TEST_PROGRESS') {
+            const { currentIndex, totalModules, moduleName } = event.data;
+            const progressPercent = Math.round((currentIndex / totalModules) * 100);
+
+            const progressBar = document.getElementById(DOM_IDS.TEST_PROGRESS_BAR);
+            const statusText = document.getElementById(DOM_IDS.TEST_STATUS_TEXT);
+            const timeEstimate = document.getElementById(DOM_IDS.TEST_TIME_ESTIMATE);
+
+            if (progressBar) {
+                progressBar.style.width = `${progressPercent}%`;
+            }
+
+            if (statusText) {
+                statusText.textContent = '';
+                const prefix = document.createTextNode('🧪 Testing: ');
+                const strong = document.createElement('strong');
+                strong.textContent = moduleName;
+                const suffix = document.createTextNode(` (${currentIndex}/${totalModules})`);
+                statusText.append(prefix, strong, suffix);
+            }
+
+            if (timeEstimate && currentIndex > 0) {
+                const elapsed = (Date.now() - testStartTime) / 1000;
+                const avgTimePerModule = elapsed / currentIndex;
+                const remainingModules = totalModules - currentIndex;
+                const estimatedRemaining = Math.ceil(avgTimePerModule * remainingModules);
+
+                if (estimatedRemaining > 60) {
+                    const mins = Math.floor(estimatedRemaining / 60);
+                    const secs = estimatedRemaining % 60;
+                    timeEstimate.textContent = `~${mins}m ${secs}s remaining`;
+                } else {
+                    timeEstimate.textContent = `~${estimatedRemaining}s remaining`;
+                }
+            }
+
+            return;
+        }
+
+        // Final results — show 100% / completion state, then tear down after a brief pause.
+        if (event.data.type === 'TEST_RESULTS') {
+            resultsReceived = true;
+            const data = event.data;
+
+            const progressBar = document.getElementById(DOM_IDS.TEST_PROGRESS_BAR);
+            const statusText = document.getElementById(DOM_IDS.TEST_STATUS_TEXT);
+            const timeEstimate = document.getElementById(DOM_IDS.TEST_TIME_ESTIMATE);
+            const title = document.getElementById(DOM_IDS.TEST_RUNNER_TITLE);
+
+            if (progressBar) progressBar.style.width = '100%';
+            if (statusText) statusText.textContent = data.allPassed
+                ? '✅ All tests passed!'
+                : `⚠️ ${data.totalTests - data.totalPassed} test(s) failed`;
+            if (timeEstimate) {
+                const totalTime = ((Date.now() - testStartTime) / 1000).toFixed(1);
+                timeEstimate.textContent = `Completed in ${totalTime}s`;
+            }
+            if (title) title.textContent = data.allPassed
+                ? '✅ Tests Complete'
+                : '⚠️ Tests Complete (with failures)';
+
+            // Brief pause so the ✅ completion state is visible, then tear down.
+            setTimeout(() => finalizeTeardown(data), 1200);
+            return;
+        }
+    };
+    window.addEventListener('message', handleTestMessages);
+
+    // Timeout after 20 minutes (production runs 100+ modules through SW, takes a while)
+    setTimeout(() => {
+        if (!resultsReceived) {
+            window.removeEventListener('message', handleTestMessages);
+            appendToAutomatedTestResults("⚠️ Test timeout - closing modal.\n");
+            closeTestRunnerModal();
+        }
+    }, 1200000);
+}
+
+// DI-pure module (no window.* fallbacks for dependencies)
+
+/**
+ * Initialize testing modal integration (called by moduleLoader)
+ * @param {Object} dependencies - { safeAddEventListenerById, showNotification }
+ */
+/**
+ * Point the "Open Test Suite Browser" link at the ISOLATED test origin.
+ *
+ * The markup carries a RELATIVE href (`tests/module-test-suite.html`) as a no-JS
+ * fallback, but relative means *this* origin — so on minicycle.app the link sent
+ * users to the copy of the runner that shares storage with their real routines.
+ * Single-module runs there fall back to backup/restore instead of the isolation
+ * this app already has a second origin for, and "Run All" only survives because
+ * the page guards itself (v2.505/v2.507).
+ *
+ * Rewriting it here rather than hardcoding keeps localhost and LAN dev working:
+ * getTestOrigin() maps production to test.minicycle.app and dev to :8081.
+ * @returns {void}
+ */
+function pointTestSuiteLinkAtIsolatedOrigin() {
+    const link = document.getElementById(DOM_IDS.OPEN_TEST_SUITE_LINK);
+    if (!link) return;
+    link.href = `${getTestOrigin()}/tests/module-test-suite.html`;
+}
+
+export function initTestingModalIntegration(dependencies = {}) {
+    // Set dependencies
+    setTestingModalDependencies(dependencies);
+
+    // Setup event listeners
+    setupAutomatedTestingFunctions();
+
+    // Retarget the "Open Test Suite Browser" link away from this origin. Safe to do
+    // here: the anchor is static markup in miniCycle.html, so it is in the DOM long
+    // before this module is lazily loaded on the Diagnostics button.
+    pointTestSuiteLinkAtIsolatedOrigin();
+
+    return {
+        runAllAutomatedTests,
+        setupAutomatedTestingFunctions,
+        pointTestSuiteLinkAtIsolatedOrigin
+    };
+}
+
+// Export functions for module use
+export {
+    setupAutomatedTestingFunctions,
+    runAllAutomatedTests
+};

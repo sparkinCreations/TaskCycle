@@ -1,0 +1,1158 @@
+/**
+ * MiniCycleNotifications Browser Tests
+ * Test functions for module-test-suite.html
+ */
+
+import { getTestMiniCycleNotifications, getTestEducationalTipManager, hasGlobal } from './helpers/testContext.js';
+
+// Module-level variables for dynamic imports
+let setNotificationsDependencies, MiniCycleNotifications;
+
+export async function runNotificationsTests(resultsDiv) {
+    // Dynamic import with cache busting
+    const cacheBuster = window.testCacheBuster || Date.now();
+    const module = await import(`../modules/utils/notifications.js?v=${cacheBuster}`);
+    setNotificationsDependencies = module.setNotificationsDependencies;
+    MiniCycleNotifications = module.MiniCycleNotifications;
+
+    // Make class available globally for tests
+    window.MiniCycleNotifications = MiniCycleNotifications;
+    resultsDiv.innerHTML = '<h2>🔔 MiniCycleNotifications Tests</h2><h3>Running tests...</h3>';
+
+    let passed = { count: 0 };
+    let total = { count: 0 };
+
+    // ✅ CRITICAL: Mark core as ready for test environment
+    // This allows async functions using appInit.waitForCore() to proceed
+    if (window.appInit && !window.appInit.isCoreReady()) {
+        await window.appInit.markCoreSystemsReady();
+        console.log('✅ Test environment: AppInit core systems marked as ready');
+    }
+
+    async function test(name, testFn) {
+        total.count++;
+
+        // 🔒 SAVE REAL APP DATA before test runs
+        const savedRealData = {};
+        const protectedKeys = ['miniCycleData', 'miniCycleForceFullVersion'];
+        protectedKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                savedRealData[key] = value;
+            }
+        });
+
+        try {
+            // Clean up before each test
+            cleanupTestEnvironment();
+
+            // Set up mock globals for each test
+            setupMockGlobals();
+
+            const result = testFn();
+            // Handle async test functions
+            if (result instanceof Promise) {
+                await result;
+            }
+            resultsDiv.innerHTML += `<div class="result pass">✅ ${name}</div>`;
+            passed.count++;
+        } catch (error) {
+            resultsDiv.innerHTML += `<div class="result fail">❌ ${name}: ${error.message}</div>`;
+        } finally {
+            // Clean up after each test
+            cleanupTestEnvironment();
+            // Clean up mock globals
+            delete window.AppState;
+            delete window.generateHashId;
+
+            // 🔒 RESTORE REAL APP DATA after test completes (even if it failed)
+            localStorage.clear();
+            Object.keys(savedRealData).forEach(key => {
+                localStorage.setItem(key, savedRealData[key]);
+            });
+        }
+    }
+
+    // ===== HELPER FUNCTIONS =====
+
+    function cleanupTestEnvironment() {
+        // Remove notification container
+        const existingContainer = document.getElementById('notification-container');
+        if (existingContainer) {
+            existingContainer.remove();
+        }
+
+        // Remove any modals/overlays (old and new selectors)
+        document.querySelectorAll('.mini-modal-overlay, .miniCycle-overlay, .mini-modal-dialog, .miniCycle-prompt-dialog').forEach(el => el.remove());
+
+        // Reset body styles
+        document.body.style.userSelect = '';
+        document.body.style.overflow = '';
+
+        // Clear localStorage
+        localStorage.clear();
+    }
+
+    function createNotificationContainer() {
+        const container = document.createElement('div');
+        container.id = 'notification-container';
+        document.body.appendChild(container);
+        return container;
+    }
+
+    function createMockSchemaData() {
+        return {
+            schemaVersion: "2.6",
+            metadata: {
+                lastModified: Date.now(),
+                version: "2.5"
+            },
+            settings: {
+                theme: 'default',
+                darkMode: false,
+                notificationPosition: { x: 100, y: 20 },
+                notificationPositionModified: false,
+                dismissedEducationalTips: {}
+            },
+            data: { routine: {
+                    'test-cycle': {
+                        tasks: []
+                    }
+                }
+            },
+            appState: {
+                activeRoutineId: 'test-cycle'
+            }
+        };
+    }
+
+    function setupMockGlobals() {
+        // Mock generateHashId
+        window.generateHashId = (str) => {
+            let hash = 0;
+            for (let i = 0; i < str.length; i++) {
+                hash = ((hash << 5) - hash) + str.charCodeAt(i);
+                hash = hash & hash;
+            }
+            return 'hash-' + Math.abs(hash).toString(36);
+        };
+
+        // Mock safeAddEventListener and set it as a dependency for the Notifications module
+        const mockSafeAddEventListener = (element, event, handler, options) => {
+            if (element && typeof element.addEventListener === 'function') {
+                element.addEventListener(event, handler, options);
+            }
+        };
+        window.safeAddEventListener = mockSafeAddEventListener;
+
+        // Set module dependencies so DI system has access to safeAddEventListener and generateHashId
+        setNotificationsDependencies({
+            safeAddEventListener: mockSafeAddEventListener,
+            generateHashId: window.generateHashId
+        });
+
+        // Mock AppState - improved to not rely on window.loadMiniCycleData during update
+        window.AppState = {
+            isReady: () => true,
+            get: () => {
+                const data = localStorage.getItem('miniCycleData');
+                return data ? JSON.parse(data) : null;
+            },
+            update: (updateFn, immediate) => {
+                const data = localStorage.getItem('miniCycleData');
+                if (data && data !== 'null') {
+                    const parsedData = JSON.parse(data);
+                    // Only call updateFn if parsedData is valid (not null, not undefined, and is an object)
+                    if (parsedData !== null && parsedData !== undefined && typeof parsedData === 'object') {
+                        updateFn(parsedData);
+                        if (!parsedData.metadata) {
+                            parsedData.metadata = {};
+                        }
+                        parsedData.metadata.lastModified = Date.now();
+                        localStorage.setItem('miniCycleData', JSON.stringify(parsedData));
+                    }
+                }
+            }
+        };
+    }
+
+    // ===== INITIALIZATION TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">🔧 Initialization</h4>';
+
+    await test('MiniCycleNotifications creates successfully', () => {
+        const notifications = new window.MiniCycleNotifications();
+        if (!notifications || typeof notifications.show !== 'function') {
+            throw new Error('MiniCycleNotifications not properly initialized');
+        }
+    });
+
+    await test('has educationalTips manager', () => {
+        const notifications = new window.MiniCycleNotifications();
+        if (!notifications.educationalTips) {
+            throw new Error('educationalTips manager not initialized');
+        }
+    });
+
+    await test('has dragging state tracking', () => {
+        const notifications = new window.MiniCycleNotifications();
+        if (typeof notifications.isDraggingNotification !== 'boolean') {
+            throw new Error('isDraggingNotification not initialized');
+        }
+    });
+
+    // ===== BASIC NOTIFICATION TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">🔔 Basic Notifications</h4>';
+
+    await test('show() creates notification element', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.show('Test message', 'info', 3000);
+
+        const notif = container.querySelector('.notification');
+        if (!notif) {
+            throw new Error('Notification element not created');
+        }
+    });
+
+    // Hardening regression: setupMockGlobals() does NOT inject escapeHtml, so this
+    // exercises the un-wired path. Before the fix this path fell back to the raw
+    // message and parsed injected markup; getEscapeHtml() now guarantees a
+    // complete escaper even with no DI. Would fail (img injected) pre-fix.
+    await test('show() escapes HTML in message even when escapeHtml is NOT injected', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        const payload = '<img src=x onerror="alert(1)">';
+        notifications.show(payload, 'info');
+
+        const notif = container.querySelector('.notification');
+        if (!notif) throw new Error('notification not created');
+        if (notif.querySelector('img')) {
+            throw new Error('XSS: <img> was parsed into the notification DOM (escape fallback failed)');
+        }
+        if (notif.textContent.indexOf('<img') === -1) {
+            throw new Error('escaped payload should appear as literal text in the notification');
+        }
+    });
+
+    await test('show() applies correct type classes', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.show('Error message', 'error');
+        if (!container.querySelector('.notification.error')) {
+            throw new Error('Error class not applied');
+        }
+
+        container.innerHTML = '';
+
+        notifications.show('Success message', 'success');
+        if (!container.querySelector('.notification.success')) {
+            throw new Error('Success class not applied');
+        }
+    });
+
+    await test('show() adds close button', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.show('Test', 'info');
+
+        const closeBtn = container.querySelector('.close-btn');
+        if (!closeBtn) {
+            throw new Error('Close button not added');
+        }
+    });
+
+    await test('show() calls onDismiss when close button is clicked', async () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+        let dismissCount = 0;
+
+        notifications.show('Dismiss me', 'info', 0, {
+            onDismiss: () => {
+                dismissCount++;
+            }
+        });
+
+        container.querySelector('.close-btn')?.click();
+        await new Promise(resolve => setTimeout(resolve, 350));
+
+        if (dismissCount !== 1) {
+            throw new Error(`Expected onDismiss once, got ${dismissCount}`);
+        }
+    });
+
+    await test('show() calls onDismiss when auto-dismiss removes notification', async () => {
+        setupMockGlobals();
+        createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+        let dismissCount = 0;
+
+        notifications.show('Auto dismiss', 'info', 10, {
+            onDismiss: () => {
+                dismissCount++;
+            }
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 400));
+
+        if (dismissCount !== 1) {
+            throw new Error(`Expected auto-dismiss onDismiss once, got ${dismissCount}`);
+        }
+    });
+
+    await test('show() prevents duplicate notifications', () => {
+        setupMockGlobals();
+        // Ensure clean container with no leftover notifications
+        const existingContainer = document.getElementById('notification-container');
+        if (existingContainer) existingContainer.remove();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.show('Same message', 'info');
+        notifications.show('Same message', 'info');
+
+        const notifs = container.querySelectorAll('.notification');
+        if (notifs.length !== 1) {
+            throw new Error(`Expected 1 notification, found ${notifs.length}`);
+        }
+    });
+
+    await test('show() handles empty message', () => {
+        setupMockGlobals();
+        createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        // Should not throw, should show warning message
+        notifications.show('', 'info');
+        // Test passes if no error thrown
+    });
+
+    await test('show() handles missing container', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+
+        // Should not throw, should warn
+        notifications.show('Test', 'info');
+        // Test passes if no error thrown
+    });
+
+    // ===== NOTIFICATION WITH TIPS TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">💡 Notifications with Tips</h4>';
+
+    await test('showWithTip() creates notification element', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.showWithTip('Test with tip', 'info', 3000, 'test-tip');
+
+        const notif = container.querySelector('.notification');
+        if (!notif) {
+            throw new Error('Notification element not created');
+        }
+    });
+
+    await test('showWithTip() applies type classes', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.showWithTip('Recurring message', 'recurring');
+
+        if (!container.querySelector('.notification.recurring')) {
+            throw new Error('Recurring class not applied');
+        }
+    });
+
+    await test('showWithTip() prevents duplicates', () => {
+        setupMockGlobals();
+        // Ensure clean container with no leftover notifications
+        const existingContainer = document.getElementById('notification-container');
+        if (existingContainer) existingContainer.remove();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.showWithTip('Same tip message', 'info');
+        notifications.showWithTip('Same tip message', 'info');
+
+        const notifs = container.querySelectorAll('.notification');
+        if (notifs.length !== 1) {
+            throw new Error(`Duplicate notification created: found ${notifs.length}`);
+        }
+    });
+
+    // ===== EDUCATIONAL TIP MANAGER TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">🎓 Educational Tips</h4>';
+
+    // --- SPLIT SEAM (Aug 2026) ---
+    // EducationalTipManager moved to modules/utils/educationalTips.js and reaches
+    // its consumers only because notifications.js RE-EXPORTS it. That re-export is
+    // the same shape of seam the v2.347 statsPanel split dropped: remove it and
+    // nothing throws at the source — importers just receive undefined, and the
+    // harness's `window.EducationalTipManager = mod.EducationalTipManager` quietly
+    // assigns undefined. Every tip test below would then fail with a confusing
+    // "not a constructor" instead of naming the cause, so these run first.
+
+    await test('notifications.js re-exports EducationalTipManager (split seam)', async () => {
+        const mod = await import(`../modules/utils/notifications.js?v=${cacheBuster}`);
+        if (typeof mod.EducationalTipManager !== 'function') {
+            throw new Error(
+                'notifications.js must re-export EducationalTipManager — it lives in ' +
+                './educationalTips.js since the Aug 2026 split, and the test harness plus ' +
+                'every existing importer reach it through this facade re-export'
+            );
+        }
+    });
+
+    await test('the facade uses the class it re-exports (no second copy)', async () => {
+        // Deliberately compared INSIDE one module graph. The facade imports
+        // './educationalTips.js' bare while a test importing it with ?v= gets a
+        // separate registry entry, so comparing those two is guaranteed to differ
+        // and would prove nothing. What matters is that the class a caller gets
+        // from the facade is the one the facade itself instantiates.
+        const facade = await import(`../modules/utils/notifications.js?v=${cacheBuster}`);
+        const instance = new facade.MiniCycleNotifications();
+        if (!(instance.educationalTips instanceof facade.EducationalTipManager)) {
+            throw new Error(
+                'The tip manager held by MiniCycleNotifications is not an instance of the ' +
+                're-exported class — two copies mean dismissed-tip state can diverge'
+            );
+        }
+    });
+
+    await test('the extracted class still resolves deps through the live getter', async () => {
+        const { EducationalTipManager } = await import(`../modules/utils/educationalTips.js?v=${cacheBuster}`);
+        let handed = { marker: 'first' };
+        const tipManager = new EducationalTipManager(() => handed);
+        if (tipManager.deps.marker !== 'first') {
+            throw new Error('Constructor getter not consulted on read');
+        }
+        // The getter exists so LATE-injected deps propagate without re-wiring.
+        // A split that captured deps by value instead would pass the line above
+        // and silently freeze the notifications instance's deps at boot.
+        handed = { marker: 'second' };
+        if (tipManager.deps.marker !== 'second') {
+            throw new Error('deps captured by value — late-injected deps will never reach this class');
+        }
+    });
+
+    await test('an unavailable data source is not cached as "nothing dismissed"', async () => {
+        // A tip-bearing notification can fire before AppState is ready.
+        // Caching {} at that moment made every already-dismissed tip reappear.
+        const { EducationalTipManager } = await import(`../modules/utils/educationalTips.js?v=${cacheBuster}`);
+        let deps = {};                       // AppState not available yet
+        const tipManager = new EducationalTipManager(() => deps);
+
+        if (tipManager.isTipDismissed('already-dismissed') !== false) {
+            throw new Error('Expected false while the source is unavailable');
+        }
+
+        // Source arrives late, reporting a real dismissal.
+        deps = { AppState: { isReady: () => true, get: () => ({ settings: { dismissedEducationalTips: { 'already-dismissed': true } } }) } };
+        if (tipManager.isTipDismissed('already-dismissed') !== true) {
+            throw new Error('Fallback was cached — the real dismissed map is now unreachable');
+        }
+    });
+
+    await test('saving merges into stored dismissals instead of replacing them', async () => {
+        // The replace-wholesale version erased every prior dismissal the first
+        // time a user dismissed a tip after a failed early load.
+        const { EducationalTipManager } = await import(`../modules/utils/educationalTips.js?v=${cacheBuster}`);
+        const stored = { settings: { dismissedEducationalTips: { old: true, older: true } } };
+        let updated = null;
+        const deps = {
+            AppState: {
+                isReady: () => true,
+                get: () => stored,
+                update: async (producer) => { producer(stored); updated = stored.settings.dismissedEducationalTips; }
+            }
+        };
+        const tipManager = new EducationalTipManager(() => deps);
+        tipManager.dismissedTips = {};       // simulate a poisoned/empty local cache
+
+        await tipManager.saveDismissedTips({ fresh: true });
+
+        if (!updated || updated.old !== true || updated.older !== true) {
+            throw new Error(`Prior dismissals erased: ${JSON.stringify(updated)}`);
+        }
+        if (updated.fresh !== true) {
+            throw new Error('New dismissal not persisted');
+        }
+    });
+
+    await test('un-dismissing removes only that tip', async () => {
+        const { EducationalTipManager } = await import(`../modules/utils/educationalTips.js?v=${cacheBuster}`);
+        const stored = { settings: { dismissedEducationalTips: { keep: true, drop: true } } };
+        let updated = null;
+        const deps = {
+            AppState: {
+                isReady: () => true,
+                get: () => stored,
+                update: async (producer) => { producer(stored); updated = stored.settings.dismissedEducationalTips; }
+            }
+        };
+        const tipManager = new EducationalTipManager(() => deps);
+        await tipManager.saveDismissedTips({ drop: false });
+
+        if (updated.keep !== true) throw new Error('Un-dismissing one tip removed another');
+        if ('drop' in updated) throw new Error('Un-dismissed tip was not removed');
+    });
+
+    await test('a plain object still works as the constructor argument', async () => {
+        // Backwards compatibility: the pre-split class accepted either shape, and
+        // the harness constructs it with no argument at all.
+        const { EducationalTipManager } = await import(`../modules/utils/educationalTips.js?v=${cacheBuster}`);
+        const withObject = new EducationalTipManager({ marker: 'obj' });
+        if (withObject.deps.marker !== 'obj') {
+            throw new Error('Plain-object deps argument no longer supported');
+        }
+        const withNothing = new EducationalTipManager();
+        if (typeof withNothing.deps === 'undefined' && withNothing.deps !== undefined) {
+            throw new Error('Zero-argument construction should not throw');
+        }
+    });
+
+    await test('EducationalTipManager creates successfully', () => {
+        const tipManager = new window.EducationalTipManager();
+        if (!tipManager) {
+            throw new Error('EducationalTipManager not created');
+        }
+    });
+
+    await test('isTipDismissed() returns false for new tip', () => {
+        setupMockGlobals();
+        localStorage.setItem('miniCycleData', JSON.stringify(createMockSchemaData()));
+
+        const tipManager = new window.EducationalTipManager();
+        if (tipManager.isTipDismissed('new-tip')) {
+            throw new Error('New tip should not be dismissed');
+        }
+    });
+
+    await test('dismissTip() marks tip as dismissed', () => {
+        setupMockGlobals();
+        localStorage.setItem('miniCycleData', JSON.stringify(createMockSchemaData()));
+
+        const tipManager = new window.EducationalTipManager();
+        tipManager.dismissTip('test-tip');
+
+        if (!tipManager.isTipDismissed('test-tip')) {
+            throw new Error('Tip not marked as dismissed');
+        }
+    });
+
+    await test('showTip() unmarks dismissed tip', () => {
+        setupMockGlobals();
+        const mockData = createMockSchemaData();
+        mockData.settings.dismissedEducationalTips = { 'test-tip': true };
+        localStorage.setItem('miniCycleData', JSON.stringify(mockData));
+
+        const tipManager = new window.EducationalTipManager();
+        tipManager.showTip('test-tip');
+
+        if (tipManager.isTipDismissed('test-tip')) {
+            throw new Error('Tip still marked as dismissed');
+        }
+    });
+
+    await test('createTip() generates tip HTML', () => {
+        setupMockGlobals();
+        localStorage.setItem('miniCycleData', JSON.stringify(createMockSchemaData()));
+
+        const tipManager = new window.EducationalTipManager();
+        const tipHTML = tipManager.createTip('test-tip', 'Test tip text');
+
+        if (!tipHTML.includes('Test tip text')) {
+            throw new Error('Tip text not in HTML');
+        }
+        if (!tipHTML.includes('tip-test-tip')) {
+            throw new Error('Tip ID not in HTML');
+        }
+    });
+
+    // ===== POSITION MANAGEMENT TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">📍 Position Management</h4>';
+
+    await test('setDefaultPosition() sets smart defaults', () => {
+        setupMockGlobals();
+        localStorage.setItem('miniCycleData', JSON.stringify(createMockSchemaData()));
+
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.setDefaultPosition(container);
+
+        if (!container.style.top || !container.style.left) {
+            throw new Error('Default position not set');
+        }
+    });
+
+
+    // ===== MODAL TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">💬 Modal Dialogs</h4>';
+
+    await test('showConfirmationModal() creates modal', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.showConfirmationModal({
+            title: 'Test',
+            message: 'Test message',
+            callback: () => {}
+        });
+
+        const modal = document.querySelector('.mini-modal-dialog');
+        if (!modal) {
+            throw new Error('Modal not created');
+        }
+    });
+
+    await test('showConfirmationModal() has confirm and cancel buttons', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.showConfirmationModal({
+            title: 'Test',
+            confirmText: 'Yes',
+            cancelText: 'No',
+            callback: () => {}
+        });
+
+        const dialog = document.querySelector('.mini-modal-dialog');
+        const confirmBtn = dialog.querySelector('.btn-confirm');
+        const cancelBtn = dialog.querySelector('.btn-cancel');
+
+        if (!confirmBtn || confirmBtn.textContent !== 'Yes') {
+            throw new Error('Confirm button not correct');
+        }
+        if (!cancelBtn || cancelBtn.textContent !== 'No') {
+            throw new Error('Cancel button not correct');
+        }
+    });
+
+    await test('showConfirmationModal() confirm button triggers callback', (done) => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+        let callbackCalled = false;
+
+        notifications.showConfirmationModal({
+            title: 'Test',
+            callback: (confirmed) => {
+                callbackCalled = true;
+                if (!confirmed) {
+                    throw new Error('Callback should receive true');
+                }
+            }
+        });
+
+        const dialog = document.querySelector('.mini-modal-dialog');
+        const confirmBtn = dialog.querySelector('.btn-confirm');
+        confirmBtn.click();
+
+        if (!callbackCalled) {
+            throw new Error('Callback not called');
+        }
+    });
+
+    await test('showConfirmationModal() checkbox option: rendered, unchecked by default, state reaches the callback', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+        const seen = [];
+        notifications.showConfirmationModal({
+            title: 'Test',
+            checkbox: { label: 'Skip the <safety> step' },   // angle brackets: must be escaped, not rendered
+            callback: (confirmed, detail) => seen.push({ confirmed, detail })
+        });
+        const dialog = document.querySelector('.mini-modal-dialog');
+        const box = dialog.querySelector('.mini-modal-checkbox-input');
+        if (!box) throw new Error('checkbox input not rendered');
+        if (box.checked) throw new Error('checkbox must default to unchecked');
+        const labelText = dialog.querySelector('.mini-modal-checkbox').textContent;
+        if (!labelText.includes('Skip the <safety> step')) throw new Error('label text wrong or HTML-interpreted: ' + labelText);
+        if (dialog.querySelector('.mini-modal-checkbox safety')) throw new Error('label was injected as HTML');
+        box.click();
+        dialog.querySelector('.btn-confirm').click();
+        if (seen.length !== 1) throw new Error('callback should fire once');
+        if (seen[0].confirmed !== true) throw new Error('confirm should pass true');
+        if (!seen[0].detail || seen[0].detail.checked !== true) throw new Error('callback should receive { checked: true } after ticking: ' + JSON.stringify(seen[0].detail));
+    });
+
+    await test('showConfirmationModal() without the checkbox option: no checkbox, callback detail undefined', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+        const seen = [];
+        notifications.showConfirmationModal({ title: 'Test', callback: (confirmed, detail) => seen.push({ confirmed, detail }) });
+        const dialog = document.querySelector('.mini-modal-dialog');
+        if (dialog.querySelector('.mini-modal-checkbox')) throw new Error('no checkbox row expected');
+        dialog.querySelector('.btn-cancel').click();
+        if (seen.length !== 1 || seen[0].confirmed !== false) throw new Error('cancel should pass false once');
+        if (seen[0].detail !== undefined) throw new Error('detail should be undefined without a checkbox');
+    });
+
+    await test('showConfirmationModal() dismissed before Enter-arm delay: callback fires once, later Enter is inert', async () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+        const results = [];
+
+        notifications.showConfirmationModal({
+            title: 'Test',
+            destructive: false,
+            callback: (confirmed) => results.push(confirmed)
+        });
+
+        // Dismiss inside the arm window — before the delayed Enter-anywhere
+        // handler attaches. Pre-fix, the un-cancelled arm timer attached the
+        // handler anyway; a later Enter then fired callback(true) with no
+        // modal on screen (results became [false, true]).
+        const dialog = document.querySelector('.mini-modal-dialog');
+        dialog.querySelector('.btn-cancel').click();
+
+        await new Promise(r => setTimeout(r, 180)); // let the arm timer fire if it leaked
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+        await new Promise(r => setTimeout(r, 20));
+
+        if (results.length !== 1 || results[0] !== false) {
+            throw new Error(`callback must fire exactly once with false, got [${results}]`);
+        }
+    });
+
+    await test('showChoiceModal() settles once: cancel after choice is inert', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+        const results = [];
+
+        notifications.showChoiceModal({
+            title: 'Test',
+            choices: [{ text: 'Option A', value: 'a' }],
+            callback: (choice) => results.push(choice)
+        });
+
+        const dialog = document.querySelector('.mini-modal-dialog');
+        const cancelBtn = dialog.querySelector('.btn-cancel');
+        dialog.querySelector('.btn-choice').click();
+        // Pre-contract, a held reference to the detached cancel button could
+        // still fire callback(null) as a second, contradictory answer.
+        cancelBtn.click();
+
+        if (results.length !== 1 || results[0] !== 'a') {
+            throw new Error(`callback must fire exactly once with 'a', got [${results}]`);
+        }
+    });
+
+    await test('showPromptModal() settles once: cancel after confirm is inert', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+        const results = [];
+
+        notifications.showPromptModal({
+            title: 'Test',
+            defaultValue: 'hello',
+            callback: (value) => results.push(value)
+        });
+
+        const dialog = document.querySelector('.miniCycle-prompt-dialog');
+        const cancelBtn = dialog.querySelector('.miniCycle-btn-cancel');
+        dialog.querySelector('.miniCycle-btn-confirm').click();
+        cancelBtn.click();
+
+        if (results.length !== 1 || results[0] !== 'hello') {
+            throw new Error(`callback must fire exactly once with 'hello', got [${results}]`);
+        }
+    });
+
+    await test('showPromptModal() required-empty does not settle; retry still works', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+        const results = [];
+
+        notifications.showPromptModal({
+            title: 'Test',
+            required: true,
+            callback: (value) => results.push(value)
+        });
+
+        const dialog = document.querySelector('.miniCycle-prompt-dialog');
+        const input = dialog.querySelector('.miniCycle-prompt-input');
+        const confirmBtn = dialog.querySelector('.miniCycle-btn-confirm');
+
+        confirmBtn.click(); // empty + required → must NOT settle
+        if (results.length !== 0) {
+            throw new Error(`empty required submit must not fire callback, got [${results}]`);
+        }
+
+        input.value = 'second try';
+        confirmBtn.click();
+        if (results.length !== 1 || results[0] !== 'second try') {
+            throw new Error(`retry must settle with the value, got [${results}]`);
+        }
+    });
+
+    await test('showPromptModal() creates prompt', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.showPromptModal({
+            title: 'Enter value',
+            placeholder: 'Enter text',
+            callback: () => {}
+        });
+
+        const modal = document.querySelector('.miniCycle-prompt-dialog');
+        const input = document.querySelector('.miniCycle-prompt-input');
+
+        if (!modal) {
+            throw new Error('Prompt modal not created');
+        }
+        if (!input) {
+            throw new Error('Input field not created');
+        }
+    });
+
+    await test('showPromptModal() has default value', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.showPromptModal({
+            title: 'Test',
+            defaultValue: 'Default text',
+            callback: () => {}
+        });
+
+        const input = document.querySelector('.miniCycle-prompt-input');
+        if (input.value !== 'Default text') {
+            throw new Error('Default value not set');
+        }
+    });
+
+    await test('showPromptModal() enforces required field', () => {
+        setupMockGlobals();
+        const notifications = new window.MiniCycleNotifications();
+        let callbackCalled = false;
+
+        notifications.showPromptModal({
+            title: 'Test',
+            required: true,
+            callback: (value) => {
+                callbackCalled = true;
+            }
+        });
+
+        const confirmBtn = document.querySelector('.miniCycle-btn-confirm');
+        const input = document.querySelector('.miniCycle-prompt-input');
+
+        input.value = ''; // Empty value
+        confirmBtn.click();
+
+        // Should not call callback with empty required field
+        if (callbackCalled) {
+            throw new Error('Callback should not be called with empty required field');
+        }
+
+        // Input should have error class
+        if (!input.classList.contains('miniCycle-input-error')) {
+            throw new Error('Input should have error class');
+        }
+    });
+
+    // ===== AUTO-REMOVE TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">⏰ Auto-Remove</h4>';
+
+    await test('setupAutoRemove() attaches hover listeners', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notification = document.createElement('div');
+        notification.className = 'notification';
+        container.appendChild(notification);
+
+        // Record every event type registered on the notification. setupAutoRemove
+        // attaches its listeners via addEventListener (through the injected
+        // safeAddEventListener, which forwards to element.addEventListener), so a
+        // recording wrapper captures them. The old test checked `.onmouseenter`/
+        // `.onmouseleave` — always null since listeners aren't attached as properties —
+        // and left its only branch empty, so it verified nothing.
+        const registered = [];
+        const realAdd = notification.addEventListener.bind(notification);
+        notification.addEventListener = (type, handler, options) => {
+            registered.push(type);
+            return realAdd(type, handler, options);
+        };
+
+        const notifications = new window.MiniCycleNotifications();
+        notifications.setupAutoRemove(notification, 3000);
+
+        if (!registered.includes('mouseenter') || !registered.includes('mouseleave')) {
+            throw new Error(`hover listeners not attached — registered: [${registered.join(', ')}]`);
+        }
+    });
+
+    // ===== DRAGGING TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">🖱️ Dragging</h4>';
+
+    await test('setupNotificationDragging() attaches listeners', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.setupNotificationDragging(container);
+
+        if (!container.dragListenersAttached) {
+            throw new Error('Drag listeners flag not set');
+        }
+    });
+
+    await test('setupNotificationDragging() only attaches once', () => {
+        setupMockGlobals();
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.setupNotificationDragging(container);
+        const observer1 = container._pointerEventsObserver;
+        notifications.setupNotificationDragging(container);
+        const observer2 = container._pointerEventsObserver;
+
+        // The dedup guard (`if (!container._pointerEventsObserver)`) installs the observer
+        // once and makes the second call a no-op. The old test only checked "no error thrown".
+        if (!observer1) {
+            throw new Error('first setupNotificationDragging should install the pointer-events observer');
+        }
+        if (observer1 !== observer2) {
+            throw new Error('second setupNotificationDragging should be a no-op (observer must not be recreated)');
+        }
+    });
+
+    await test('setDraggingState() updates state', () => {
+        const notifications = new window.MiniCycleNotifications();
+
+        notifications.setDraggingState(true);
+        if (!notifications.isDraggingNotification) {
+            throw new Error('Dragging state not set to true');
+        }
+
+        notifications.setDraggingState(false);
+        if (notifications.isDraggingNotification) {
+            throw new Error('Dragging state not set to false');
+        }
+    });
+
+    // ===== ERROR HANDLING TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">⚠️ Error Handling</h4>';
+
+    await test('show() handles missing generateHashId gracefully', () => {
+        setupMockGlobals();
+        createNotificationContainer();
+        delete window.generateHashId;
+
+        const notifications = new window.MiniCycleNotifications();
+
+        // Should NOT throw - Simple Instance pattern catches errors gracefully
+        try {
+            notifications.show('Test', 'info');
+            // If we get here, the error was handled gracefully (correct behavior)
+        } catch (error) {
+            throw new Error('Should NOT throw - should handle error gracefully');
+        }
+    });
+
+    await test('restoreNotificationPosition() handles missing data', () => {
+        setupMockGlobals();
+
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+
+        // Should not throw, should use defaults
+        notifications.restoreNotificationPosition(container);
+
+        if (!container.style.top || !container.style.left) {
+            throw new Error('Default position not set when data missing');
+        }
+    });
+
+    await test('loadDismissedTips() handles a missing AppState', () => {
+
+        const tipManager = new window.EducationalTipManager();
+        const tips = tipManager.loadDismissedTips();
+
+        // Contract changed deliberately: null means "could not load", which is
+        // NOT the same as "loaded, nothing dismissed". Returning {} here is what
+        // let getDismissedTips() cache an empty map forever and, via the old
+        // wholesale save, erase the user's real dismissals.
+        if (tips !== null) {
+            throw new Error(`Should return null when the data source is missing, got ${JSON.stringify(tips)}`);
+        }
+    });
+
+    await test('saveDismissedTips() handles a missing AppState', () => {
+
+        const tipManager = new window.EducationalTipManager();
+
+        // Should not throw, should warn
+        tipManager.saveDismissedTips();
+        // Test passes if no error thrown
+    });
+
+    // ===== RECURRING NOTIFICATION TESTS =====
+
+    resultsDiv.innerHTML += '<h4 class="test-section">🔁 Recurring Notifications</h4>';
+
+    await test('createRecurringNotificationWithTip() generates HTML', () => {
+        const notifications = new window.MiniCycleNotifications();
+
+        const html = notifications.createRecurringNotificationWithTip(
+            'task-123',
+            'daily',
+            'indefinitely'
+        );
+
+        if (!html.includes('task-123')) {
+            throw new Error('Task ID not in HTML');
+        }
+        if (!html.includes('daily')) {
+            throw new Error('Frequency not in HTML');
+        }
+    });
+
+    await test('createRecurringNotificationWithTip() includes quick options', () => {
+        const notifications = new window.MiniCycleNotifications();
+
+        const html = notifications.createRecurringNotificationWithTip(
+            'task-123',
+            'weekly',
+            'indefinitely'
+        );
+
+        if (!html.includes('quick-recurring-options')) {
+            throw new Error('Quick options not included');
+        }
+        if (!html.includes('Hourly') || !html.includes('Daily') ||
+            !html.includes('Weekly') || !html.includes('Monthly')) {
+            throw new Error('All frequency options not included');
+        }
+    });
+
+    await test('createRecurringNotificationWithTip() marks selected frequency', () => {
+        const notifications = new window.MiniCycleNotifications();
+
+        const html = notifications.createRecurringNotificationWithTip(
+            'task-123',
+            'monthly',
+            'indefinitely'
+        );
+
+        // The MONTHLY option specifically must carry the `selected` class — not merely that
+        // a monthly option exists AND some option is selected (both are always true for any
+        // valid frequency). Source: notifications.js:1252-1253 renders
+        // `class="radio-circle ${freq==='monthly'?'selected':''}" data-freq="monthly"`.
+        if (!html.includes('radio-circle selected" data-freq="monthly"')) {
+            throw new Error('Monthly option should be marked selected');
+        }
+        // And a different frequency must NOT be marked (guards against highlighting the wrong one).
+        if (html.includes('radio-circle selected" data-freq="daily"')) {
+            throw new Error('Daily should not be marked selected when monthly is chosen');
+        }
+    });
+
+    // Security (notifications-review): the status line renders frequency into
+    // HTML (rendered { trusted: true }), so a hostile frequency that survived
+    // normalization must still be escaped at the sink — defense in depth.
+    await test('createRecurringNotificationWithTip() escapes a hostile frequency', () => {
+        const notifications = new window.MiniCycleNotifications();
+        const html = notifications.createRecurringNotificationWithTip(
+            'task-123',
+            '<img src=x onerror=alert(1)>',
+            'indefinitely'
+        );
+        if (html.includes('<img src=x onerror=alert(1)>')) {
+            throw new Error('raw <img> payload reached the notification HTML — frequency not escaped at the sink');
+        }
+        if (!html.includes('&lt;img')) {
+            throw new Error('escaped frequency should appear as an HTML entity');
+        }
+    });
+
+    // ===== PRIORITY PICKER =====
+    // Swatches are LEVELS. The picker names them High / Medium / Low (visible text
+    // and accessible name) and selects by level, so a colour picked under another
+    // theme lights up the matching swatch. Swatch colours come from the theme
+    // manager, never a theme id read off the DOM.
+    resultsDiv.innerHTML += '<h4 class="test-section">🚩 Priority picker</h4>';
+
+    const openPicker = (currentColor) => {
+        // The picker mounts into the FIRST #notification-container; drop any an
+        // earlier test left behind so the assertions read this picker.
+        document.querySelectorAll('#notification-container').forEach(el => el.remove());
+        const container = createNotificationContainer();
+        const notifications = new window.MiniCycleNotifications();
+        notifications.showPriorityColorPickerNotification(currentColor, 8000, null, null);
+        const buttons = [...container.querySelectorAll('.priority-color-btn')];
+        return { container, buttons };
+    };
+
+    await test('priority picker names each swatch by level and checks the current level', () => {
+        setupMockGlobals();
+        setNotificationsDependencies({ vocabThemeManager: null });   // defaults path
+        const { container, buttons } = openPicker('#facc15');
+        try {
+            const names = buttons.map(b => b.getAttribute('aria-label')).join(',');
+            if (names !== 'High,Medium,Low') throw new Error(`accessible names should be High,Medium,Low — got ${names}`);
+            const visible = buttons.map(b => b.querySelector('.priority-swatch-label')?.textContent).join(',');
+            if (visible !== 'High,Medium,Low') throw new Error(`visible labels should be High,Medium,Low — got ${visible}`);
+            const checked = buttons.filter(b => b.getAttribute('aria-checked') === 'true').map(b => b.dataset.level);
+            if (checked.join(',') !== 'medium') throw new Error(`only Medium should be checked — got ${checked.join(',')}`);
+        } finally { container.remove(); }
+    });
+
+    await test('priority picker uses the theme manager\'s swatches and selects a foreign theme\'s colour by level', () => {
+        setupMockGlobals();
+        const habitSwatches = [
+            { level: 'high', hex: '#8b1a1a', labelKey: 'notify.priorityHigh' },
+            { level: 'medium', hex: '#7a4d00', labelKey: 'notify.priorityMedium' },
+            { level: 'low', hex: '#1a5c2e', labelKey: 'notify.priorityLow' }
+        ];
+        setNotificationsDependencies({
+            vocabThemeManager: {
+                getPrioritySwatches: () => habitSwatches,
+                // classic's Low green → low
+                getTaskPriorityLevel: (task) => (task.priorityColor === '#28a745' ? 'low' : 'high')
+            }
+        });
+        const { container, buttons } = openPicker('#28a745');
+        try {
+            const colours = buttons.map(b => b.dataset.color).join(',');
+            if (colours !== '#8b1a1a,#7a4d00,#1a5c2e') throw new Error(`swatches should be the manager's — got ${colours}`);
+            const checked = buttons.filter(b => b.getAttribute('aria-checked') === 'true').map(b => b.dataset.level);
+            if (checked.join(',') !== 'low') throw new Error(`classic green should select Low — got ${checked.join(',')}`);
+        } finally {
+            container.remove();
+            setNotificationsDependencies({ vocabThemeManager: null });
+        }
+    });
+
+    // Summary
+    const percentage = Math.round((passed.count / total.count) * 100);
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${percentage}%)</h3>`;
+
+    if (passed.count === total.count) {
+        resultsDiv.innerHTML += '<div class="result pass">🎉 All tests passed!</div>';
+    } else {
+        resultsDiv.innerHTML += `<div class="result fail">⚠️ ${total.count - passed.count} test(s) failed</div>`;
+    }
+
+    return { passed: passed.count, total: total.count };
+}

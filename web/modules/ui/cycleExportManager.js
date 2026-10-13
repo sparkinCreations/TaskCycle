@@ -1,0 +1,204 @@
+/**
+ * Cycle Export Manager (DI-Pure)
+ * Handles exporting cycles to .mcyc files
+ *
+ * NO window.* globals - all dependencies must be injected
+ * NO legacy fallbacks - strict DI only
+ *
+ * @module ui/cycleExportManager
+ */
+
+import { createDIModule, required, optional } from '../core/diBase.js';
+import { DOM_IDS, UI_TIMEOUTS } from '../core/constants.js';
+import { getLabel } from '../labels/labelResolver.js';
+import { isNativeApp, shareRoutineFileNative } from '../platform/capacitorBridge.js';
+import { buildMcycPayload, buildMcycFilename } from '../utils/mcycPayload.js';
+import { getActiveRoutineId, getRoutine } from '../utils/cycleMode.js';
+
+// ============================================================================
+// DEPENDENCY INJECTION SETUP
+// ============================================================================
+
+const di = createDIModule('CycleExportManager', {
+    AppState: required(),
+    showNotification: required(),
+    showConfirmationModal: required(),
+    safeAddEventListener: required(),
+    getElementById: optional(null),  // DOM helper - safe to default
+    AppMeta: optional(null)  // For version info
+});
+
+/** @type {{AppState: Object, showNotification: Function, safeAddEventListener: Function, getElementById: Function|null, AppMeta: Object|null}} */
+const _deps = new Proxy({}, {
+    get(_, prop) {
+        return di.resolve()[prop];
+    }
+});
+
+/**
+ * Inject dependencies for the cycle export manager module.
+ * @param {Object} dependencies - Dependencies including AppState, showNotification, etc.
+ * @returns {void}
+ */
+export function setCycleExportManagerDependencies(dependencies) {
+    di.setDependencies(dependencies);
+}
+
+// ============================================================================
+// IDEMPOTENCY GUARD
+// ============================================================================
+
+let _exportButtonInitialized = false;
+
+// ============================================================================
+// EXPORT FUNCTIONS
+// ============================================================================
+
+/**
+ * Export cycle data to .mcyc file
+ * @param {Object} miniCycleData - The cycle data to export
+ * @param {string} cycleName - Name for the file
+ * @returns {void}
+ */
+export async function exportMiniCycleData(miniCycleData, cycleName) {
+
+    try {
+        const dataStr = JSON.stringify(miniCycleData, null, 2);
+        const dataBlob = new Blob([dataStr], { type: "application/json" });
+        const sanitizedName = buildMcycFilename(cycleName);
+
+        // Native (Capacitor) path — route through the Android share sheet, which
+        // lets the user save to Files/Drive or send the .mcyc elsewhere. The web
+        // download/file-picker fallbacks don't work in the WebView.
+        if (isNativeApp()) {
+            const result = await shareRoutineFileNative({
+                data: dataStr,
+                fileName: `${sanitizedName}.mcyc`,
+                title: cycleName
+            });
+            if (result.handled) {
+                if (!result.cancelled) {
+                    _deps.showNotification("✅ " + getLabel('notify.exportSuccess', { vars: { name: cycleName } }), "success", 3000);
+                }
+                return;
+            }
+        }
+
+        // Try File System Access API (lets user name file and choose save location)
+        if (typeof window.showSaveFilePicker === 'function') {
+            try {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: `${sanitizedName}.mcyc`,
+                    types: [{
+                        description: 'miniCycle Routine',
+                        accept: { 'application/json': ['.mcyc'] }
+                    }]
+                });
+                const writable = await handle.createWritable();
+                await writable.write(dataBlob);
+                await writable.close();
+
+                _deps.showNotification("✅ " + getLabel('notify.exportSuccess', { vars: { name: cycleName } }), "success", 3000);
+                return;
+            } catch (pickerError) {
+                // User cancelled the save dialog — not an error
+                if (pickerError.name === 'AbortError') return;
+                // Other error — fall through to legacy download
+                console.warn('Save picker failed, falling back to download:', pickerError);
+            }
+        }
+
+        // Fallback: auto-download for browsers without File System Access API
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(dataBlob);
+        link.download = `${sanitizedName}.mcyc`;
+
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+
+        URL.revokeObjectURL(link.href);
+
+        // Notification must wait for save dialog to close — it covers the browser
+        // and the 3s auto-dismiss expires before the user can see it.
+        // Strategy: fire on window focus (save dialog causes blur→focus cycle),
+        // with a short fallback for browsers that auto-download without a dialog.
+        const notify = _deps.showNotification;
+        if (typeof notify === 'function') {
+            let notified = false;
+            const showSuccess = () => {
+                if (notified) return;
+                notified = true;
+                window.removeEventListener('focus', showSuccess);
+                notify("✅ " + getLabel('notify.exportSuccess', { vars: { name: cycleName } }), "success", UI_TIMEOUTS.NOTIFICATION_LONG);
+            };
+            window.addEventListener('focus', showSuccess);
+            setTimeout(showSuccess, UI_TIMEOUTS.EXPORT_FALLBACK_SUCCESS); // fallback if no save dialog
+        }
+
+    } catch (error) {
+        console.error('Export failed:', error);
+        _deps.showNotification?.(getLabel('notify.exportFailed'), "error", UI_TIMEOUTS.NOTIFICATION_LONG);
+    }
+}
+
+/**
+ * Setup export button functionality
+ */
+export function setupExportButton() {
+    // ✅ Idempotency guard
+    if (_exportButtonInitialized) {
+        return;
+    }
+    _exportButtonInitialized = true;
+
+    const safeAddEventListener = _deps.safeAddEventListener;
+    if (!safeAddEventListener) {
+        console.error('CycleExportManager: safeAddEventListener dependency not injected');
+        return;
+    }
+
+    const exportBtn = document.getElementById(DOM_IDS.EXPORT_MINI_CYCLE);
+    if (!exportBtn) return;
+
+    exportBtn._clickHandler = () => {
+
+        const AppState = _deps.AppState;
+        if (!AppState.isReady()) {
+            console.error('State data required for export');
+            _deps.showNotification(getLabel('notify.exportNoData'), "error");
+            return;
+        }
+
+        const state = AppState.get();
+        const activeCycle = getActiveRoutineId(state);
+        const cycle = getRoutine(state, activeCycle);
+
+        if (!activeCycle || !cycle) {
+            _deps.showNotification(getLabel('notify.exportNoActiveCycle'));
+            return;
+        }
+
+        const cycleName = cycle.title || activeCycle;
+
+        _deps.showConfirmationModal({
+            title: getLabel('switcher.downloadConfirmTitle'),
+            message: getLabel('switcher.downloadConfirmMessage', { vars: { name: cycleName } }),
+            confirmText: getLabel('routine.download'),
+            cancelText: getLabel('button.cancel'),
+            destructive: false,
+            callback: (confirmed) => {
+                if (!confirmed) return;
+
+                // Backup-for-self semantics: includeHistory true — the owner's
+                // own restore should carry the event log and cleared tasks.
+                const miniCycleData = buildMcycPayload(activeCycle, cycle, { includeHistory: true });
+
+                exportMiniCycleData(miniCycleData, cycleName);
+            }
+        });
+    };
+
+    safeAddEventListener(exportBtn, "click", exportBtn._clickHandler);
+}
+

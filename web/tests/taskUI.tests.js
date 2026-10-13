@@ -1,0 +1,700 @@
+/**
+ * TaskUI Tests (DI-Pure)
+ * Tests for modules/ui/taskUI.js
+ *
+ * Tests the task UI functionality:
+ * - TaskOptionsVisibilityController (mode-aware visibility)
+ * - refreshTaskListUI
+ * - showTaskOptions/hideTaskOptions
+ * - checkCompleteAllButton
+ */
+
+let TaskOptionsVisibilityController = null;
+let setTaskUIDependencies = null;
+let refreshTaskListUI = null;
+let showTaskOptions = null;
+let hideTaskOptions = null;
+let hideTaskButtons = null;
+let checkCompleteAllButton = null;
+
+export async function runTaskUITests(resultsDiv, isPartOfSuite = false) {
+    resultsDiv.innerHTML = '<h2>TaskUI Tests (DI-Pure)</h2><h3>Loading module...</h3>';
+
+    // Import the module directly for DI testing
+    try {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const module = await import(`../modules/ui/taskUI.js?v=${cacheBuster}`);
+        TaskOptionsVisibilityController = module.TaskOptionsVisibilityController;
+        setTaskUIDependencies = module.setTaskUIDependencies;
+        refreshTaskListUI = module.refreshTaskListUI;
+        showTaskOptions = module.showTaskOptions;
+        hideTaskOptions = module.hideTaskOptions;
+        hideTaskButtons = module.hideTaskButtons;
+        checkCompleteAllButton = module.checkCompleteAllButton;
+        resultsDiv.innerHTML = '<h2>TaskUI Tests (DI-Pure)</h2><h3>Running tests...</h3>';
+    } catch (e) {
+        resultsDiv.innerHTML = `<h2>TaskUI Tests</h2><div class="result fail">Failed to import module: ${e.message}</div>`;
+        return { passed: 0, total: 1 };
+    }
+
+    if (!TaskOptionsVisibilityController) {
+        resultsDiv.innerHTML += '<div class="result fail">TaskOptionsVisibilityController class not found</div>';
+        return { passed: 0, total: 1 };
+    }
+
+    let passed = { count: 0 }, total = { count: 0 };
+
+    // Create mock dependencies
+    function createMockDeps(overrides = {}) {
+        return {
+            AppState: {
+                isReady: () => true,
+                get: () => ({
+                    data: { routine: {
+                        'test-cycle': {
+                            title: 'Test Cycle',
+                            tasks: [
+                                { id: '1', text: 'Task 1', completed: false },
+                                { id: '2', text: 'Task 2', completed: true }
+                            ]
+                        }
+                    } },
+                    appState: { activeRoutineId: 'test-cycle' }
+                })
+            },
+            addTask: () => {},
+            getElementById: (id) => document.getElementById(id),
+            getTaskList: () => document.getElementById('taskList'),
+            isTouchDevice: () => false,
+            // Mock taskToAddTaskOptions - converts task to addTask options
+            taskToAddTaskOptions: (task) => ({
+                completed: task.completed || false,
+                taskId: task.id,
+                shouldSave: false
+            }),
+            ...overrides
+        };
+    }
+
+    // Create DOM elements for testing
+    function createTestDOM() {
+        const container = document.createElement('div');
+        container.id = 'test-task-ui-container';
+        container.innerHTML = `
+            <ul id="taskList"></ul>
+            <button id="completeAll" style="display: none;"></button>
+        `;
+        document.body.appendChild(container);
+        return container;
+    }
+
+    function createMockTaskElement(id = 'test-task') {
+        const task = document.createElement('li');
+        task.className = 'task';
+        task.dataset.id = id;
+
+        const taskOptions = document.createElement('div');
+        taskOptions.className = 'task-options';
+        taskOptions.classList.add('task-options-force-hidden');
+
+        const btn1 = document.createElement('button');
+        btn1.className = 'task-btn';
+        const btn2 = document.createElement('button');
+        btn2.className = 'task-btn';
+
+        taskOptions.appendChild(btn1);
+        taskOptions.appendChild(btn2);
+        task.appendChild(taskOptions);
+
+        return task;
+    }
+
+    function cleanupTestDOM() {
+        const container = document.getElementById('test-task-ui-container');
+        if (container) container.remove();
+        // Clean up body classes
+        document.body.classList.remove('show-three-dots-enabled', 'auto-cycle-mode');
+    }
+
+    async function test(name, testFn) {
+        total.count++;
+        try {
+            cleanupTestDOM();
+            await testFn();
+            resultsDiv.innerHTML += `<div class="result pass">${name}</div>`;
+            passed.count++;
+        } catch (error) {
+            resultsDiv.innerHTML += `<div class="result fail">${name}: ${error.message}</div>`;
+            console.error(`Test failed: ${name}`, error);
+        } finally {
+            cleanupTestDOM();
+        }
+    }
+
+    // =====================================================
+    // TaskOptionsVisibilityController Tests
+    // =====================================================
+    resultsDiv.innerHTML += '<h3>TaskOptionsVisibilityController</h3>';
+
+    await test('getMode returns hover when three-dots not enabled', async () => {
+        document.body.classList.remove('show-three-dots-enabled');
+        const mode = TaskOptionsVisibilityController.getMode();
+        if (mode !== 'hover') {
+            throw new Error(`Expected 'hover', got '${mode}'`);
+        }
+    });
+
+    await test('getMode returns three-dots when enabled', async () => {
+        document.body.classList.add('show-three-dots-enabled');
+        const mode = TaskOptionsVisibilityController.getMode();
+        if (mode !== 'three-dots') {
+            throw new Error(`Expected 'three-dots', got '${mode}'`);
+        }
+    });
+
+    await test('canHandle allows mouseenter in hover mode', async () => {
+        document.body.classList.remove('show-three-dots-enabled');
+        if (!TaskOptionsVisibilityController.canHandle('mouseenter')) {
+            throw new Error('mouseenter should be allowed in hover mode');
+        }
+    });
+
+    await test('canHandle blocks mouseenter in three-dots mode', async () => {
+        document.body.classList.add('show-three-dots-enabled');
+        if (TaskOptionsVisibilityController.canHandle('mouseenter')) {
+            throw new Error('mouseenter should be blocked in three-dots mode');
+        }
+    });
+
+    await test('canHandle always allows long-press', async () => {
+        document.body.classList.remove('show-three-dots-enabled');
+        if (!TaskOptionsVisibilityController.canHandle('long-press')) {
+            throw new Error('long-press should be allowed in hover mode');
+        }
+
+        document.body.classList.add('show-three-dots-enabled');
+        if (!TaskOptionsVisibilityController.canHandle('long-press')) {
+            throw new Error('long-press should be allowed in three-dots mode');
+        }
+    });
+
+    await test('canHandle allows three-dots-button in three-dots mode', async () => {
+        document.body.classList.add('show-three-dots-enabled');
+        if (!TaskOptionsVisibilityController.canHandle('three-dots-button')) {
+            throw new Error('three-dots-button should be allowed in three-dots mode');
+        }
+    });
+
+    await test('show makes task options visible in hover mode', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        const result = TaskOptionsVisibilityController.show(task, 'mouseenter');
+        const taskOptions = task.querySelector('.task-options');
+
+        if (!result) {
+            throw new Error('show should return true');
+        }
+        if (taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('visibility should be visible');
+        }
+        if (taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('opacity should be 1');
+        }
+    });
+
+    await test('hide makes task options hidden in hover mode', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        // First show
+        TaskOptionsVisibilityController.show(task, 'mouseenter');
+        // Then hide
+        const result = TaskOptionsVisibilityController.hide(task, 'mouseleave');
+        const taskOptions = task.querySelector('.task-options');
+
+        if (!result) {
+            throw new Error('hide should return true');
+        }
+        if (!taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('visibility should be hidden');
+        }
+        if (!taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('opacity should be 0');
+        }
+    });
+
+    await test('setVisibility returns false for missing task-options', async () => {
+        createTestDOM();
+        const task = document.createElement('li');
+        task.className = 'task';
+        // No .task-options child
+
+        const result = TaskOptionsVisibilityController.setVisibility(task, true, 'test');
+        if (result !== false) {
+            throw new Error('Should return false for missing task-options');
+        }
+    });
+
+    await test('show blocked in three-dots mode for hover callers', async () => {
+        createTestDOM();
+        document.body.classList.add('show-three-dots-enabled');
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        const result = TaskOptionsVisibilityController.show(task, 'mouseenter');
+        const taskOptions = task.querySelector('.task-options');
+
+        if (result !== false) {
+            throw new Error('show should return false in three-dots mode for mouseenter');
+        }
+        if (!taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('visibility should remain hidden');
+        }
+    });
+
+    // =====================================================
+    // showTaskOptions/hideTaskOptions Tests
+    // =====================================================
+    resultsDiv.innerHTML += '<h3>showTaskOptions/hideTaskOptions</h3>';
+
+    // A mouseenter alone is NOT evidence of a hover: the browser fires it, with
+    // isTrusted true, whenever an element MOVES UNDER a stationary pointer — and
+    // any task-list re-render does that. These four tests pin the discriminator
+    // (a mousemove inside the row must follow) rather than the old contract,
+    // which showed options the instant a mouseenter arrived.
+
+    await test('showTaskOptions shows options on desktop once the pointer moves in the row', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+        setTaskUIDependencies({ isTouchDevice: () => false });
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        showTaskOptions({ currentTarget: task, type: 'mouseenter' });
+        task.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+
+        const taskOptions = task.querySelector('.task-options');
+        if (taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should be visible after a real hover');
+        }
+    });
+
+    await test('showTaskOptions ignores a mouseenter with no pointer movement', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+        setTaskUIDependencies({ isTouchDevice: () => false });
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        // A row sliding under a parked cursor: the enter arrives, nothing follows.
+        showTaskOptions({ currentTarget: task, type: 'mouseenter' });
+
+        const taskOptions = task.querySelector('.task-options');
+        if (!taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('a bare mouseenter opened the options — the row moved, the user did not point at it');
+        }
+    });
+
+    await test('showTaskOptions does not spend the customizer tip on a bare mouseenter', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+        let tips = 0;
+        setTaskUIDependencies({ isTouchDevice: () => false, showCustomizerTip: () => { tips++; } });
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        showTaskOptions({ currentTarget: task, type: 'mouseenter' });
+        if (tips !== 0) {
+            throw new Error(`the tip fired on a hover that never happened (${tips}x) — it only shows once per reload`);
+        }
+
+        task.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+        if (tips !== 1) {
+            throw new Error(`the tip should fire on the real hover, got ${tips}`);
+        }
+    });
+
+    await test('hideTaskOptions disarms a pending hover so a later stray move cannot open it', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+        setTaskUIDependencies({ isTouchDevice: () => false });
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        showTaskOptions({ currentTarget: task, type: 'mouseenter' });
+        hideTaskOptions({ currentTarget: task, type: 'mouseleave' });
+        task.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+
+        const taskOptions = task.querySelector('.task-options');
+        if (!taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('a move after the pointer left still opened the options');
+        }
+    });
+
+    await test('showTaskOptions blocked on mobile without long-press', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+        setTaskUIDependencies({ isTouchDevice: () => true });
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        const event = { currentTarget: task, type: 'mouseenter' };
+        showTaskOptions(event);
+
+        const taskOptions = task.querySelector('.task-options');
+        if (!taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should remain hidden on mobile without long-press');
+        }
+    });
+
+    await test('showTaskOptions works on mobile with long-press', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+        setTaskUIDependencies({ isTouchDevice: () => true });
+
+        const task = createMockTaskElement();
+        task.classList.add('long-pressed');
+        document.getElementById('taskList').appendChild(task);
+
+        const event = { currentTarget: task, type: 'mouseenter' };
+        showTaskOptions(event);
+
+        // No mousemove is dispatched here on purpose: touch produces no pointer
+        // movement to wait for, so gating long-press on it would break task
+        // options on touch devices entirely.
+        const taskOptions = task.querySelector('.task-options');
+        if (taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should be visible on mobile with long-press');
+        }
+    });
+
+    await test('hideTaskOptions hides options on desktop', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+        setTaskUIDependencies({ isTouchDevice: () => false });
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        // First show
+        TaskOptionsVisibilityController.show(task, 'mouseenter');
+
+        const event = { currentTarget: task, type: 'mouseleave' };
+        hideTaskOptions(event);
+
+        const taskOptions = task.querySelector('.task-options');
+        if (!taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should be hidden');
+        }
+    });
+
+    await test('hideTaskOptions blocked on mobile with long-press', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+        setTaskUIDependencies({ isTouchDevice: () => true });
+
+        const task = createMockTaskElement();
+        task.classList.add('long-pressed');
+        document.getElementById('taskList').appendChild(task);
+
+        // First show
+        TaskOptionsVisibilityController.show(task, 'long-press');
+
+        const event = { currentTarget: task, type: 'mouseleave' };
+        hideTaskOptions(event);
+
+        const taskOptions = task.querySelector('.task-options');
+        // Should remain visible because long-pressed
+        if (taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should remain visible during long-press');
+        }
+    });
+
+    // =====================================================
+    // hideTaskButtons Tests
+    // =====================================================
+    resultsDiv.innerHTML += '<h3>hideTaskButtons</h3>';
+
+    await test('hideTaskButtons hides options in hover mode', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        // First show
+        TaskOptionsVisibilityController.show(task, 'mouseenter');
+
+        hideTaskButtons(task);
+
+        const taskOptions = task.querySelector('.task-options');
+        if (!taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should be hidden');
+        }
+    });
+
+    await test('hideTaskButtons skipped during rearranging', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+
+        const task = createMockTaskElement();
+        task.classList.add('rearranging');
+        document.getElementById('taskList').appendChild(task);
+
+        // First show
+        TaskOptionsVisibilityController.show(task, 'mouseenter');
+
+        hideTaskButtons(task);
+
+        const taskOptions = task.querySelector('.task-options');
+        // Should remain visible because rearranging
+        if (taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should remain visible during rearranging');
+        }
+    });
+
+    await test('hideTaskButtons skipped during long-press', async () => {
+        createTestDOM();
+        document.body.classList.remove('show-three-dots-enabled');
+
+        const task = createMockTaskElement();
+        task.classList.add('long-pressed');
+        document.getElementById('taskList').appendChild(task);
+
+        // First show
+        TaskOptionsVisibilityController.show(task, 'long-press');
+
+        hideTaskButtons(task);
+
+        const taskOptions = task.querySelector('.task-options');
+        // Should remain visible because long-pressed
+        if (taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should remain visible during long-press');
+        }
+    });
+
+    await test('hideTaskButtons blocked in three-dots mode', async () => {
+        createTestDOM();
+        document.body.classList.add('show-three-dots-enabled');
+
+        const task = createMockTaskElement();
+        document.getElementById('taskList').appendChild(task);
+
+        // Show via three-dots-button
+        TaskOptionsVisibilityController.show(task, 'three-dots-button');
+
+        hideTaskButtons(task);
+
+        const taskOptions = task.querySelector('.task-options');
+        // Should remain visible because hideTaskButtons not allowed in three-dots mode
+        if (taskOptions.classList.contains('task-options-force-hidden')) {
+            throw new Error('Task options should remain visible in three-dots mode');
+        }
+    });
+
+    // =====================================================
+    // checkCompleteAllButton Tests
+    // =====================================================
+    resultsDiv.innerHTML += '<h3>checkCompleteAllButton</h3>';
+
+    // checkCompleteAllButton decides from STATE (the active routine), never from the
+    // rendered lists. Fixtures are AppState mocks; the DOM only supplies the button.
+    function appStateWith(routine) {
+        const state = routine === null ? null : {
+            data: { routine: { 'test-cycle': routine } },
+            appState: { activeRoutineId: 'test-cycle' }
+        };
+        return { isReady: () => state !== null, get: () => state };
+    }
+    const task = (completed = false) => ({ id: 't-' + Math.random().toString(36).slice(2, 7), text: 'T', completed });
+
+    await test('checkCompleteAllButton shows button when the routine has tasks (manual mode)', async () => {
+        createTestDOM();
+        setTaskUIDependencies(createMockDeps({ AppState: appStateWith({ autoReset: false, deleteCheckedTasks: false, tasks: [task()] }) }));
+
+        checkCompleteAllButton();
+
+        const btn = document.getElementById('completeAll');
+        if (btn.style.display !== 'block') {
+            throw new Error('Button should be displayed when the routine has tasks');
+        }
+    });
+
+    await test('checkCompleteAllButton hides button when the routine has no tasks', async () => {
+        createTestDOM();
+        setTaskUIDependencies(createMockDeps({ AppState: appStateWith({ autoReset: false, deleteCheckedTasks: false, tasks: [] }) }));
+
+        checkCompleteAllButton();
+
+        const btn = document.getElementById('completeAll');
+        if (btn.style.display !== 'none') {
+            throw new Error('Button should be hidden when the routine has no tasks');
+        }
+    });
+
+    await test('checkCompleteAllButton hides button when there is no routine (first run / after reset)', async () => {
+        createTestDOM();
+        setTaskUIDependencies(createMockDeps({ AppState: appStateWith(null) }));
+
+        checkCompleteAllButton(); // must not throw
+
+        const btn = document.getElementById('completeAll');
+        if (btn.style.display !== 'none') {
+            throw new Error('Button should be hidden with no active routine');
+        }
+    });
+
+    await test('checkCompleteAllButton stays visible when every task is in the completed dropdown', async () => {
+        // Reproduced Sep 2026: with the completed dropdown on, every finished row
+        // moves out of #taskList. The old element count read that as "no tasks"
+        // and hid the Complete Cycle button after a reload — in manual mode, the
+        // one button that finishes the cycle.
+        createTestDOM();
+        setTaskUIDependencies(createMockDeps({ AppState: appStateWith({
+            autoReset: false, deleteCheckedTasks: false, tasks: [task(true), task(true), task(true)]
+        }) }));
+        // #taskList is deliberately EMPTY — the rows live in the dropdown.
+        if (document.getElementById('taskList').children.length !== 0) throw new Error('fixture: taskList should be empty');
+
+        checkCompleteAllButton();
+
+        const btn = document.getElementById('completeAll');
+        if (btn.style.display !== 'block') {
+            throw new Error('Button must stay visible: the routine has tasks, they are just all in the dropdown');
+        }
+    });
+
+    await test('checkCompleteAllButton hides button in auto mode, read from state', async () => {
+        createTestDOM();
+        setTaskUIDependencies(createMockDeps({ AppState: appStateWith({ autoReset: true, deleteCheckedTasks: false, tasks: [task()] }) }));
+        // Body classes are NOT consulted: leave the body saying manual to prove it.
+        document.body.classList.add('manual-cycle-mode');
+        try {
+            checkCompleteAllButton();
+            const btn = document.getElementById('completeAll');
+            if (btn.style.display !== 'none') {
+                throw new Error('Button should be hidden in auto mode (state), whatever the body class says');
+            }
+        } finally {
+            document.body.classList.remove('manual-cycle-mode');
+        }
+    });
+
+    await test('checkCompleteAllButton labels the button for To-Do mode from state', async () => {
+        createTestDOM();
+        setTaskUIDependencies(createMockDeps({ AppState: appStateWith({ autoReset: false, deleteCheckedTasks: true, tasks: [task()] }) }));
+
+        checkCompleteAllButton();
+
+        const btn = document.getElementById('completeAll');
+        if (btn.style.display !== 'block') throw new Error('Button should show in To-Do mode with tasks');
+        if (!btn.classList.contains('todo-mode-btn') || btn.classList.contains('cycle-mode-btn')) {
+            throw new Error(`To-Do styling expected, got classes: ${btn.className}`);
+        }
+    });
+
+    // =====================================================
+    // refreshTaskListUI Tests
+    // =====================================================
+    resultsDiv.innerHTML += '<h3>refreshTaskListUI</h3>';
+
+    await test('refreshTaskListUI clears and repopulates task list', async () => {
+        createTestDOM();
+
+        let addTaskCalls = [];
+        setTaskUIDependencies({
+            ...createMockDeps(),
+            addTask: (...args) => { addTaskCalls.push(args); }
+        });
+
+        const taskList = document.getElementById('taskList');
+        const oldTask = document.createElement('li');
+        oldTask.textContent = 'Old task';
+        taskList.appendChild(oldTask);
+
+        await refreshTaskListUI();
+
+        if (addTaskCalls.length !== 2) {
+            throw new Error(`Expected 2 addTask calls, got ${addTaskCalls.length}`);
+        }
+
+        if (addTaskCalls[0][0] !== 'Task 1') {
+            throw new Error('First task text should be Task 1');
+        }
+    });
+
+    await test('refreshTaskListUI throws when no schema data', async () => {
+        createTestDOM();
+        setTaskUIDependencies({
+            ...createMockDeps(),
+            AppState: { isReady: () => false, get: () => null }
+        });
+
+        let threwError = false;
+        try {
+            await refreshTaskListUI();
+        } catch (e) {
+            threwError = true;
+            if (!e.message.includes('State data not found')) {
+                throw new Error('Wrong error message');
+            }
+        }
+
+        if (!threwError) {
+            throw new Error('Should throw error when no schema data');
+        }
+    });
+
+    await test('refreshTaskListUI handles missing active cycle gracefully', async () => {
+        createTestDOM();
+        setTaskUIDependencies({
+            ...createMockDeps(),
+            AppState: { isReady: () => true, get: () => ({ data: { routine: {} }, appState: { activeRoutineId: 'nonexistent' } }) }
+        });
+
+        // Should not throw, just return early
+        await refreshTaskListUI();
+        // If we get here without error, test passes
+    });
+
+    // NOTE (drift-review C-24): the 'refreshTaskListUI calls
+    // updateRecurringButtonVisibility' test was removed along with the dep —
+    // it was resolvable nowhere in production (no manifest/depMappings route),
+    // so the call the test asserted never ran outside this mock harness.
+    await test('refreshTaskListUI re-adds every task without recurring-visibility dep', async () => {
+        createTestDOM();
+        let added = 0;
+        setTaskUIDependencies({
+            ...createMockDeps(),
+            addTask: () => { added++; }
+        });
+        await refreshTaskListUI();
+        // The mock cycle has 2 tasks; all must be re-added even though
+        // updateRecurringButtonVisibility is no longer wired (drift-review C-24).
+        if (added !== 2) {
+            throw new Error(`Expected 2 addTask calls, got ${added}`);
+        }
+    });
+
+    // Final cleanup
+    cleanupTestDOM();
+
+    // Results
+    const summary = `<h3>Results: ${passed.count}/${total.count} tests passed</h3>`;
+    resultsDiv.innerHTML = resultsDiv.innerHTML.replace('<h3>Running tests...</h3>', summary);
+
+    return { passed: passed.count, total: total.count };
+}

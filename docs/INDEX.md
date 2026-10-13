@@ -25,7 +25,7 @@ explicit warnings about exactly what data is dropped.
 ## Status
 
 - [ ] Plan reviewed / approved
-- [ ] Phase 0 — Scaffold
+- [x] Phase 0 — Scaffold (branch `phase-0-scaffold`; see `web/FORK_MANIFEST.md`)
 - [ ] Phase 1 — Engine parity
 - [ ] Phase 2 — File formats (`.tcyc` + `.mcyc` interop)
 - [ ] Phase 3 — Tiers & licensing

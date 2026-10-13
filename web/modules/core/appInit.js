@@ -1,0 +1,992 @@
+/**
+ * miniCycle AppInit - 2-Phase Initialization Coordinator
+ *
+ * Solves race conditions by coordinating module initialization with
+ * a promise-based waiting system. Modules can wait for specific phases
+ * to complete before proceeding with their initialization.
+ *
+ * Initialization Phases:
+ * - Phase 1 (Core Systems): AppState + cycle data loaded
+ * - Phase 2 (App Ready): All modules initialized, UI ready
+ *
+ * Features:
+ * - Promise-based phase waiting with timeout protection
+ * - Plugin registration and lifecycle hooks
+ * - Initial setup orchestration (onboarding, cycle loading)
+ * - Performance timing and status reporting
+ *
+ * @module core/appInit
+ * @version 2.0.0
+ * @see {@link module:boot/orchestrator} - Boot sequence coordinator
+ * @see {@link module:core/appState} - State management
+ */
+
+/**
+ * @typedef {import('./types.js').Schema25Data} Schema25Data
+ * @typedef {import('./types.js').Cycle} Cycle
+ */
+
+/**
+ * @typedef {Object} AppInitStatus
+ * @property {boolean} coreReady - Whether Phase 1 (core) is complete
+ * @property {boolean} appReady - Whether Phase 2 (app) is complete
+ * @property {number} pluginCount - Number of registered plugins
+ * @property {Object} timings - Phase timing data in milliseconds
+ * @property {Array<{name: string, version: string}>} plugins - Registered plugins
+ */
+
+import { createDIModule, optional } from './diBase.js';
+import { DOM_IDS, DOM_CLASSES, STORAGE_KEYS, Z_INDEX, UI_TIMEOUTS, DEFAULT_REMINDERS } from './constants.js';
+import { getLabel } from '../labels/labelResolver.js';
+import { getRoutine, getRoutines, getActiveRoutineId, setActiveRoutineId } from '../utils/cycleMode.js';
+
+// ============================================================================
+// DEPENDENCY INJECTION SETUP (using diBase.js)
+// ============================================================================
+
+const di = createDIModule('AppInit', {
+	// For initialSetup
+	createInitialSchema25Data: optional(null),
+	showCycleCreationModal: optional(null),
+	getOnboardingManager: optional(null),
+	getMiniCycleState: optional(null),
+	showNotification: optional(null),  // For data integrity warnings
+
+	// For completeInitialSetup
+	loadMiniCycle: optional(null),
+	updateReminderButtons: optional(null),
+	updateDueDateVisibility: optional(null),
+	checkOverdueTasks: optional(null),
+	organizeCompletedTasks: optional(null),
+	startReminders: optional(null),
+	updateThemeColor: optional(null),
+	syncModeFromToggles: optional(null),
+	getElementById: optional((id) => document.getElementById(id)),
+	addBodyClass: optional((cls) => document.body.classList.add(cls)),
+	removeBodyClass: optional((cls) => document.body.classList.remove(cls))
+});
+
+// Helper to get current deps (resolves fresh each time for late binding)
+const getDeps = () => di.resolve();
+
+// Legacy _deps reference for compatibility (uses getter for late binding)
+/** @type {{createInitialSchema25Data: Function|null, showCycleCreationModal: Function|null, getOnboardingManager: Function|null, getMiniCycleState: Function|null, showNotification: Function|null, loadMiniCycle: Function|null, updateReminderButtons: Function|null, updateDueDateVisibility: Function|null, checkOverdueTasks: Function|null, organizeCompletedTasks: Function|null, startReminders: Function|null, updateThemeColor: Function|null, getElementById: Function, addBodyClass: Function, removeBodyClass: Function}} */
+const _deps = new Proxy({}, {
+	get(_, prop) {
+		return getDeps()[prop];
+	}
+});
+
+/**
+ * Set the AppInit dependencies
+ * @param {Object} dependencies - Dependencies to inject
+ */
+export function setAppInitDependencies(dependencies) {
+	di.setDependencies(dependencies);
+}
+
+class AppInit {
+	constructor() {
+		this.coreReady = false;
+		this.appReady = false;
+
+		this._corePromise = null;
+		this._coreResolve = null;
+		this._appPromise = null;
+		this._appResolve = null;
+
+		this.plugins = new Map();
+		this.pluginHooks = {
+			beforeCore: [],
+			afterCore: [],
+			beforeApp: [],
+			afterApp: []
+		};
+
+		this.startTime = Date.now();
+		this.phaseTimings = {};
+	}
+
+	/**
+	 * Reset appInit state for boot retry
+	 * Called by orchestrator when boot fails and retry is needed
+	 */
+	reset() {
+		this.coreReady = false;
+		this.appReady = false;
+		this._corePromise = null;
+		this._coreResolve = null;
+		this._appPromise = null;
+		this._appResolve = null;
+		this.startTime = Date.now();
+		this.phaseTimings = {};
+		// Note: Keep plugins and hooks registered - they should persist across retries
+	}
+
+	async markCoreSystemsReady() {
+		if (this.coreReady) {
+			console.warn('⚠️ Core systems already marked as ready');
+			return;
+		}
+
+		const startTime = Date.now();
+		await this.runHooks('beforeCore');
+
+		this.coreReady = true;
+		this.phaseTimings.core = Date.now() - startTime;
+
+		if (this._coreResolve) {
+			this._coreResolve();
+		}
+
+		await this.runHooks('afterCore');
+		document.dispatchEvent(new Event('init:core-ready'));
+	}
+
+	/**
+	 * Resolve once core systems are up.
+	 *
+	 * WHAT THIS DOES NOT PROMISE: core-ready is NOT state-ready. On a first run
+	 * AppState.init() deliberately returns with `data = null` and
+	 * `isInitialized = false` (see appState._initializeInternal: "don't create data
+	 * if none exists"), and coreBoot marks core ready straight after — measured:
+	 * AppState.isReady() is false AT markCoreSystemsReady(). The first
+	 * AppState.update() adopts data via its own lazy init.
+	 *
+	 * So on a first run callers must GUARD READS (AppState.get() can be null) and
+	 * must not assume a WRITE lands either: AppState.update() awaits its own init(),
+	 * finds no data, warns "State not ready for updates" and returns WITHOUT running
+	 * the producer. A silent no-op, not a corrupting write — which is why the caller
+	 * audit in the catch below still concludes "don't bail".
+	 *
+	 * All four states (empty origin / refused write / after the first-run choice /
+	 * returning user) are measured and pinned by the "first-run state contract"
+	 * journey in `npm run test:journey`.
+	 *
+	 * Do NOT make this await AppState.isReady() to "close the gap": measured
+	 * Aug 2026, it deadlocks boot. State only becomes ready when something writes,
+	 * and every writer is a UI manager awaiting this gate — boot never completed
+	 * within 25s. The asymmetry is the design, not a defect.
+	 *
+	 * @param {number} [timeoutMs=10000] - Safety timeout
+	 * @returns {Promise<boolean>} true if core became ready; false if it timed out
+	 *          (DIAGNOSTIC — see the caller audit below; not for control flow)
+	 */
+	async waitForCore(timeoutMs = 10000) {
+		if (this.coreReady) {
+			return true;
+		}
+
+		if (!this._corePromise) {
+			this._corePromise = new Promise(resolve => {
+				this._coreResolve = resolve;
+			});
+		}
+
+		// Timeout safety: don't hang forever if core never becomes ready
+		let timer;
+		const timeoutPromise = new Promise((_, reject) => {
+			timer = setTimeout(() => {
+				reject(new Error(`waitForCore timed out after ${timeoutMs}ms - core never became ready`));
+			}, timeoutMs);
+		});
+
+		try {
+			await Promise.race([this._corePromise, timeoutPromise]);
+			return true;
+		} catch (err) {
+			console.error('❌', err.message);
+			console.warn('⚠️ Continuing without core ready - some features may not work');
+			// Don't rethrow — that would break every awaiting caller at once.
+			// Report it instead. `await waitForCore()` ignoring the value behaves
+			// exactly as before.
+			//
+			// CALLER AUDIT (Aug 2026) — why no caller branches on this, and why
+			// adding a bail-on-false would be a REGRESSION rather than a fix:
+			//   • WRITES cannot go WRONG here. AppState.update() awaits its own
+			//     init() before touching data: where data exists it writes
+			//     correctly, and on an empty origin it warns and returns without
+			//     running the producer at all (measured — see the first-run state
+			//     contract journey). Either way, proceeding after `false` cannot
+			//     produce the corrupted write that bailing was meant to prevent.
+			//   • READS are the real exposure: AppState.get() is synchronous and
+			//     returns null before init. Four post-await sites dereferenced it
+			//     unguarded (recurringPanel, recurringSettingsApplicator,
+			//     notifications ×2) — fixed at the READ site, which is where the
+			//     hazard actually lives.
+			//   • What callers do immediately after awaiting is UI setup —
+			//     attaching listeners, resolving DOM nodes, loading sub-modules.
+			//     Bailing would skip that permanently, turning a transient
+			//     degraded boot into a feature that never works for the session.
+			// So the return value is for DIAGNOSIS, not control flow.
+			return false;
+		} finally {
+			// Promise.race settles on the FIRST outcome but does not cancel the
+			// loser — without this the timer runs to completion, so every
+			// awaiting caller left a live 10s timer holding a closure and a
+			// pending rejection, right through the boot window that matters.
+			// Verified by execution: races settling at 50ms still fired every
+			// timer afterwards (Aug 2026). Also keeps Node alive in tests.
+			clearTimeout(timer);
+		}
+	}
+
+	isCoreReady() {
+		return this.coreReady;
+	}
+
+	async markAppReady() {
+		if (this.appReady) {
+			console.warn('⚠️ miniCycle app already marked as ready');
+			return;
+		}
+
+		const startTime = Date.now();
+		await this.runHooks('beforeApp');
+
+		this.appReady = true;
+		this.phaseTimings.app = Date.now() - startTime;
+		this.phaseTimings.total = Date.now() - this.startTime;
+
+		if (this._appResolve) {
+			this._appResolve();
+		}
+
+		await this.runHooks('afterApp');
+		document.dispatchEvent(new Event('init:app-ready'));
+	}
+
+	async waitForApp(timeoutMs = 15000) {
+		if (this.appReady) {
+			return true;
+		}
+
+		if (!this._appPromise) {
+			this._appPromise = new Promise(resolve => {
+				this._appResolve = resolve;
+			});
+		}
+
+		// Timeout safety: don't hang forever if app never becomes ready
+		let timer;
+		const timeoutPromise = new Promise((_, reject) => {
+			timer = setTimeout(() => {
+				reject(new Error(`waitForApp timed out after ${timeoutMs}ms - app never became ready`));
+			}, timeoutMs);
+		});
+
+		try {
+			await Promise.race([this._appPromise, timeoutPromise]);
+			return true;
+		} catch (err) {
+			console.error('❌', err.message);
+			console.warn('⚠️ Continuing without app ready - some features may not work');
+			return false;
+		} finally {
+			// Same as waitForCore: cancel the losing timer. 15s here.
+			clearTimeout(timer);
+		}
+	}
+
+	isAppReady() {
+		return this.appReady;
+	}
+
+	registerPlugin(name, plugin) {
+		if (this.plugins.has(name)) {
+			console.warn(`⚠️ Plugin ${name} already registered, skipping`);
+			return false;
+		}
+
+		this.plugins.set(name, plugin);
+		return true;
+	}
+
+	getPlugin(name) {
+		return this.plugins.get(name);
+	}
+
+	hasPlugin(name) {
+		return this.plugins.has(name);
+	}
+
+	getPlugins() {
+		return Array.from(this.plugins.entries()).map(([name, plugin]) => ({
+			name,
+			version: plugin.version || 'unknown',
+			plugin
+		}));
+	}
+
+	addHook(hookName, callback) {
+		if (!this.pluginHooks[hookName]) {
+			throw new Error(`Unknown hook: ${hookName}. Available: ${Object.keys(this.pluginHooks).join(', ')}`);
+		}
+
+		this.pluginHooks[hookName].push(callback);
+	}
+
+	async runHooks(hookName) {
+		const hooks = this.pluginHooks[hookName] || [];
+
+		if (hooks.length === 0) {
+			return;
+		}
+
+		for (const hook of hooks) {
+			try {
+				await hook();
+			} catch (error) {
+				console.error(`Hook ${hookName} failed:`, error);
+			}
+		}
+	}
+
+	getStatus() {
+		return {
+			coreReady: this.coreReady,
+			appReady: this.appReady,
+			pluginCount: this.plugins.size,
+			timings: this.phaseTimings,
+			plugins: this.getPlugins().map(p => ({ name: p.name, version: p.version }))
+		};
+	}
+
+	printStatus() {
+		const status = this.getStatus();
+	}
+
+	/**
+	 * Route a brand-new user based on their first-run choice-screen pick.
+	 * All three destinations use existing machinery; this only picks the path.
+	 * @param {'create'|'sample'|'learn'|null|undefined} choice
+	 * @param {Object} onboardingManager - resolved onboarding manager (may be null)
+	 * @param {Object} cycles, @param {string} activeCycle, @param {Object} schemaData
+	 */
+	_routeFirstRunChoice(choice, onboardingManager, cycles, activeCycle, schemaData) {
+		// The focus-first flow (typewriter splash → Focus View w/ Your First
+		// Routine → welcome banner + tour) is BOTH the "learn" experience and the
+		// legacy default, so 'learn' and null map to it.
+		const runLegacyFocusFlow = () => {
+			if (onboardingManager?.runFirstRunFlow) {
+				onboardingManager.runFirstRunFlow().catch(err => {
+					console.error('❌ runFirstRunFlow failed:', err);
+				});
+			} else {
+				console.warn('⚠️ runFirstRunFlow unavailable — falling back to legacy welcome modal');
+				onboardingManager?.showOnboarding?.(cycles, activeCycle, schemaData);
+			}
+		};
+
+		// create/sample have NO guided tour (the user declined it by their pick).
+		// Mark onboarding complete NOW so a refresh doesn't re-trigger the legacy
+		// welcome modal (appInit's second first-run branch fires on
+		// !onboardingCompleted && !focusModeActive).
+		// 'learn' is NOT marked here — runFirstRunFlow completes it on focus exit.
+		const markOnboardingComplete = () => {
+			const AppState = _deps.getMiniCycleState?.();
+			AppState?.update?.((s) => {
+				if (!s.settings) s.settings = {};
+				s.settings.onboardingCompleted = true;
+			}, true); // immediate save — survives a fast refresh
+		};
+
+		// Both create and sample land the new user in FOCUS VIEW rather than Home
+		// View — one task at a time is a calmer, more pointed first impression than
+		// the full list plus all the chrome, and it puts the cycle itself front and
+		// centre. The tour is still skipped; onboardingManager shows a short
+		// notification naming the ⋯ menu (exiting is the excuse to make them
+		// discover the menu), and guidedTourManager's "tour of Home View" prompt
+		// fires by itself on the first focus exit.
+		//
+		// Deferred until the routine actually exists — activating focus view while
+		// the creation dialog is still open would land on nothing. Both paths
+		// finish through completeInitialSetup() → runCompleteInitialSetup(), which
+		// consumes this flag. (An 'onboarding:setup-complete' listener does NOT
+		// work here: routineManager fires that event on the create path only —
+		// loadSampleRoutine completes without it.)
+		const landInFocusViewWhenRoutineReady = ({ showInputBar, choice }) => {
+			this._pendingFirstRunFocusView = { showInputBar, choice };
+		};
+
+		// create/sample get the same welcome splash as 'learn', minus the
+		// phase-3 hand-off — there's no welcome banner on these paths, so the
+		// title just rests centered and fades. The dialog opens AFTER the fade
+		// rather than behind it: its name input autofocuses, and a dialog
+		// hidden under the splash would raise the mobile keyboard against a
+		// black screen. showWelcomeSplash is watchdog-backed so it always
+		// settles; the guards below cover the manager being unavailable.
+		const openAfterWelcomeSplash = (openDialog) => {
+			const splashDone = onboardingManager?.showWelcomeSplash?.();
+			if (typeof splashDone?.then !== 'function') {
+				openDialog();
+				return;
+			}
+			splashDone.then(openDialog).catch(err => {
+				console.error('❌ welcome splash failed — opening dialog anyway:', err);
+				openDialog();
+			});
+		};
+
+		switch (choice) {
+			case 'create':
+				// Blank routine: open the creation dialog, then land in Focus View
+				// with the task input bar showing — the routine is empty, so the
+				// input is the one thing there is to act on. Cancelling falls back
+				// to the getting-started sample via the dialog's own guard.
+				markOnboardingComplete();
+				// One-shot flag: the empty-state hint shown after this routine is
+				// created uses the friendlier first-step copy (routineManager reads
+				// + clears it). Cleared on first render so later routines are normal.
+				try { sessionStorage.setItem('miniCycle_firstRunCreate', '1'); } catch (e) { /* private mode */ }
+				if (_deps.showCycleCreationModal) {
+					landInFocusViewWhenRoutineReady({ showInputBar: true, choice: 'create' });
+					openAfterWelcomeSplash(() => _deps.showCycleCreationModal());
+				} else {
+					console.warn('⚠️ showCycleCreationModal unavailable — legacy flow');
+					runLegacyFocusFlow();
+				}
+				break;
+			case 'sample':
+				// Sample picker: same dialog, opened straight to the sample list.
+				// The sample arrives with tasks, so Focus View has something to show
+				// immediately — no input bar needed.
+				markOnboardingComplete();
+				if (_deps.showCycleCreationModal) {
+					landInFocusViewWhenRoutineReady({ showInputBar: false, choice: 'sample' });
+					openAfterWelcomeSplash(() => _deps.showCycleCreationModal({ startInSampleView: true }));
+				} else {
+					runLegacyFocusFlow();
+				}
+				break;
+			case 'learn':
+			default:
+				runLegacyFocusFlow();
+				break;
+		}
+	}
+
+	/**
+	 * The state the setup paths read, in the flat shape they consume
+	 * (`{ cycles, activeCycle, reminders, settings }`), or null while AppState is
+	 * not ready. Reads AppState ONLY. The legacy loadMiniCycleData wrapper that fed
+	 * this fell back to a direct localStorage parse, which could hand back a document
+	 * AppState had refused (a newer build's, or one that failed validation) with
+	 * AppState empty - a half-dead UI (STATE_TRUTH_MIGRATION #25).
+	 * @returns {{cycles: Object, activeCycle: string|null, reminders: Object, settings: Object}|null}
+	 */
+	_readSchemaData() {
+		const AppState = _deps.getMiniCycleState?.();
+		if (!AppState?.isReady?.()) return null;
+		const state = AppState.get();
+		if (!state) return null;
+		return {
+			cycles: getRoutines(state) || {},
+			activeCycle: getActiveRoutineId(state),
+			reminders: state.customReminders || DEFAULT_REMINDERS,
+			settings: state.settings || {}
+		};
+	}
+
+	async runInitialSetup() {
+
+		// Wait for core systems (AppState, etc.) to be ready before loading data
+		// Note: With orchestrator pattern, core is always ready by Phase 3, but we check defensively
+		if (!this.isCoreReady()) {
+			await this.waitForCore();
+		}
+
+		const miniCycleState = _deps.getMiniCycleState?.();
+		let schemaData = this._readSchemaData();
+
+		if (!schemaData) {
+			// Storage written by a NEWER build: AppState refused to adopt it (and will
+			// refuse to write over it). Checked FIRST: the corruption modal below offers
+			// a fresh start that would delete it. Show the one honest option: reload
+			// into a newer build.
+			const newerBlock = miniCycleState?.isBlockedByNewerData?.();
+			if (newerBlock) {
+				this.showNewerDataNotice(newerBlock.version);
+				return;
+			}
+
+			// Check if this is corrupted data vs truly empty
+			const rawData = localStorage.getItem(STORAGE_KEYS.DATA);
+			if (rawData) {
+				// Data exists but AppState could not adopt it - CORRUPTED
+				console.error('🚨 DATA CORRUPTION DETECTED: localStorage has data but it cannot be parsed');
+				console.error('🚨 Raw data length:', rawData.length, 'chars');
+
+				// Show recovery modal
+				this.showDataCorruptionRecovery(rawData);
+				return;
+			}
+
+			_deps.createInitialSchema25Data?.();
+
+			// ✅ FIX: Reload AppState so it picks up the newly created data
+			// This ensures AppState.isReady() returns true for onboarding and subsequent code
+			if (miniCycleState?.reload) {
+				miniCycleState.reload();
+			}
+
+			schemaData = this._readSchemaData();
+		}
+
+		// Final check - if still no data, something is very wrong
+		if (!schemaData) {
+			console.error('🚨 Failed to load or create schema data');
+			this.showDataCorruptionRecovery(localStorage.getItem(STORAGE_KEYS.DATA));
+			return;
+		}
+
+		const { cycles, activeCycle, reminders, settings } = schemaData;
+
+		// ✅ FIX: Check onboarding directly from schemaData instead of via AppState
+		// This avoids a race condition where AppState.isReady() returns false on initial load
+		// because data was just created by dataAccess and AppState wasn't re-initialized
+		// Two paths graduate a user, per the contract documented in
+		// onboardingManager (~line 1761): dismissing the welcome banner
+		// (firstRunWelcomeDismissed) OR exiting Focus View (onboardingCompleted).
+		// Reading only the second stranded anyone who took the first: they never
+		// exit Focus View during the create-your-own-routine flow, so the
+		// focus-exit handler never fires, and every reload re-showed onboarding
+		// over their real routines (Aug 2026 lockout).
+		// Safe for "Reset Onboarding" — that handler clears BOTH flags, so a
+		// deliberate reset still re-shows onboarding.
+		const hasSeenOnboarding = !!(settings?.onboardingCompleted || settings?.firstRunWelcomeDismissed);
+		const cycleCount = Object.keys(cycles || {}).length;
+		const hasValidActiveCycle = activeCycle && cycles[activeCycle];
+
+		// First-run focus-first flow: brand-new user with zero cycles.
+		// Loads Your First Routine into Focus View; welcome toast + tour
+		// notification defer until first focus-view exit (or app close).
+		if (!hasSeenOnboarding && cycleCount === 0) {
+			const onboardingManager = _deps.getOnboardingManager?.();
+
+			// First-run choice screen (static, shown pre-boot when no data exists):
+			// route by the user's pick instead of unconditionally running the
+			// focus-first flow. appInit runs DURING boot — before the tap — so the
+			// choice is usually not set yet; defer to the 'firstrun:choice' event.
+			// Falls back to the legacy focus-first flow when the screen is absent.
+			const loaderEl = _deps.getElementById?.(DOM_IDS.APP_LOADER);
+			const choiceScreenActive = loaderEl?.classList?.contains?.('first-run-mode');
+			let pendingChoice = null;
+			try { pendingChoice = sessionStorage.getItem('miniCycle_firstRunChoice'); } catch (e) { /* private mode */ }
+
+			if (pendingChoice) {
+				this._routeFirstRunChoice(pendingChoice, onboardingManager, cycles, activeCycle, schemaData);
+				return;
+			}
+			if (choiceScreenActive) {
+				document.addEventListener('firstrun:choice', (e) => {
+					this._routeFirstRunChoice(e?.detail?.choice, onboardingManager, cycles, activeCycle, schemaData);
+				}, { once: true });
+				return;
+			}
+
+			// No choice screen → legacy default (unchanged behavior).
+			this._routeFirstRunChoice(null, onboardingManager, cycles, activeCycle, schemaData);
+			return;
+		}
+
+		// Onboarding incomplete but cycles exist. Three ways to get here:
+		//   • the user closed the app mid-first-run (still in Focus View) →
+		//     re-arm the first-session lifecycle so the welcome banner reappears
+		//     and focus-exit / unload finalize onboarding;
+		//   • they hit "Reset Onboarding" in Settings → it sets
+		//     onboardingResetRequested alongside clearing the flags; Home View
+		//     shows the legacy 3-step welcome modal as the refresher, once;
+		//   • the profile PREDATES the flags — migrated from schema 2.5 or
+		//     restored from an old backup. Until Oct 2026 this case was read as
+		//     a reset, so a Mac profile with 36 routines got "Welcome to
+		//     miniCycle!" on every launch (noticed as "every update"). Routines
+		//     exist and nobody asked for a refresher: graduate the profile and
+		//     boot normally.
+		if (!hasSeenOnboarding) {
+			const onboardingManager = _deps.getOnboardingManager?.();
+			const focusModeActive = !!settings?.focusModeActive;
+			const resetRequested = !!settings?.onboardingResetRequested;
+			if (!focusModeActive) {
+				const AppState = _deps.getMiniCycleState?.();
+				if (resetRequested && onboardingManager?.showOnboarding) {
+					// One-shot: the modal's own completion sets onboardingCompleted.
+					AppState?.update?.((s) => {
+						if (!s.settings) s.settings = {};
+						s.settings.onboardingResetRequested = false;
+					}, true);
+					onboardingManager.showOnboarding(cycles, activeCycle, schemaData);
+					return;
+				}
+				AppState?.update?.((s) => {
+					if (!s.settings) s.settings = {};
+					s.settings.onboardingCompleted = true;
+				}, true);
+				// Fall through to normal init with the user's routines
+			} else {
+				onboardingManager?.armFirstSessionLifecycle?.();
+				// Fall through to normal init
+			}
+		}
+
+		// 🛡️ DATA INTEGRITY CHECK: Ensure valid routines exist
+		if (cycleCount === 0) {
+			// No routines exist at all - show onboarding flow
+			console.warn('⚠️ DATA INTEGRITY: No routines exist - showing onboarding with sample option');
+			const onboardingManager = _deps.getOnboardingManager?.();
+			if (onboardingManager?.showOnboarding) {
+				onboardingManager.showOnboarding(cycles, activeCycle, schemaData);
+			} else {
+				// Fallback if onboarding manager not available
+				_deps.showNotification?.(getLabel('notify.noRoutinesFound'), 'warning', UI_TIMEOUTS.NOTIFICATION_SLOW);
+				_deps.showCycleCreationModal?.();
+			}
+			return;
+		}
+
+		if (!hasValidActiveCycle) {
+			// Routines exist but none is active - data corruption
+			console.warn('⚠️ DATA INTEGRITY: No active routine (but routines exist) - attempting recovery');
+
+			// Try to auto-recover by activating the first available routine
+			const availableCycles = Object.keys(cycles);
+			const firstCycle = availableCycles[0];
+
+			if (firstCycle) {
+				const miniCycleState = _deps.getMiniCycleState?.();
+				if (miniCycleState?.isReady?.()) {
+					await miniCycleState.update(state => {
+						setActiveRoutineId(state, firstCycle);
+					}, true);
+					// Re-read with the fixed activeCycle
+					schemaData = this._readSchemaData();
+					const recoveredActiveCycle = schemaData?.activeCycle || firstCycle;
+					_deps.showNotification?.(getLabel('notify.recoveredRoutine', { vars: { name: recoveredActiveCycle } }), 'success', UI_TIMEOUTS.NOTIFICATION_LONG);
+					await this.runCompleteInitialSetup(recoveredActiveCycle, null, schemaData);
+					return;
+				}
+			}
+
+			// Recovery failed - show creation modal
+			console.warn('⚠️ DATA INTEGRITY: Recovery failed - showing creation modal');
+			_deps.showNotification?.(getLabel('notify.noActiveRoutine'), 'warning', UI_TIMEOUTS.NOTIFICATION_SLOW);
+			_deps.showCycleCreationModal?.();
+			return;
+		}
+
+		await this.runCompleteInitialSetup(activeCycle, null, schemaData);
+	}
+
+	async runCompleteInitialSetup(activeCycle, fullSchemaData = null, schemaData = null) {
+
+		// ✅ Remove onboarding-active class to show task list area
+		document.body.classList.remove(DOM_CLASSES.ONBOARDING_ACTIVE);
+
+		// Wait for core systems (TaskDOM is loaded in Phase 2, before Phase 3 runs)
+		// Note: With orchestrator pattern, core is always ready by the time this runs
+		if (!this.isCoreReady()) {
+			await this.waitForCore();
+		}
+
+		// First-run "create": reveal the task input bar for the new (empty) routine.
+		// Must happen BEFORE loadMiniCycle() below, because modeManager reads the
+		// per-routine `showTaskInput` once during that render — setting it after
+		// persists the preference but leaves the bar hidden until the next render.
+		// Writing the setting (rather than clicking the toggle button) also avoids
+		// the button's own "Add tasks using the input bar…" notification, which
+		// would double up with the Focus View one shown at the end of this method.
+		if (this._pendingFirstRunFocusView?.showInputBar) {
+			const AppStateForInput = _deps.getMiniCycleState?.();
+			await AppStateForInput?.update?.((state) => {
+				const cycle = getRoutine(state, activeCycle);
+				if (cycle) cycle.showTaskInput = true;
+			}, true);
+		}
+
+		const loadMiniCycle = _deps.loadMiniCycle?.();
+		if (typeof loadMiniCycle === 'function') {
+			await loadMiniCycle();
+
+			const updateReminderButtons = _deps.updateReminderButtons?.();
+			if (typeof updateReminderButtons === 'function') {
+				await updateReminderButtons();
+			}
+
+			const updateDueDateVisibility = _deps.updateDueDateVisibility?.();
+			if (typeof updateDueDateVisibility === 'function') {
+				const toggleAutoReset = _deps.getElementById?.(DOM_IDS.TOGGLE_AUTO_RESET);
+				const autoReset = toggleAutoReset?.checked || false;
+				await updateDueDateVisibility(autoReset);
+			}
+
+			const checkOverdueTasks = _deps.checkOverdueTasks?.();
+			if (typeof checkOverdueTasks === 'function') {
+				await checkOverdueTasks();
+			}
+
+			const organizeCompletedTasks = _deps.organizeCompletedTasks?.();
+			if (typeof organizeCompletedTasks === 'function') {
+				organizeCompletedTasks();
+			}
+		}
+
+		if (!schemaData) {
+			schemaData = this._readSchemaData();
+		}
+
+		const { cycles, reminders, settings } = schemaData || {};
+
+		if (!cycles) {
+			console.warn('⚠️ No cycles data found in schema - legacy migration may still be in progress');
+			return;
+		}
+
+		const currentCycle = cycles[activeCycle];
+
+		if (!currentCycle) {
+			console.error('❌ Cycle not found after setup:', activeCycle);
+			return;
+		}
+
+		const titleElement = _deps.getElementById?.(DOM_IDS.MINI_CYCLE_TITLE);
+		const toggleAutoReset = _deps.getElementById?.(DOM_IDS.TOGGLE_AUTO_RESET);
+		const deleteCheckedTasks = _deps.getElementById?.(DOM_IDS.DELETE_CHECKED_TASKS);
+		const enableReminders = _deps.getElementById?.(DOM_IDS.ENABLE_REMINDERS);
+		const frequencySection = _deps.getElementById?.(DOM_IDS.FREQUENCY_SECTION);
+
+		if (titleElement) {
+			titleElement.textContent = currentCycle.title;
+		}
+
+		if (toggleAutoReset) {
+			toggleAutoReset.checked = currentCycle.autoReset || false;
+		}
+
+		if (deleteCheckedTasks) {
+			deleteCheckedTasks.checked = currentCycle.deleteCheckedTasks || false;
+		}
+
+		// Sync mode selector dropdown to match the toggle states we just set
+		await _deps.syncModeFromToggles?.();
+
+		if (enableReminders) {
+			enableReminders.checked = reminders.enabled === true;
+
+			if (reminders.enabled && frequencySection) {
+				frequencySection.classList.remove(DOM_CLASSES.HIDDEN);
+				_deps.startReminders?.();
+			}
+		}
+
+		if (settings.darkMode) {
+			_deps.addBodyClass?.('dark-mode');
+			document.documentElement?.classList.add(DOM_CLASSES.DARK_MODE);
+		} else {
+			_deps.removeBodyClass?.('dark-mode');
+			document.documentElement?.classList.remove(DOM_CLASSES.DARK_MODE);
+		}
+
+		if (settings.theme && settings.theme !== 'default') {
+			const allThemes = ['theme-dark-ocean', 'theme-golden-glow'];
+			allThemes.forEach(theme => _deps.removeBodyClass?.(theme));
+			_deps.addBodyClass?.(`theme-${settings.theme}`);
+		}
+
+		_deps.updateThemeColor?.();
+
+		// Accessibility settings
+		if (settings.reducedMotion) {
+			_deps.addBodyClass?.('reduced-motion');
+			document.documentElement?.classList.add(DOM_CLASSES.REDUCED_MOTION);
+		}
+		if (settings.highContrast) {
+			_deps.addBodyClass?.('high-contrast');
+		}
+		if (settings.fontSize && settings.fontSize !== '16') {
+			document.documentElement.style.setProperty('--font-size-base', `${settings.fontSize}px`);
+		}
+
+		// First-run "create"/"sample" choices land the user in Focus View instead
+		// of Home View. Done HERE (rather than in _routeFirstRunChoice) because
+		// this is the first point where the routine actually exists and has
+		// rendered — both paths funnel through completeInitialSetup() to get here.
+		// Consumed one-shot so later routine creations behave normally.
+		if (this._pendingFirstRunFocusView) {
+			const firstRunChoice = this._pendingFirstRunFocusView.choice;
+			this._pendingFirstRunFocusView = null;
+			_deps.getOnboardingManager?.()?.startFocusViewForNewRoutine?.(firstRunChoice);
+		}
+
+		return true;
+	}
+
+	/**
+	 * Show data corruption recovery modal
+	 * Offers options to recover from corrupted localStorage data
+	 */
+	/**
+	 * Full-screen notice for storage written by a newer app version. Deliberately
+	 * has ONE action, reload: every other recovery option (fresh start, restore)
+	 * would destroy data this build simply cannot read yet. Built with DOM APIs
+	 * and textContent — the version string comes from storage.
+	 * @param {string} version - The stored document's schemaVersion
+	 * @returns {void}
+	 */
+	showNewerDataNotice(version) {
+		if (document.getElementById(DOM_IDS.NEWER_DATA_NOTICE)) return;
+
+		const overlay = document.createElement('div');
+		overlay.id = DOM_IDS.NEWER_DATA_NOTICE;
+		overlay.setAttribute('role', 'alertdialog');
+		overlay.setAttribute('aria-modal', 'true');
+		overlay.setAttribute('aria-labelledby', DOM_IDS.NEWER_DATA_NOTICE + '-title');
+		overlay.style.cssText = `position:fixed;inset:0;z-index:${Z_INDEX.CRITICAL};display:flex;align-items:center;justify-content:center;padding:var(--space-4, 16px);box-sizing:border-box;background:rgba(0,0,0,0.9);`;
+
+		const content = document.createElement('div');
+		content.style.cssText = 'max-width:500px;width:100%;padding:32px;border-radius:16px;color:#fff;background:linear-gradient(135deg,#1a1a2e,#16213e);box-shadow:0 10px 40px rgba(0,0,0,0.5);';
+
+		const title = document.createElement('h2');
+		title.id = DOM_IDS.NEWER_DATA_NOTICE + '-title';
+		title.style.cssText = 'margin:0 0 16px;font-size:1.5rem;';
+		title.textContent = getLabel('modal.newerDataTitle');
+
+		const body = document.createElement('p');
+		body.style.cssText = 'margin:0 0 24px;line-height:1.5;opacity:0.9;white-space:pre-line;';
+		body.textContent = getLabel('modal.newerDataMessage', { vars: { version } });
+
+		const reload = document.createElement('button');
+		reload.type = 'button';
+		reload.style.cssText = 'width:100%;padding:14px;border:0;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;color:#fff;background:#4a90e2;';
+		reload.textContent = getLabel('button.reload');
+		reload.addEventListener('click', () => globalThis.location?.reload?.(), { once: true });
+
+		content.append(title, body, reload);
+		overlay.appendChild(content);
+		document.body.appendChild(overlay);
+		reload.focus();
+	}
+
+	showDataCorruptionRecovery(corruptedData) {
+
+		// Create modal overlay
+		const modal = document.createElement('div');
+		modal.id = 'data-corruption-modal';
+		modal.style.cssText = `
+			position: fixed;
+			top: 0;
+			left: 0;
+			width: 100%;
+			height: 100%;
+			background: rgba(0, 0, 0, 0.9);
+			z-index: ${Z_INDEX.CRITICAL};
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			padding: 20px;
+			box-sizing: border-box;
+		`;
+
+		const content = document.createElement('div');
+		content.style.cssText = `
+			background: linear-gradient(135deg, #1a1a2e, #16213e);
+			border-radius: 16px;
+			padding: 32px;
+			max-width: 500px;
+			width: 100%;
+			color: white;
+			font-family: 'Inter', -apple-system, sans-serif;
+			box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+		`;
+
+		const preview = corruptedData ? corruptedData.substring(0, 50) + '...' : 'No data';
+
+		content.innerHTML = `
+			<h2 style="margin: 0 0 16px; color: #ff6b6b; font-size: 1.5rem;">
+				⚠️ Data Corruption Detected
+			</h2>
+			<p style="margin: 0 0 16px; opacity: 0.9; line-height: 1.5;">
+				Your saved data appears to be corrupted and cannot be loaded. This may have happened during a test run or browser issue.
+			</p>
+			<p style="margin: 0 0 24px; font-size: 0.85rem; opacity: 0.7; font-family: monospace; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 4px; word-break: break-all;">
+				Preview: ${preview.replace(/</g, '&lt;').replace(/>/g, '&gt;')}
+			</p>
+			<div style="display: flex; flex-direction: column; gap: 12px;">
+				<button id="recovery-fresh-start" style="
+					background: linear-gradient(135deg, #4c79ff, #74c0fc);
+					border: none;
+					color: white;
+					padding: 14px 20px;
+					border-radius: 8px;
+					cursor: pointer;
+					font-size: 1rem;
+					font-weight: 600;
+				">
+					🆕 Start Fresh (Clear Data)
+				</button>
+				<button id="recovery-load-sample" style="
+					background: rgba(255,255,255,0.1);
+					border: 1px solid rgba(255,255,255,0.3);
+					color: white;
+					padding: 14px 20px;
+					border-radius: 8px;
+					cursor: pointer;
+					font-size: 1rem;
+				">
+					📥 Load Sample Routine
+				</button>
+				<button id="recovery-download-backup" style="
+					background: transparent;
+					border: 1px solid rgba(255,255,255,0.2);
+					color: rgba(255,255,255,0.7);
+					padding: 10px 20px;
+					border-radius: 8px;
+					cursor: pointer;
+					font-size: 0.9rem;
+				">
+					💾 Download Corrupted Data (for recovery)
+				</button>
+			</div>
+		`;
+
+		modal.appendChild(content);
+		document.body.appendChild(modal);
+
+		// Button handlers
+		document.getElementById(DOM_IDS.RECOVERY_FRESH_START).addEventListener('click', () => {
+			localStorage.removeItem(STORAGE_KEYS.DATA);
+			modal.remove();
+			window.location.reload();
+		});
+
+		document.getElementById(DOM_IDS.RECOVERY_LOAD_SAMPLE).addEventListener('click', async () => {
+			localStorage.removeItem(STORAGE_KEYS.DATA);
+			modal.remove();
+			// Create initial data then show cycle creation modal with sample option
+			_deps.createInitialSchema25Data?.();
+			const miniCycleState = _deps.getMiniCycleState?.();
+			if (miniCycleState?.reload) {
+				miniCycleState.reload();
+			}
+			// Trigger sample load
+			_deps.showCycleCreationModal?.();
+		});
+
+		document.getElementById(DOM_IDS.RECOVERY_DOWNLOAD_BACKUP).addEventListener('click', () => {
+			// Download the corrupted data for potential manual recovery
+			const blob = new Blob([corruptedData || ''], { type: 'text/plain' });
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = `miniCycle-corrupted-backup-${Date.now()}.txt`;
+			a.click();
+			URL.revokeObjectURL(url);
+		});
+	}
+}
+
+/** @type {AppInit} Singleton instance coordinating app initialization lifecycle */
+export const appInit = new AppInit();
+
+/** @type {string} Version of the AppInit module */
+export const APPINIT_VERSION = '2.0.0';
+

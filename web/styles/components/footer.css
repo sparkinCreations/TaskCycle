@@ -1,0 +1,175 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Footer Component
+   Footer container, copyright, and footer links
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* =============================================================================
+   FOOTER CONTAINER
+   ============================================================================= */
+
+#footer-container {
+    display: block;
+    position: fixed;
+    bottom: 18px;
+    color: var(--footer-text, #ffffff);
+    text-align: center;
+    font-size: 12px;
+    font-family: 'Poppins', 'Poppins Fallback', sans-serif;
+    z-index: var(--z-base);
+    width: 100%;
+}
+
+/* =============================================================================
+   COPYRIGHT TEXT
+   ============================================================================= */
+
+/* White links on a thin, see-through navy glass strip under a heavy blur,
+   so the page shows through like the panels' glass. Blur alone does not
+   change what is under the text, so the tint is what the contrast comes
+   from: a deep navy at 43% is the most transparent setting that keeps the
+   white text at 4.6:1 over the gradient's light end (see --footer-strip-bg),
+   gated by the contrast runner. No opacity dimming on the text. */
+.footer-links {
+    list-style: none;
+    margin: 0 auto;
+    padding: var(--space-0-5, 2px) var(--space-3);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: fit-content;
+    max-width: calc(100% - 2 * var(--space-4));
+    background: var(--footer-strip-bg, rgba(28, 56, 120, 0.55));
+    border: 1px solid var(--footer-strip-border, rgba(255, 255, 255, 0.28));
+    border-radius: var(--radius-full, 999px);
+    backdrop-filter: blur(14px) saturate(1.3);
+    -webkit-backdrop-filter: blur(14px) saturate(1.3);
+}
+#copyright {
+    margin: 0;
+    line-height: 1.5;
+    opacity: 1;
+    transition: opacity var(--transition-normal) ease-in-out;
+    align-items: center;
+    color: var(--footer-text, #ffffff);
+}
+
+#copyright a {
+    color: var(--footer-text, #ffffff);
+    text-decoration: none;
+}
+
+#copyright a:hover {
+    text-decoration: underline;
+}
+
+#footer-container:hover #copyright {
+    opacity: 1;
+}
+
+/* =============================================================================
+   FOOTER ITEMS
+   ============================================================================= */
+
+.footer-item {
+    margin: 0;
+    line-height: 1.5;
+    opacity: 1;
+    transition: opacity var(--transition-normal) ease-in-out;
+    align-items: center;
+    color: var(--footer-text, #ffffff);
+    z-index: var(--z-content);
+}
+
+.footer-item:hover {
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.footer-item a {
+    color: var(--footer-text, #ffffff);
+    text-decoration: none;
+}
+
+.footer-item a:hover,
+.footer-item a:focus-visible,
+.footer-item button:hover,
+.footer-item button:focus-visible {
+    text-decoration: underline;
+}
+
+.footer-item button {
+    background: none;
+    border: none;
+    color: var(--footer-text, #ffffff);
+    text-decoration: none;
+    cursor: pointer;
+    font: inherit;
+    padding: 0;
+}
+
+#footer-container:hover .footer-item {
+    opacity: 1;
+}
+
+/* =============================================================================
+   FOOTER LINKS
+   ============================================================================= */
+
+#footer-container .footer-links {
+    gap: 1em;
+}
+
+/* =============================================================================
+   MOBILE ADJUSTMENTS
+   ============================================================================= */
+
+@media (max-width: 768px) {
+    #footer-container .footer-links {
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 1em;
+    }
+
+    #footer-container .footer-links > li {
+        order: 0;
+    }
+
+    #footer-container .footer-links > .footer-item {
+        display: none;
+    }
+
+    /* Phones: only the copyright line shows, so the glass strip would be a
+       pill around one short caption under the Undo button and the page dots.
+       Drop it; the text carries the contrast via --footer-text-mobile. */
+    #footer-container .footer-links {
+        background: none;
+        border: none;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        padding: 0;
+    }
+
+    #footer-container #copyright,
+    #footer-container #copyright a {
+        color: var(--footer-text-mobile, #111111);
+    }
+
+    #footer-container #copyright {
+        order: 99;
+        flex-basis: 100%;
+        display: flex;
+        justify-content: center;
+        gap: .3em;
+        /* No negative top margin: it pulled the line up out of the glass
+           strip on phones (Oct 2026). The other items are display:none here,
+           so there is no wrapped row above it to close up against. */
+    }
+}
+
+/* =============================================================================
+   FOOTER LINKS DISPLAY
+   ============================================================================= */
+
+/* Display, list-style, margin and padding live in the band rule above
+   (.footer-links near the top of this file); a second declaration here used
+   to reset the margin and padding and defeat the band's centring. */

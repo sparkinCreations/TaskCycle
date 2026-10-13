@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>miniCycle Game</title>
+  <link rel="icon" type="image/png" href="../assets/images/logo/pwa-icons/icon-192.png">
+  <style>
+    /* Basic styling for the game */
+    body {
+      font-family: 'Poppins', sans-serif;
+      background: #f0f0f0;
+      margin: 0;
+      padding: 20px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    .game-container {
+      background: white;
+      padding: 20px 30px;
+      border-radius: 8px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+      text-align: center;
+      max-width: 500px;
+      width: 100%;
+    }
+    h1 {
+      color: #333;
+      margin-bottom: 10px;
+    }
+    p {
+      margin-bottom: 10px;
+    }
+    .scrambled-word {
+      font-size: 2rem;
+      margin: 20px 0;
+      letter-spacing: 2px;
+      color: #4c79ff;
+    }
+    input[type="text"] {
+      padding: 10px;
+      width: 80%;
+      font-size: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      margin-bottom: 10px;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 1rem;
+      border: none;
+      background: #4c79ff;
+      color: white;
+      border-radius: 4px;
+      cursor: pointer;
+      margin: 5px;
+    }
+    button:hover {
+      background: #3a65d9;
+    }
+    .feedback {
+      margin: 10px 0;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="game-container">
+    <h1>Task Name Scramble Game</h1>
+    <p>Unscramble the task name!</p>
+    <div class="scrambled-word" id="scrambledWord">Loading...</div>
+    <input type="text" id="guessInput" placeholder="Type your guess here..." />
+    <div>
+      <button id="submitGuess">Submit</button>
+      <button id="nextTask">Next</button>
+    </div>
+    <div class="feedback" id="feedback"></div>
+  </div>
+
+  <script src="miniCycle-taskScramble.js"></script>
+</body>
+</html>

@@ -1,0 +1,852 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   CRITICAL CSS - Loaded first to prevent flash of unstyled content
+   Covers: loading screen, error states, retry buttons, basic page setup
+
+   Extracted from inline <style> in miniCycle.html to eliminate
+   'unsafe-inline' from CSP style-src directive.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* Base - prevents flash of unstyled content */
+*, *::before, *::after { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  /* CRITICAL: Start black for loading screen, updateThemeColor() sets proper color after load */
+  background-color: #000000;
+  background-image: linear-gradient(135deg, #4c79ff, #74c0fc);
+  color: white;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Loading screen */
+#app-loader {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background:
+    linear-gradient(135deg, rgba(76, 121, 255, 0.5), rgba(116, 192, 252, 0.45)),
+    url('../../assets/images/Stock/Routine_Lists.webp') center/cover no-repeat;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  z-index: var(--z-debug, 99999);
+  opacity: 1;
+  transition: opacity var(--transition-normal) ease-out;
+}
+#app-loader.fade-out {
+  opacity: 0;
+  pointer-events: none;
+}
+.loader-tip {
+  position: absolute;
+  top: 15%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 300px;
+  max-width: 80vw;
+  padding: 10px 24px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: white;
+  font-size: var(--font-size-base, 15px);
+  font-weight: 500;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  text-align: center;
+  line-height: 1.4;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  text-shadow: var(--text-shadow-lg);
+}
+.loader-tip.visible {
+  opacity: 0.85;
+}
+.loader-tip-header {
+  font-size: var(--font-size-md, 17px);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.loader-tip-text {
+  font-weight: 400;
+}
+.loader-logo {
+  width: 120px;
+  height: 96px;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.2));
+}
+.loader-text {
+  margin-top: 20px;
+  color: white;
+  font-size: var(--font-size-base);
+  font-weight: 500;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  opacity: 0.9;
+}
+/* Version line on the "Updating to latest version…" overlay (v2.425+).
+   Lives in critical.css alongside .loader-text because the overlay renders
+   during boot and cache recovery — before any non-critical stylesheet is
+   guaranteed to have loaded. Colour is a fixed white here, like its siblings:
+   the boot splash paints its own gradient and never sees the app theme. */
+.loader-version-line {
+  margin-top: 6px;
+  color: rgba(255, 255, 255, 0.9);
+  /* Fallback matters here: this overlay renders during boot and cache recovery,
+     which can precede variables.css. Same shape as the other critical.css rules. */
+  font-size: var(--font-size-sm, 13px);
+  font-weight: 600;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.loader-bar-container {
+  margin-top: 24px;
+  width: 200px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.3);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.loader-bar {
+  width: 100%;
+  height: 100%;
+  background: white;
+  border-radius: 3px;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform var(--transition-fast) ease-out;
+}
+
+/* While the splash (or first-run choice screen) is up, focus-mode's floating
+   chrome sits on the --z-notification tier (100000) — ABOVE the splash (99999)
+   — and leaks over it. Pre-existing on any slow boot into focus mode; became
+   obvious once the choice screen lingers. Keep it hidden until the splash goes. */
+body.app-loading #focus-mode-btn,
+body.app-loading #focus-mode-menu-btn,
+body.app-loading #focus-mode-menu,
+body.app-loading #focus-mode-exit-btn,
+body.app-loading #undo-redo-buttons {
+  visibility: hidden;
+}
+
+/* ── First-run choice screen (splash variant for brand-new users) ──
+   Revealed by the inline controller in miniCycle.html; reuses the splash
+   background/logo/tips. The centered loading text + bar are replaced by the
+   tagline + three frosted-pill buttons and a thin bottom progress strip. */
+html.mc-first-run #app-loader .loader-text,
+html.mc-first-run #app-loader .loader-bar-container {
+  display: none;
+}
+/* Top-anchor the header (logo + brand + tagline) near the top; the choice
+   container then fills the rest of the height so the buttons can center in it. */
+html.mc-first-run #app-loader {
+  /* Centre logo + brand + actions AS ONE GROUP. Previously top-pinned at 8vh
+     with the actions auto-centred in the leftover height, which on a tall screen
+     parked the buttons far below the brand AND left the whole block riding high
+     with dead space beneath it. */
+  justify-content: center;
+  padding-top: 0;
+}
+/* Soft scrim behind the header text so white is legible over the LIGHT areas of
+   the photo (the clipboard paper). Concentrated near the top now that the brand
+   sits there; transparent edges keep the airy look. Buttons are white cards. */
+html.mc-first-run #app-loader::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  /* Taller and stronger than it was. MEASURED against the photo composited with
+     the blue overlay: the old ellipse (48% tall, 0.42 peak) left the tagline at
+     2.94:1, the use-case line at 3.42:1 and "Restore from a backup file" at
+     1.56:1 — the last because the falloff hit zero by 70% and that link sits at
+     78%. WCAG AA wants 4.5:1. Edges still fade out, so the photo keeps its airy
+     look; only the column the text occupies is anchored. */
+  /* Tight scrim: only the column the text actually occupies. A broad ellipse
+     dimmed the whole photo, which is the thing worth keeping. Sized in % of the
+     viewport and centred on the content group. Shaped to match the COLUMN: it is
+     narrow (a FIXED 300px, max 84vw) and tall (spans roughly 18%-82%), so the
+     ellipse is tall and narrow too — a wide, short one both missed the top and
+     bottom text AND dimmed photo nobody needs to read.
+     Radii are in % of the VIEWPORT and generous. A px radius sized to the text
+     column (430px) held the numbers but read as a distinct OVAL on a wide
+     display — at 3440px that is only 25% of the width, so the shape is obvious.
+     A small % (34%) failed the other way: 133px on a 390px phone, narrower than
+     the text it was meant to sit behind (1.77:1). 62% satisfies both — wide
+     enough on a large screen that there is no perceptible horizontal edge, and
+     still wider than the column on the narrowest phone.
+     SIXTEEN stops on a (1-t^4)^2 curve, not four linear ones. With few stops the
+     eye picks out the ellipse as a shape — linear interpolation between stops
+     produces Mach banding, and what reads as "an oval" is the falloff RATE
+     changing, not the darkness itself. This curve reaches zero with zero slope,
+     so there is no boundary to latch onto; the radius is generous for the same
+     reason (a longer falloff spread over more pixels). Verified by sampling REAL rendered pixels beside each text
+     run, not by modelling the gradient. */
+  background: radial-gradient(ellipse 62% 78% at 50% 50%,
+              rgba(0, 0, 0, 0.58) 0%,
+              rgba(0, 0, 0, 0.58) 10%,
+              rgba(0, 0, 0, 0.578) 20%,
+              rgba(0, 0, 0, 0.571) 30%,
+              rgba(0, 0, 0, 0.551) 40%,
+              rgba(0, 0, 0, 0.51) 50%,
+              rgba(0, 0, 0, 0.479) 55%,
+              rgba(0, 0, 0, 0.439) 60%,
+              rgba(0, 0, 0, 0.391) 65%,
+              rgba(0, 0, 0, 0.335) 70%,
+              rgba(0, 0, 0, 0.271) 75%,
+              rgba(0, 0, 0, 0.202) 80%,
+              rgba(0, 0, 0, 0.133) 85%,
+              rgba(0, 0, 0, 0.069) 90%,
+              rgba(0, 0, 0, 0.02) 95%,
+              rgba(0, 0, 0, 0) 100%);
+  pointer-events: none;
+}
+/* Raise the text block above the scrim (these are static flex items; the tip,
+   status, and bottom bar are already position:absolute so sit above it). */
+html.mc-first-run #app-loader .loader-logo,
+html.mc-first-run #app-loader .first-run-choice {
+  position: relative;
+  z-index: 1;
+}
+/* In choice mode the tip is demoted to a small, quiet strip just above the
+   bottom progress bar — the buttons and tagline own the screen. (Its top-15%
+   pin also collided with the centered column on short/wide viewports.) */
+html.mc-first-run #app-loader .loader-tip {
+  top: auto;
+  bottom: 26px;
+  width: auto;
+  max-width: 78vw;
+  padding: 7px 16px;
+  font-size: var(--font-size-sm, 13px);
+  background: rgba(0, 0, 0, 0.18);
+}
+html.mc-first-run #app-loader .loader-tip.visible {
+  opacity: 0.7;
+}
+html.mc-first-run #app-loader .loader-tip-header {
+  display: none;
+}
+.first-run-choice {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-top: 14px;
+  width: 300px;
+  max-width: 84vw;
+}
+/* In choice mode the container fills the height below the logo so the actions
+   group can vertically center in the leftover space (brand + tagline stay at the
+   top of this zone, right under the logo). */
+html.mc-first-run #app-loader .first-run-choice {
+  flex: 0 1 auto;
+  margin-top: 14px;
+  min-height: 0;
+  padding-bottom: 56px; /* clear the bottom tip strip / progress bar */
+}
+/* Actions = buttons + lite link, centered in the space beneath the header. */
+.first-run-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  margin-top: auto;
+  margin-bottom: auto;
+}
+/* Hidden by DEFAULT and revealed by the pre-paint `mc-first-run` class on
+   <html> (set by the head's first-run reader). Previously the markup carried
+   `hidden` and JS removed it in the body — that reveal landed AFTER first
+   paint and was the app's single largest layout shift (Lighthouse attributed
+   0.204 of a 0.238 CLS to #first-run-choice). Deciding pre-paint means the
+   screen is either laid out from the very first frame or never rendered at
+   all; nothing moves either way. Keep the [hidden] rule too, so any JS that
+   sets the attribute later still hides it. */
+html:not(.mc-first-run) .first-run-choice,
+.first-run-choice[hidden] {
+  display: none;
+}
+/* Brand block: wordmark + category descriptor (what the app IS). */
+.first-run-brand {
+  text-align: center;
+  margin-bottom: 10px;
+}
+.first-run-wordmark {
+  color: white;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: var(--font-size-xl, 26px);
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  line-height: 1.1;
+  text-shadow: var(--text-shadow-lg);
+}
+.first-run-descriptor {
+  color: white;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: var(--font-size-sm, 13px);
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  margin-top: 3px;
+  opacity: 0.9;
+  text-shadow: var(--text-shadow-lg);
+}
+.first-run-tagline {
+  /* Quiet context line — deliberately smaller/dimmer than the use-case hook below. */
+  margin: 0 0 8px;
+  color: white;
+  text-align: center;
+  font-size: var(--font-size-xs, 12px);
+  font-weight: 400;
+  line-height: 1.45;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  text-shadow: var(--text-shadow-lg);
+  /* Was 0.72 — measured 2.94:1 against the backdrop, under WCAG AA's 4.5:1. */
+  opacity: 0.92;
+}
+/* Rotating use-case line — the "that's me" hook, so it OUTRANKS the tagline
+   (bigger + heavier). FIXED height + overflow hidden: swaps never shift the
+   centered buttons, and the clipped window is what makes the ticker reveal work. */
+.first-run-usecase {
+  /* Grid stack: both crossfade layers live in the SAME cell (grid-area 1/1),
+     so they overlap AND stay in normal flow — the element keeps its size
+     (unlike absolute children, which collapse it to 0). */
+  display: grid;
+  place-items: center;
+  margin: 0 0 16px;
+  height: 1.6em;
+  overflow: hidden;
+  color: white;
+  font-size: var(--font-size-base, 15px);
+  font-weight: 600;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  text-shadow: var(--text-shadow-lg);
+}
+/* Crossfade layers: stacked in one grid cell. The active one is at full
+   opacity, the idle one at 0. On each rotation the roles swap, so the incoming
+   line fades in WHILE the outgoing fades out — a line is always visible (no
+   blank frame). nowrap keeps each to a single line inside the clipped window. */
+.first-run-usecase-text {
+  grid-area: 1 / 1;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.55s ease;
+}
+.first-run-usecase-text.is-active {
+  opacity: 0.97;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Instant swap — still gap-free (incoming appears the same frame the
+     outgoing disappears), just no fade. */
+  .first-run-usecase-text { transition: none; }
+}
+.first-run-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+}
+.first-run-btn {
+  /* Solid white on the photo background — same button language as the
+     boot-error screen (white bg, brand-blue text). */
+  padding: 15px 20px;
+  border: none;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.95);
+  /* #4c79ff measured 3.54:1 on this near-white fill — below AA, on the primary
+     call to action of the first screen anyone sees. Same brand blue deepened to
+     5.93:1. Hardcoded rather than var(): this is pre-paint critical CSS and
+     variables.css is not guaranteed to have loaded. */
+  color: #3455c8;
+  font-size: var(--font-size-base, 15px);
+  font-weight: 600;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+  transition: background 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
+}
+/* Primary: keeps the solid-white treatment and gains weight, so it wins on the
+   photo background without introducing a second accent colour (the brand blue is
+   already spoken for by .is-chosen below, which inverts the tapped button). */
+.first-run-btn-primary {
+  padding: 18px 20px;
+  font-size: var(--font-size-md, 16px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+}
+
+/* Secondary: ghost buttons. White text sits on the first-run scrim, which is
+   measured at 5.3:1+ for text, so this stays readable while clearly receding.
+   Deliberately NOT a faded white fill — that would have kept the blue text on a
+   lighter surface and lost contrast instead of losing emphasis. */
+.first-run-btn-secondary {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  border: 1.5px solid rgba(255, 255, 255, 0.55);
+  box-shadow: none;
+}
+.first-run-btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.22);
+  border-color: rgba(255, 255, 255, 0.8);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+}
+
+.first-run-btn:hover {
+  background: #ffffff;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+}
+.first-run-btn:active {
+  transform: scale(0.98);
+}
+.first-run-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.first-run-btn.is-chosen {
+  /* Tapped button inverts to brand blue as the working state. Same deepened
+     blue as the label above: #4c79ff carried the white text at only 3.83:1. */
+  opacity: 1;
+  background: #3455c8;
+  color: white;
+  animation: first-run-chosen-pulse 1.2s ease-in-out infinite;
+}
+@keyframes first-run-chosen-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.75; }
+}
+/* Wait-gated Lite escape hatch. Reveal is CSS-driven — a 10s animation-delay,
+   NOT a JS timer, because a slow boot saturates the main thread and would starve
+   setTimeout on exactly the devices this is for. CSS animations run off-thread,
+   so it fades in on time even mid-boot. If boot finishes first, the loader fades
+   out before 10s elapses, so a fast/capable device never sees it. To retune the
+   threshold, change the 10s delay below. */
+.first-run-lite {
+  margin-top: 16px;
+  color: white;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: var(--font-size-sm, 13px);
+  font-weight: 400;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-shadow: var(--text-shadow-lg);
+  opacity: 0;
+  pointer-events: none;
+  animation: first-run-lite-in 0.6s ease-out 10s forwards;
+}
+.first-run-lite:hover {
+  opacity: 1;
+}
+@keyframes first-run-lite-in {
+  from { opacity: 0; transform: translateY(4px); pointer-events: none; }
+  to { opacity: 0.72; transform: translateY(0); pointer-events: auto; }
+}
+/* Gate: once boot completes (uiBoot sets html[data-app-loaded]), cancel the
+   reveal — even though the choice screen lingers awaiting a tap. This is what
+   stops a capable device that finished in 250ms from showing "Try Lite" just
+   because the user read the screen for 10s. Off-thread CSS handles the TIMING;
+   this attribute (set by JS when the thread is free, post-boot) handles the
+   CONDITION. Together: reveal only if still booting at 10s. */
+html[data-app-loaded="true"] .first-run-lite {
+  animation: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Keep the timed reveal (it's a functional gate, not decoration) but drop the slide. */
+  .first-run-lite { animation: first-run-lite-fade 0.1s linear 10s forwards; }
+  @keyframes first-run-lite-fade {
+    to { opacity: 0.72; pointer-events: auto; }
+  }
+}
+
+/* Restore-from-backup — quietest tier on the screen; only relevant to users
+   returning after a clear/reinstall (pairs with the boot error screen's
+   "Back Up My Data" button — INCIDENT doc §6a). Always visible (no time gate:
+   a restoring user needs it immediately). */
+.first-run-restore {
+  margin-top: 14px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: white;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: var(--font-size-sm, 13px);
+  font-weight: 400;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  /* Was 0.6 (1.56:1), then 0.85 (3.92:1 measured on real pixels) — both under
+     WCAG AA's 4.5:1. At full strength it still reads as the quiet secondary
+     action: that comes from its size and underline, not from being faded out. */
+  opacity: 1;
+  cursor: pointer;
+  text-shadow: var(--text-shadow-lg);
+}
+.first-run-restore:hover {
+  opacity: 0.95;
+}
+
+/* Thin, quiet progress strip pinned to the bottom edge — continuous creep,
+   no text, no percentage. Designed to be ignorable. */
+.first-run-bottom-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.15);
+}
+/* Same pre-paint treatment as .first-run-choice above. */
+html:not(.mc-first-run) .first-run-bottom-bar,
+.first-run-bottom-bar[hidden] {
+  display: none;
+}
+/* Low-key live boot status, bottom-right — mirrors updateLoaderProgress().
+   Only visible on the choice screen; ignorable by design. */
+.first-run-status {
+  display: none;
+}
+html.mc-first-run #app-loader .first-run-status {
+  display: block;
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  max-width: 60vw;
+  color: white;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.2px;
+  text-align: right;
+  opacity: 0.55;
+  text-shadow: var(--text-shadow-lg);
+  pointer-events: none;
+}
+.first-run-bottom-fill {
+  height: 100%;
+  width: 0;
+  background: rgba(255, 255, 255, 0.7);
+  /* Width is driven by updateLoaderProgress() with the real boot percent.
+     Ease between the discrete real steps so it moves smoothly, not snappily. */
+  transition: width 0.5s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .first-run-bottom-fill {
+    transition: none;
+  }
+  .first-run-btn.is-chosen {
+    animation: none;
+  }
+}
+
+/* Mobile loading screen optimizations */
+@media (max-width: 768px) {
+  #app-loader {
+    background:
+      linear-gradient(135deg, rgba(76, 121, 255, 0.55), rgba(116, 192, 252, 0.5)),
+      url('../../assets/images/Stock/Routine_Lists.webp') left center/cover no-repeat;
+  }
+  .loader-logo {
+    width: 100px;
+    height: 80px;
+  }
+  .loader-text {
+    font-size: var(--font-size-sm);
+  }
+  .loader-bar-container {
+    width: 160px;
+  }
+}
+
+/* Notification styles */
+#notification-container {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: var(--z-notification-active, 10000);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 300px;
+  cursor: move;
+  -webkit-user-select: none;
+  user-select: none;
+  /* Prevent long-press context menu on iOS during drag */
+  -webkit-touch-callout: none;
+  /* Let JS handle all touch gestures — without this the browser
+     intercepts touch for pan/scroll before pointermove fires */
+  touch-action: none;
+  /* Override UA popover defaults */
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  inset: auto;
+  overflow: visible;
+}
+#notification-container.dragging {
+  opacity: 0.8;
+  cursor: grabbing;
+}
+.notification {
+  background-color: #333;
+  color: #fff;
+  padding: 12px 16px;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  opacity: 0;
+  transform: translateY(-20px);
+  transition: opacity var(--transition-fast) ease, transform var(--transition-fast) ease;
+  position: relative;
+  overflow-wrap: anywhere;
+}
+.notification.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+/* White body text sits on these fills, so each must clear WCAG AA (4.5:1).
+   The previous values did not: error #e74c3c = 3.82:1, success #27ae60 =
+   2.87:1, info #2980b9 = 4.3:1. Literals rather than var() because this sheet
+   is pre-paint and must not depend on variables.css having applied — these
+   mirror --color-notify-* in base/variables.css, keep the two in sync. */
+.notification.error { background-color: #c0392b; }   /* 5.44:1 on white */
+.notification.success { background-color: #1e8449; } /* 4.72:1 on white */
+.notification.info { background-color: #2471a3; }    /* 5.30:1 on white */
+.notification.warning { background-color: #f39c12; } /* black text: 9.58:1 */
+/* .notification.recurring is defined in notifications.css - not needed in critical CSS
+   since recurring notifications don't appear on initial page load */
+
+.notification .notification-content {
+  margin-right: 24px; /* Space for close button */
+}
+
+/* Critical header styles - reserve space to prevent CLS */
+.fixed-header-container {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: var(--z-header, 100);
+}
+
+.header-branding {
+  position: absolute;
+  left: 50%;
+  /* Center within the visible area BELOW the status-bar safe area, not the full
+     padded box. env(safe-area-inset-top) is 0 on desktop (→ plain 50%) and the
+     status-bar height on native/notched devices, where plain 50% would pull the
+     logo up under the status bar and clip it. Mirrors layout/header.css. */
+  top: calc(50% + env(safe-area-inset-top, 0px) / 2);
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+/* iOS PWA standalone mode - blur extends to top, content pushed with padding */
+/* Requires .ios-pwa class added by JavaScript detection */
+.ios-pwa .fixed-header-container {
+  top: 0;
+}
+.ios-pwa .mini-cycle-header-row {
+  padding-top: 59px;
+}
+.ios-pwa .header-branding {
+  top: calc(50% + 27px);
+}
+.header-logo {
+  height: 25px;
+  width: auto;
+}
+.app-name-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.app-name {
+  height: 22px;
+  width: auto;
+}
+.app-subtitle {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.25em;
+  color: #000;
+  /* 0.8, not 0.7: 12px/600 is not WCAG "large" text, so it needs 4.5:1.
+     Composited over the #4c79ff header, 0.7 gave 3.93:1 and 0.8 gives 4.57:1.
+     This sheet loads after main.css, so it wins over layout/header.css —
+     keep the two in sync. */
+  opacity: 0.8;
+}
+.mode-selector-wrapper {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 31px;
+  padding: 3px 0;
+  background: linear-gradient(135deg, #f1f1f172, #ffffff10);
+}
+
+/* Reserve space for task list to prevent CLS when data loads from IndexedDB */
+.task-list-container {
+  min-height: 200px;
+}
+.mini-cycle-title {
+  min-height: 32px;
+}
+/* Task input: use visibility:hidden to reserve space and prevent CLS */
+.task-input.hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* Onboarding state - critical CSS to prevent CLS when onboarding is shown */
+body.onboarding-active .title-row,
+body.onboarding-active .task-list,
+body.onboarding-active .empty-state,
+body.onboarding-active .completed-tasks-section,
+body.onboarding-active .task-search-input-row,
+body.onboarding-active .progress-container,
+body.onboarding-active .complete-all-and-help-window-container {
+  display: none;
+}
+.onboarding-placeholder {
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.9);
+  min-height: 200px;
+}
+body.onboarding-active .onboarding-placeholder {
+  display: flex;
+}
+
+/* App loading state - hide main content to prevent CLS measurement during boot */
+body.app-loading #app-container,
+body.app-loading .fixed-header-container {
+  visibility: hidden;
+}
+
+/* Footer mobile layout is defined in components/footer.css */
+
+/* ============================================================================
+   PRE-BOOT WELCOME SPLASH (create / sample first-run picks)
+   Mounted by showPrebootSplash() in miniCycle.html the moment the user taps,
+   before main.css and the onboarding module have loaded, so the letter
+   cascade runs WHILE boot is still downloading instead of after it. That is
+   why the whole cascade — timing custom properties, container, title, char
+   rules and both keyframes — is repeated here from
+   components/first-run-welcome.css: an animation whose keyframes live in the
+   async main stylesheet cannot start until that 400 KB sheet lands (measured:
+   first letter at 6.2 s on slow 4G with only the container inlined).
+   Every value mirrors first-run-welcome.css exactly, and the selectors carry
+   the --preboot marker at higher specificity, so when main.css arrives the
+   computed values do not change and the running animation is not restarted.
+   Two things intentionally differ: z-index sits ABOVE #app-loader
+   (--z-debug, 99999), which is still fully opaque at tap time, and timing
+   properties are set on the element (not :root) so they resolve before
+   variables.css exists. onboardingSplash.js adopts the element by the marker
+   class and reads the remaining animation via getAnimations().
+   ============================================================================ */
+.first-run-splash.first-run-splash--preboot {
+  --first-run-splash-char-duration: 280ms;
+  --first-run-splash-char-stagger: 90ms;
+  --first-run-splash-char-start-scale: 1.8;
+  --first-run-splash-letter-spread: 14px;
+  --first-run-splash-line-gap: var(--space-8, 32px);
+  --first-run-splash-word-gap: 0.7em;
+  --first-run-splash-fade-duration: 600ms;
+  --first-run-splash-phase1-total: calc(
+    var(--last-char-index, 19) * var(--first-run-splash-char-stagger)
+    + var(--first-run-splash-char-duration)
+  );
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  background: var(--color-black, #000);
+  color: var(--color-white, #fff);
+  pointer-events: auto;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: env(safe-area-inset-top, 0px) var(--space-4, 16px) env(safe-area-inset-bottom, 0px);
+  box-sizing: border-box;
+  opacity: 1;
+  transition: opacity var(--first-run-splash-fade-duration) ease;
+}
+.first-run-splash.first-run-splash--preboot.first-run-splash--fading {
+  opacity: 0;
+  pointer-events: none;
+}
+.first-run-splash--preboot .first-run-splash__title {
+  display: flex;
+  flex-direction: column;
+  gap: var(--first-run-splash-line-gap);
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  font-family: 'Poppins', 'Poppins Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: var(--font-size-2xl, 24px);
+  font-weight: var(--font-weight-bold, 700);
+  line-height: var(--line-height-tight, 1.25);
+  text-align: center;
+  letter-spacing: 0;
+}
+.first-run-splash--preboot .first-run-splash__line {
+  display: block;
+  text-align: center;
+  white-space: nowrap;
+}
+.first-run-splash--preboot .first-run-splash__word {
+  display: inline-block;
+}
+.first-run-splash--preboot .first-run-splash__char {
+  display: inline-block;
+  transform-origin: center;
+  opacity: 0;
+  scale: var(--first-run-splash-char-start-scale, 12);
+  translate: calc(var(--letter-pos, 0) * var(--first-run-splash-letter-spread, 0px)) 0;
+  animation:
+    first-run-splash-fade-in
+      var(--first-run-splash-char-duration)
+      ease-out
+      forwards,
+    first-run-splash-shrink
+      var(--first-run-splash-char-duration)
+      cubic-bezier(0.33, 1, 0.68, 1)
+      forwards;
+  animation-delay:
+    calc(var(--char-index, 0) * var(--first-run-splash-char-stagger)),
+    calc(var(--first-run-splash-phase1-total) + var(--char-index, 0) * var(--first-run-splash-char-stagger));
+}
+.first-run-splash--preboot .first-run-splash__char--space {
+  width: 0.32em;
+}
+@keyframes first-run-splash-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes first-run-splash-shrink {
+  from {
+    scale: var(--first-run-splash-char-start-scale, 12);
+    translate: calc(var(--letter-pos, 0) * var(--first-run-splash-letter-spread, 0px)) 0;
+  }
+  to {
+    scale: 1;
+    translate: 0 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .first-run-splash.first-run-splash--preboot {
+    transition: opacity var(--transition-fast, 150ms) ease;
+  }
+  .first-run-splash--preboot .first-run-splash__char {
+    animation: none;
+    opacity: 1;
+  }
+}

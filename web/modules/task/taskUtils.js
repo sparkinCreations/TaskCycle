@@ -1,0 +1,476 @@
+/**
+ * miniCycle Task Utilities Module
+ *
+ * Static utility functions for task operations including context building,
+ * DOM data extraction, scrolling, and task data creation/persistence.
+ *
+ * Features:
+ * - Task context building from DOM elements
+ * - DOM data extraction for persistence
+ * - Schema 2.5 task data creation
+ * - Recurring task template management
+ * - Scroll-to-task behavior
+ * - Overdue styling management
+ *
+ * @module task/taskUtils
+ * @version 1.0.0
+ * @see {@link module:task/taskDOM} - Uses these utilities
+ * @see {@link module:task/taskRenderer} - Uses taskToAddTaskOptions
+ */
+
+/**
+ * @typedef {import('../core/types.js').Task} Task
+ * @typedef {import('../core/types.js').Cycle} Cycle
+ * @typedef {import('../core/types.js').MiniCycleState} MiniCycleState
+ * @typedef {import('../core/types.js').RecurringSettings} RecurringSettings
+ */
+
+import { createDIModule, optional } from '../core/diBase.js';
+import { buildRecurringTemplate } from '../recurring/recurringTemplate.js';
+import { getLabel } from '../labels/labelResolver.js';
+import { autoClearFields, getActiveRoutineId, getAutoClearMode, getAutoClearSettings, getRoutine, getRoutines } from '../utils/cycleMode.js';
+import { priorityFields, isPriorityLevel } from '../utils/priorityLevel.js';
+import {
+    DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS,
+    DEFAULT_RECURRING_DELETE_SETTINGS,
+    DEFAULT_REMINDERS,
+    DOM_IDS,
+    DOM_SELECTORS,
+    DOM_CLASSES
+} from '../core/constants.js';
+
+// ============================================================================
+// DEPENDENCY INJECTION SETUP (using diBase.js)
+// ============================================================================
+
+const di = createDIModule('TaskUtils', {
+    AppState: optional(null),
+    generateId: optional(null),
+    remindOverdueTasks: optional(null),
+    enableDragAndDropOnTask: optional(null),
+    updateMoveArrowsVisibility: optional(null),
+    saveTaskToSchema25: optional(null),
+    // Needed to stamp nextScheduledOccurrence on templates created here.
+    // Forwarded from taskDOM (facade sub-module); see the template literal below.
+    calculateNextOccurrence: optional(null)
+});
+
+// Late-binding deps via Proxy
+/** @type {{AppState: Object|null, generateId: Function|null, remindOverdueTasks: Function|null, enableDragAndDropOnTask: Function|null, updateMoveArrowsVisibility: Function|null, saveTaskToSchema25: Function|null}} */
+const _deps = new Proxy({}, {
+    get(_, prop) {
+        return di.resolve()[prop];
+    }
+});
+
+/**
+ * Set dependencies for TaskUtils wrapper functions
+ * @param {Object} dependencies - { AppState, generateId, remindOverdueTasks, enableDragAndDropOnTask, updateMoveArrowsVisibility, saveTaskToSchema25 }
+ */
+export function setTaskUtilsDependencies(dependencies) {
+    di.setDependencies(dependencies);
+}
+
+/**
+ * Convert a task object to addTask options for rendering
+ * Centralizes the task-to-options mapping to avoid duplication across render functions
+ * @param {Object} task - Task object from AppState
+ * @returns {Object} - Options object for addTask
+ */
+export function taskToAddTaskOptions(task) {
+    return {
+        completed: task.completed || false,
+        shouldSave: false,
+        dueDate: task.dueDate || null,
+        ...priorityFields(task),
+        isLoading: true,
+        remindersEnabled: task.remindersEnabled || false,
+        recurring: task.recurring || false,
+        taskId: task.id,
+        recurringSettings: task.recurringSettings || {},
+        // The active value is resolved again at render time (createMainTaskElement),
+        // so only the per-mode map needs to travel.
+        autoClear: getAutoClearSettings(task)
+    };
+}
+
+/**
+ * Utility class for task context building, data extraction, and state operations
+ */
+export class TaskUtils {
+    /**
+     * Build task context from DOM element
+     * @param {HTMLElement} taskItem - Task DOM element
+     * @param {string} taskId - Task ID
+     * @param {Object} AppState - AppState instance
+     * @returns {Object|null} - Task context object
+     */
+    static buildTaskContext(taskItem, taskId, AppState) {
+        try {
+            // Check if AppState is ready
+            if (!AppState?.isReady?.()) {
+                console.warn('⚠️ AppState not ready for buildTaskContext');
+                return null;
+            }
+
+            const state = AppState.get();
+            const activeCycleId = getActiveRoutineId(state);
+
+            if (!activeCycleId) return null;
+
+            const currentCycle = getRoutine(state, activeCycleId);
+            if (!currentCycle) return null;
+
+            const taskText = taskItem.querySelector(DOM_SELECTORS.TASK_TEXT)?.textContent?.trim() || '';
+
+            return {
+                taskTextTrimmed: taskText,
+                assignedTaskId: taskId,
+                schemaData: state, // Pass the full state for backward compatibility
+                cycles: getRoutines(state),
+                activeCycle: activeCycleId,
+                currentCycle,
+                settings: state.settings || {},
+                autoResetEnabled: currentCycle.autoReset || false,
+                deleteCheckedEnabled: currentCycle.deleteCheckedTasks || false
+            };
+        } catch (error) {
+            console.warn('⚠️ Failed to build task context:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Load task context from state
+     * @param {string} taskTextTrimmed - Sanitized task text
+     * @param {string} taskId - Task ID (optional, will generate if not provided)
+     * @param {Object} taskOptions - Additional task options
+     * @param {boolean} isLoading - Whether task is being loaded (vs created)
+     * @param {Object} AppState - State manager; must be ready
+     * @param {Function} generateId - Function to generate ID
+     * @returns {Object} - Task context object
+     */
+    static loadTaskContext(taskTextTrimmed, taskId, taskOptions, isLoading = false, AppState, generateId) {
+
+        if (!AppState?.isReady?.()) {
+            console.warn('⚠️ State data required for loadTaskContext');
+            throw new Error('State data not found');
+        }
+
+        const state = AppState.get();
+        const activeCycle = getActiveRoutineId(state);
+        const currentCycle = getRoutine(state, activeCycle);
+        const settings = state.settings;
+        const reminders = state.customReminders || DEFAULT_REMINDERS;
+
+        if (!activeCycle || !currentCycle) {
+            console.warn("⚠️ No active routine found in state for loadTaskContext");
+            throw new Error('No active cycle found');
+        }
+
+        // Fallback suffix entropy matches generateHashId — a 0-999 suffix collides
+        // easily for tasks created in the same millisecond, and colliding ids make
+        // find-by-id flows (reorder, edit, delete) target the wrong task.
+        const assignedTaskId = taskId || (generateId ? generateId() : `task-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`);
+
+        return {
+            taskTextTrimmed,
+            assignedTaskId,
+            activeCycle,
+            currentCycle,
+            settings,
+            reminders,
+            cycleTasks: currentCycle.tasks || [],
+            autoResetEnabled: currentCycle.autoReset || false,
+            remindersEnabledGlobal: reminders?.enabled === true,
+            deleteCheckedEnabled: currentCycle.deleteCheckedTasks || false,
+            isLoading,  // ✅ Pass through isLoading flag
+            ...taskOptions
+        };
+    }
+
+    /**
+     * Create or update task data in the cycle.
+     *
+     * One-door migration (v2.361): creation now happens INSIDE an
+     * AppState.update() producer — previously this pushed the task and its
+     * recurring template into the live objects loadTaskContext handed back
+     * (aliases of AppState state when ready, a stale localStorage COPY when
+     * not) and then "persisted" via a wholesale self-assignment. That worked
+     * only by aliasing, could clobber newer state with the stale copy in the
+     * not-ready window, and never marked state dirty by itself.
+     * @param {Object} taskContext - Task context from loadTaskContext
+     * @param {Function} saveTaskToSchema25 - Legacy fallback persister (used only when AppState unavailable)
+     * @param {Object} [AppState] - State manager; when ready, creation commits through its producer
+     * @returns {Object} - Task data object
+     */
+    static createOrUpdateTaskData(taskContext, saveTaskToSchema25, AppState) {
+        const {
+            cycleTasks, assignedTaskId, taskTextTrimmed, completed, dueDate,
+            priority, remindersEnabled, recurring, recurringSettings,
+            currentCycle, cycles, activeCycle, isLoading, deleteWhenComplete,
+            autoClear
+        } = taskContext;
+
+        let existingTask = cycleTasks.find(task => task.id === assignedTaskId);
+
+        if (!existingTask) {
+
+            // Mode-specific deleteWhenComplete architecture:
+            // - Active value synced with current mode
+            // - Settings object stores preference per mode
+            // Provided settings or defaults; the active value follows the current
+            // mode unless the caller gave one (utils/cycleMode.js).
+            const autoClearField = autoClearFields({
+                settings: autoClear,
+                value: deleteWhenComplete,
+                mode: getAutoClearMode(currentCycle),
+                defaults: DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS
+            });
+
+            existingTask = {
+                id: assignedTaskId,
+                text: taskTextTrimmed,
+                completed,
+                dueDate,
+                // A level or null, never undefined: the stored shape is explicit
+                // about "no priority" (dataValidator rejects anything else).
+                priority: isPriorityLevel(priority) ? priority : null,
+                remindersEnabled,
+                recurring,
+                recurringSettings,
+                ...autoClearField,
+                schemaVersion: 2
+            };
+
+            // Recurring template (built pure; committed alongside the task below)
+            const templateData = (recurring && recurringSettings) ? buildRecurringTemplate({
+                id: assignedTaskId,
+                text: taskTextTrimmed,
+                recurringSettings: structuredClone(recurringSettings),
+                priority: isPriorityLevel(priority) ? priority : null,
+                dueDate: dueDate || null,
+                remindersEnabled: remindersEnabled || false,
+                // Without this the template never fires — recurringWatcher gates on
+                // `nextScheduledOccurrence == null`, which matches undefined too.
+                // Reached by the Cleared Tasks "Recreate" flow (v2.431 fix); the
+                // builder warns if it is ever missing again.
+                nextScheduledOccurrence: _deps.calculateNextOccurrence
+                    ? _deps.calculateNextOccurrence(recurringSettings, Date.now())
+                    : null
+            }) : null;
+
+            // Only commit if NOT loading (prevents duplicate tasks — the load
+            // path renders tasks that already exist in state)
+            if (!isLoading) {
+                if (AppState?.isReady?.()) {
+                    // Single door: push task + template inside the producer.
+                    // Finding the cycle in the DRAFT (not via the context refs)
+                    // means a stale not-ready-window copy can never clobber state.
+                    AppState.update(state => {
+                        const cycle = getRoutine(state, activeCycle);
+                        if (!cycle) {
+                            console.warn('⚠️ Active cycle vanished before task commit:', activeCycle);
+                            return;
+                        }
+                        cycle.tasks.push(existingTask);
+                        if (templateData) {
+                            if (!cycle.recurringTemplates) cycle.recurringTemplates = {};
+                            cycle.recurringTemplates[assignedTaskId] = templateData;
+                        }
+                    }, true); // immediate save - required for stats panel to read correct data
+                } else if (saveTaskToSchema25) {
+                    // Legacy fallback (AppState unavailable — early boot/tests):
+                    // mutate the context refs and persist wholesale, as before.
+                    currentCycle.tasks.push(existingTask);
+                    if (templateData) {
+                        if (!currentCycle.recurringTemplates) currentCycle.recurringTemplates = {};
+                        currentCycle.recurringTemplates[assignedTaskId] = templateData;
+                    }
+                    saveTaskToSchema25(activeCycle, currentCycle);
+                } else {
+                    console.warn('⚠️ Neither AppState nor saveTaskToSchema25 available - task not persisted');
+                }
+            } else if (templateData && !currentCycle.recurringTemplates?.[assignedTaskId]) {
+                // Load path renders from state — templates already exist there.
+                // (Kept as a no-op guard: never create templates while loading.)
+            }
+        }
+
+        return existingTask;
+    }
+
+    /**
+     * Scroll to newly created task
+     * @param {HTMLElement} taskList - Task list element
+     * @param {Function} querySelector - Function to query DOM
+     */
+    static scrollToNewTask(taskList, querySelector = (sel) => document.querySelector(sel)) {
+        const taskListContainer = querySelector(DOM_SELECTORS.TASK_LIST_CONTAINER);
+        if (taskListContainer && taskList) {
+            taskListContainer.scrollTo({
+                top: taskList.scrollHeight,
+                behavior: "smooth"
+            });
+        }
+    }
+
+    /**
+     * Handle overdue task styling
+     * @param {HTMLElement} taskItem - Task DOM element
+     * @param {boolean} completed - Whether task is completed
+     */
+    static handleOverdueStyling(taskItem, completed) {
+        setTimeout(() => {
+            if (completed) {
+                taskItem.classList.remove(DOM_CLASSES.OVERDUE_TASK);
+            }
+        }, 300);
+    }
+
+    /**
+     * Setup final task interactions (drag/drop, arrows)
+     * @param {HTMLElement} taskItem - Task DOM element
+     * @param {boolean} isLoading - Whether task is being loaded
+     * @param {Object} deps - Dependencies object { remindOverdueTasks, enableDragAndDropOnTask, updateMoveArrowsVisibility }
+     */
+    static setupFinalTaskInteractions(taskItem, isLoading, deps = {}) {
+        // Use provided deps (DI-pure - no window.* fallbacks)
+        const { remindOverdueTasks, enableDragAndDropOnTask, updateMoveArrowsVisibility } = deps;
+
+        // Remind overdue tasks after a delay (only if not loading)
+        if (!isLoading) {
+            setTimeout(() => {
+                if (typeof remindOverdueTasks === 'function') {
+                    remindOverdueTasks();
+                }
+            }, 1000);
+        }
+
+        // Enable drag and drop
+        if (typeof enableDragAndDropOnTask === 'function') {
+            enableDragAndDropOnTask(taskItem);
+        } else {
+            console.warn('⚠️ enableDragAndDropOnTask function not available');
+        }
+
+        // Update move arrows visibility
+        if (typeof updateMoveArrowsVisibility === 'function') {
+            updateMoveArrowsVisibility();
+        }
+    }
+}
+
+// ============================================
+// Wrapper Functions (use module-level _deps)
+// ============================================
+
+function buildTaskContext(taskItem, taskId) {
+    const AppState = _deps.AppState;
+    if (!AppState) {
+        console.warn('⚠️ AppState not injected for buildTaskContext');
+        return null;
+    }
+    return TaskUtils.buildTaskContext(taskItem, taskId, AppState);
+}
+
+function loadTaskContext(taskTextTrimmed, taskId, taskOptions, isLoading = false) {
+    const AppState = _deps.AppState;
+    const generateId = _deps.generateId;
+    if (!AppState) {
+        console.warn('⚠️ AppState not injected for loadTaskContext');
+        throw new Error('AppState dependency not available');
+    }
+    return TaskUtils.loadTaskContext(taskTextTrimmed, taskId, taskOptions, isLoading, AppState, generateId);
+}
+
+function scrollToNewTask(taskList) {
+    TaskUtils.scrollToNewTask(taskList);
+}
+
+function handleOverdueStyling(taskItem, completed) {
+    TaskUtils.handleOverdueStyling(taskItem, completed);
+}
+
+function setupFinalTaskInteractions(taskItem, isLoading) {
+    TaskUtils.setupFinalTaskInteractions(taskItem, isLoading, {
+        remindOverdueTasks: _deps.remindOverdueTasks,
+        enableDragAndDropOnTask: _deps.enableDragAndDropOnTask,
+        updateMoveArrowsVisibility: _deps.updateMoveArrowsVisibility
+    });
+}
+
+function createOrUpdateTaskData(taskContext) {
+    const saveTaskToSchema25 = _deps.saveTaskToSchema25;
+    // AppState enables the producer path (one-door creation); the save fn is
+    // only the legacy fallback for when AppState isn't ready.
+    return TaskUtils.createOrUpdateTaskData(taskContext, saveTaskToSchema25, _deps.AppState);
+}
+
+// ============================================
+// Exports
+// ============================================
+
+
+/**
+ * Write a task row's accessible name from its completion state.
+ *
+ * The single definition of this label. It was previously rebuilt inline at task
+ * creation (taskDOM) and on toggle (taskCompletion), and the cycle-reset path —
+ * which unchecks `checkbox.checked` directly rather than going through either —
+ * had no third copy and so silently left the old status behind. Every row read
+ * "Completed" to a screen reader while its checkbox was unchecked, which is
+ * worse than no label: it states the opposite of the control's real state.
+ *
+ * `name` and `recurring` are derived from the element when not supplied, so a
+ * caller that only knows "this row is now unchecked" can still call it.
+ *
+ * `opts.status` overrides the completed/not-completed wording for states that
+ * are neither — currently only "overdue". It must already be resolved through
+ * getLabel; passing a raw string is how this row ended up announcing a
+ * lowercase, untranslated "overdue" next to properly-cased siblings.
+ *
+ * @param {HTMLElement} taskItem - The task <li>
+ * @param {boolean} completed - New completion state
+ * @param {{name?: string, recurring?: boolean, status?: string}} [opts]
+ * @returns {void}
+ */
+/**
+ * The display text of a task object, tolerating the legacy `taskText` key.
+ *
+ * Live tasks carry `text`; `taskText` is the pre-2.5 name that only survives on a
+ * task object that has not yet passed through routineLoader's load-time repair,
+ * which renames it and deletes the old key (cleared-task ENTRIES keep `taskText`
+ * by schema). This
+ * is the one read-side fallback; do not write `taskText` on a live task.
+ * (STATE_TRUTH_MIGRATION #5)
+ *
+ * @param {Object|null|undefined} task
+ * @returns {string} '' when neither key holds a string
+ */
+export function getTaskText(task) {
+    if (typeof task?.text === 'string') return task.text;
+    if (typeof task?.taskText === 'string') return task.taskText;
+    return '';
+}
+
+export function applyTaskStatusLabel(taskItem, completed, opts = {}) {
+    if (!taskItem) return;
+    const name = opts.name ?? (taskItem.querySelector(DOM_SELECTORS.TASK_TEXT)?.textContent || '');
+    const recurring = opts.recurring ?? taskItem.classList.contains(DOM_CLASSES.RECURRING);
+    const status = opts.status ?? (completed ? getLabel('nav.completed') : getLabel('nav.notCompleted'));
+    const labelKey = recurring ? 'action.taskItemRecurring' : 'action.taskItemLabel';
+    taskItem.setAttribute('aria-label', getLabel(labelKey, { vars: { name, status } }));
+}
+
+// DI-pure module (no window.* fallbacks for dependencies)
+
+// ES6 exports
+export {
+    buildTaskContext,
+    loadTaskContext,
+    createOrUpdateTaskData,
+    scrollToNewTask,
+    handleOverdueStyling,
+    setupFinalTaskInteractions
+};

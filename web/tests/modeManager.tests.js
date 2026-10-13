@@ -1,0 +1,1243 @@
+/**
+ * ModeManager Tests (DI-Pure)
+ * Tests for modules/routine/modeManager.js
+ * Pattern: Resilient Constructor + Module-level DI
+ *
+ * Uses dependency injection pattern - imports module directly
+ *
+ * Tests the three cycling modes:
+ * - Auto Cycle ↻: Tasks auto-reset when all completed
+ * - Manual Cycle ✋: Tasks reset only on manual button click
+ * - To-Do Mode 📋: Tasks are deleted instead of reset
+ */
+
+// Import module directly for DI testing (not via appContext which may not be populated)
+let ModeManager = null;
+let setModeManagerDependencies = null;
+
+export async function runModeManagerTests(resultsDiv, isPartOfSuite = false) {
+    resultsDiv.innerHTML = '<h2>🎯 ModeManager Tests (DI-Pure)</h2><h3>Loading module...</h3>';
+
+    // Import the module directly for DI testing
+    try {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const module = await import(`../modules/routine/modeManager.js?v=${cacheBuster}`);
+        ModeManager = module.ModeManager;
+        setModeManagerDependencies = module.setModeManagerDependencies;
+        resultsDiv.innerHTML = '<h2>🎯 ModeManager Tests (DI-Pure)</h2><h3>Running tests...</h3>';
+    } catch (e) {
+        resultsDiv.innerHTML = `<h2>🎯 ModeManager Tests</h2><div class="result fail">❌ Failed to import module: ${e.message}</div>`;
+        return { passed: 0, total: 1 };
+    }
+
+    // Check if class is available
+    if (!ModeManager) {
+        resultsDiv.innerHTML += '<div class="result fail">❌ ModeManager class not found. Make sure the module is properly loaded.</div>';
+        return { passed: 0, total: 1 };
+    }
+
+    resultsDiv.innerHTML = '<h2>🎯 ModeManager Tests (DI-Pure)</h2><h3>Running tests...</h3>';
+    let passed = { count: 0 }, total = { count: 0 };
+
+    // 🔒 SAVE REAL APP DATA ONCE before all tests run (only when running individually)
+    let savedRealData = {};
+    if (!isPartOfSuite) {
+        const protectedKeys = ['miniCycleData', 'miniCycleForceFullVersion'];
+        protectedKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                savedRealData[key] = value;
+            }
+        });
+        console.log('🔒 Saved original localStorage for individual modeManager test');
+    }
+
+    // Helper to restore original data after all tests (only when running individually)
+    function restoreOriginalData() {
+        if (!isPartOfSuite) {
+            localStorage.clear();
+            Object.keys(savedRealData).forEach(key => {
+                localStorage.setItem(key, savedRealData[key]);
+            });
+            console.log('✅ Individual modeManager test completed - original localStorage restored');
+        }
+    }
+
+    // Create mock dependencies for DI-pure testing
+    function createMockDeps(overrides = {}) {
+        const mockSchemaData = {
+            metadata: { version: "2.5", lastModified: Date.now() },
+            settings: {},
+            data: { routine: {
+                    'cycle-test-123': {
+                        name: 'Test Cycle',
+                        tasks: [
+                            { id: 'task-1', text: 'Test task 1', completed: false }
+                        ],
+                        cycleCount: 5,
+                        autoReset: true,
+                        deleteCheckedTasks: false,
+                        recurringTemplates: {}
+                    }
+                }
+            },
+            appState: {
+                activeRoutineId: 'cycle-test-123',
+                currentMode: 'auto-cycle'
+            },
+            userProgress: { cyclesCompleted: 10, totalTasksCompleted: 50 }
+        };
+
+        return {
+            AppMeta: { version: '1.0.0-test' },
+            AppState: {
+                isReady: () => true,
+                get: () => mockSchemaData,
+                update: (fn) => { fn(mockSchemaData); }
+            },
+            createTaskButtonContainer: () => {
+                const container = document.createElement('div');
+                container.className = 'task-options';
+                return container;
+            },
+            setupDueDateButtonInteraction: () => {},
+            checkCompleteAllButton: () => {},
+            showNotification: () => {},
+            helpWindowManager: () => ({ showModeDescription: () => {} }),
+            recurringCore: { updateRecurringButtonVisibility: () => {} },
+            getElementById: (id) => document.getElementById(id) || document.createElement('div'),
+            querySelectorAll: (sel) => document.querySelectorAll(sel),
+            safeAddEventListener: (el, event, handler, options) => {
+                if (el && typeof el.addEventListener === 'function') {
+                    el.addEventListener(event, handler, options);
+                }
+            },
+            ...overrides
+        };
+    }
+
+    async function test(name, testFn) {
+        total.count++;
+        try {
+            // Reset environment before each test
+            localStorage.clear();
+
+            // Reset DOM state
+            document.body.className = '';
+
+            // Clear DOM elements
+            const existingSelectors = document.querySelectorAll('#mode-selector, #toggleAutoReset, #deleteCheckedTasks');
+            existingSelectors.forEach(el => el.remove());
+
+            await testFn();
+            resultsDiv.innerHTML += `<div class="result pass">✅ ${name}</div>`;
+            passed.count++;
+        } catch (error) {
+            resultsDiv.innerHTML += `<div class="result fail">❌ ${name}: ${error.message}</div>`;
+            console.error(`Test failed: ${name}`, error);
+        }
+    }
+
+    // === INITIALIZATION TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔧 Initialization Tests</h4>';
+
+    await test('ModeManager class exists', async () => {
+        if (typeof ModeManager === 'undefined') {
+            throw new Error('ModeManager class not found');
+        }
+    });
+
+    await test('creates instance with DI successfully', async () => {
+        const mockDeps = createMockDeps();
+        setModeManagerDependencies(mockDeps);
+        const manager = new ModeManager();
+        if (!manager || typeof manager.init !== 'function') {
+            throw new Error('ModeManager not properly initialized');
+        }
+    });
+
+    await test('accepts constructor dependency injection', async () => {
+        const mockDeps = {
+            AppState: { get: () => ({}) },
+            showNotification: () => {},
+            getElementById: (id) => document.createElement('div'),
+            querySelectorAll: (sel) => []
+        };
+
+        const manager = new ModeManager(mockDeps);
+
+        if (!manager.deps.AppState) {
+            throw new Error('Dependency injection failed');
+        }
+    });
+
+    await test('has _initialized flag set to false initially', async () => {
+        setModeManagerDependencies(createMockDeps());
+        const manager = new ModeManager();
+        if (manager._initialized !== false) {
+            throw new Error('_initialized should be false before init()');
+        }
+    });
+
+    await test('stores all expected dependencies (DI)', async () => {
+        setModeManagerDependencies(createMockDeps());
+        const manager = new ModeManager();
+        const expectedDeps = [
+            'AppState',
+            'createTaskButtonContainer',
+            'setupDueDateButtonInteraction',
+            'checkCompleteAllButton',
+            'showNotification',
+            'helpWindowManager',
+            'getElementById',
+            'querySelectorAll'
+        ];
+
+        for (const dep of expectedDeps) {
+            if (!manager.deps.hasOwnProperty(dep)) {
+                throw new Error(`Missing dependency: ${dep}`);
+            }
+        }
+    });
+
+    // === MODE NAME TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">📝 Mode Name Mapping (DI)</h4>';
+
+    await test('getModeName returns correct name for auto-cycle (DI)', async () => {
+        setModeManagerDependencies(createMockDeps());
+        const manager = new ModeManager();
+        const result = manager.getModeName('auto-cycle');
+        if (result !== 'Auto Cycle ↻') {
+            throw new Error(`Expected 'Auto Cycle ↻', got '${result}'`);
+        }
+    });
+
+    await test('getModeName returns correct name for manual-cycle (DI)', async () => {
+        setModeManagerDependencies(createMockDeps());
+        const manager = new ModeManager();
+        const result = manager.getModeName('manual-cycle');
+        if (result !== 'Manual Cycle ✋↻') {
+            throw new Error(`Expected 'Manual Cycle ✋↻', got '${result}'`);
+        }
+    });
+
+    await test('getModeName returns correct name for todo-mode (DI)', async () => {
+        setModeManagerDependencies(createMockDeps());
+        const manager = new ModeManager();
+        const result = manager.getModeName('todo-mode');
+        if (result !== 'To-Do Mode 📋') {
+            throw new Error(`Expected 'To-Do Mode 📋', got '${result}'`);
+        }
+    });
+
+    await test('getModeName returns default for unknown mode (DI)', async () => {
+        setModeManagerDependencies(createMockDeps());
+        const manager = new ModeManager();
+        const result = manager.getModeName('invalid-mode');
+        if (result !== 'Auto Cycle ↻') {
+            throw new Error(`Expected default 'Auto Cycle ↻', got '${result}'`);
+        }
+    });
+
+    // === REFRESH TASK BUTTONS TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔄 Refresh Task Buttons (DI)</h4>';
+
+    await test('refreshTaskButtonsForModeChange handles no tasks gracefully (DI)', async () => {
+        setModeManagerDependencies(createMockDeps({
+            querySelectorAll: () => [],
+            getElementById: (id) => null
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw
+        await manager.refreshTaskButtonsForModeChange();
+    });
+
+    await test('refreshTaskButtonsForModeChange completes without error (DI)', async () => {
+        setModeManagerDependencies(createMockDeps({
+            AppState: null,
+            querySelectorAll: () => [],
+            getElementById: () => null
+        }));
+        const manager = new ModeManager();
+
+        // Call the function - should complete without throwing
+        await manager.refreshTaskButtonsForModeChange();
+
+        // Wait for the debounce timeout (150ms + buffer)
+        await new Promise(resolve => setTimeout(resolve, 200));
+    });
+
+    // === SYNC MODE FROM TOGGLES TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔄 Sync Mode From Toggles (DI)</h4>';
+
+    await test('syncModeFromToggles handles missing state gracefully (DI)', async () => {
+        setModeManagerDependencies(createMockDeps({
+            AppState: { get: () => null },
+            getElementById: () => null
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw
+        await manager.syncModeFromToggles();
+    });
+
+    await test('syncModeFromToggles detects auto-cycle mode correctly (DI)', async () => {
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': {
+                        autoReset: true,
+                        deleteCheckedTasks: false
+                    }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        const mockModeSelector = document.createElement('select');
+        mockModeSelector.id = 'mode-selector';
+        mockModeSelector.innerHTML = `
+            <option value="auto-cycle">Auto Cycle</option>
+            <option value="manual-cycle">Manual Cycle</option>
+            <option value="todo-mode">To-Do Mode</option>
+        `;
+
+        const toggleAutoReset = document.createElement('input');
+        toggleAutoReset.type = 'checkbox';
+        toggleAutoReset.id = 'toggleAutoReset';
+
+        const deleteCheckedTasks = document.createElement('input');
+        deleteCheckedTasks.type = 'checkbox';
+        deleteCheckedTasks.id = 'deleteCheckedTasks';
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: { get: () => mockState },
+            getElementById: (id) => {
+                if (id === 'mode-selector') return mockModeSelector;
+                if (id === 'toggleAutoReset') return toggleAutoReset;
+                if (id === 'deleteCheckedTasks') return deleteCheckedTasks;
+                return null;
+            }
+        }));
+        const manager = new ModeManager();
+
+        await manager.syncModeFromToggles();
+
+        if (mockModeSelector.value !== 'auto-cycle') {
+            throw new Error(`Expected 'auto-cycle', got '${mockModeSelector.value}'`);
+        }
+    });
+
+    await test('syncModeFromToggles detects manual-cycle mode correctly (DI)', async () => {
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': {
+                        autoReset: false,
+                        deleteCheckedTasks: false
+                    }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        const mockModeSelector = document.createElement('select');
+        mockModeSelector.id = 'mode-selector';
+        mockModeSelector.innerHTML = `
+            <option value="auto-cycle">Auto Cycle</option>
+            <option value="manual-cycle">Manual Cycle</option>
+            <option value="todo-mode">To-Do Mode</option>
+        `;
+        document.body.appendChild(mockModeSelector);
+
+        const toggleAutoReset = document.createElement('input');
+        toggleAutoReset.type = 'checkbox';
+        toggleAutoReset.id = 'toggleAutoReset';
+        document.body.appendChild(toggleAutoReset);
+
+        const deleteCheckedTasks = document.createElement('input');
+        deleteCheckedTasks.type = 'checkbox';
+        deleteCheckedTasks.id = 'deleteCheckedTasks';
+        document.body.appendChild(deleteCheckedTasks);
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: { get: () => mockState },
+            getElementById: (id) => document.getElementById(id)
+        }));
+        const manager = new ModeManager();
+
+        await manager.syncModeFromToggles();
+
+        if (mockModeSelector.value !== 'manual-cycle') {
+            throw new Error(`Expected 'manual-cycle', got '${mockModeSelector.value}'`);
+        }
+
+        // Cleanup
+        mockModeSelector.remove();
+        toggleAutoReset.remove();
+        deleteCheckedTasks.remove();
+    });
+
+    await test('syncModeFromToggles detects todo-mode correctly (DI)', async () => {
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': {
+                        autoReset: false,
+                        deleteCheckedTasks: true
+                    }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        const mockModeSelector = document.createElement('select');
+        mockModeSelector.id = 'mode-selector';
+        mockModeSelector.innerHTML = `
+            <option value="auto-cycle">Auto Cycle</option>
+            <option value="manual-cycle">Manual Cycle</option>
+            <option value="todo-mode">To-Do Mode</option>
+        `;
+        document.body.appendChild(mockModeSelector);
+
+        const toggleAutoReset = document.createElement('input');
+        toggleAutoReset.type = 'checkbox';
+        toggleAutoReset.id = 'toggleAutoReset';
+        document.body.appendChild(toggleAutoReset);
+
+        const deleteCheckedTasks = document.createElement('input');
+        deleteCheckedTasks.type = 'checkbox';
+        deleteCheckedTasks.id = 'deleteCheckedTasks';
+        document.body.appendChild(deleteCheckedTasks);
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: { get: () => mockState },
+            getElementById: (id) => document.getElementById(id)
+        }));
+        const manager = new ModeManager();
+
+        await manager.syncModeFromToggles();
+
+        if (mockModeSelector.value !== 'todo-mode') {
+            throw new Error(`Expected 'todo-mode', got '${mockModeSelector.value}'`);
+        }
+
+        // Cleanup
+        mockModeSelector.remove();
+        toggleAutoReset.remove();
+        deleteCheckedTasks.remove();
+    });
+
+    await test('syncModeFromToggles updates body classes (DI)', async () => {
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': {
+                        autoReset: true,
+                        deleteCheckedTasks: false
+                    }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        const mockModeSelector = document.createElement('select');
+        const toggleAutoReset = document.createElement('input');
+        const deleteCheckedTasks = document.createElement('input');
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: { get: () => mockState },
+            getElementById: (id) => {
+                if (id === 'mode-selector') return mockModeSelector;
+                if (id === 'toggleAutoReset') return toggleAutoReset;
+                if (id === 'deleteCheckedTasks') return deleteCheckedTasks;
+                return null;
+            }
+        }));
+        const manager = new ModeManager();
+
+        await manager.syncModeFromToggles();
+
+        if (!document.body.classList.contains('auto-cycle-mode')) {
+            throw new Error('Body class not updated to auto-cycle-mode');
+        }
+    });
+
+    // === UPDATE STORAGE FROM TOGGLES TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">💾 Update Storage From Toggles (DI)</h4>';
+
+    await test('updateStorageFromToggles saves to AppState (DI)', async () => {
+        let updateCalled = false;
+        let savedData = null;
+
+        const mockAppState = {
+            get: () => ({
+                data: { routine: {
+                        'cycle-1': {}
+                    }
+                },
+                appState: { activeRoutineId: 'cycle-1' }
+            }),
+            update: (updateFn, immediate) => {
+                updateCalled = true;
+                const state = {
+                    data: { routine: {
+                            'cycle-1': {}
+                        }
+                    }
+                };
+                updateFn(state);
+                savedData = state.data.routine['cycle-1'];
+            }
+        };
+
+        const toggleAutoReset = document.createElement('input');
+        toggleAutoReset.type = 'checkbox';
+        toggleAutoReset.checked = true;
+
+        const deleteCheckedTasks = document.createElement('input');
+        deleteCheckedTasks.type = 'checkbox';
+        deleteCheckedTasks.checked = false;
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: mockAppState,
+            getElementById: (id) => {
+                if (id === 'toggleAutoReset') return toggleAutoReset;
+                if (id === 'deleteCheckedTasks') return deleteCheckedTasks;
+                return null;
+            }
+        }));
+        const manager = new ModeManager();
+
+        await manager.updateStorageFromToggles();
+
+        if (!updateCalled) {
+            throw new Error('AppState.update not called');
+        }
+
+        if (!savedData || savedData.autoReset !== true || savedData.deleteCheckedTasks !== false) {
+            throw new Error('Data not saved correctly to AppState');
+        }
+    });
+
+    await test('updateStorageFromToggles handles missing active cycle (DI)', async () => {
+        const mockAppState = {
+            get: () => ({
+                data: { routine: {} },
+                appState: { activeRoutineId: null }
+            })
+        };
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: mockAppState,
+            getElementById: () => null
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw
+        await manager.updateStorageFromToggles();
+    });
+
+    // === UPDATE CYCLE MODE DESCRIPTION TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">📝 Update Cycle Mode Description (DI)</h4>';
+
+    await test('updateCycleModeDescription handles missing AppState (DI)', async () => {
+        setModeManagerDependencies(createMockDeps({
+            AppState: null
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw
+        await manager.updateCycleModeDescription();
+    });
+
+    await test('updateCycleModeDescription updates description for auto-cycle (DI)', async () => {
+        const descriptionBox = document.createElement('div');
+        descriptionBox.id = 'mode-description';
+        document.body.appendChild(descriptionBox);
+
+        setModeManagerDependencies(createMockDeps({
+            // Read from state now, not the legacy wrapper (STATE_TRUTH_MIGRATION #25)
+            AppState: {
+                isReady: () => true,
+                get: () => ({
+                    metadata: { version: '2.5' },
+                    data: { routine: { 'cycle-1': { autoReset: true, deleteCheckedTasks: false } } },
+                    appState: { activeRoutineId: 'cycle-1' }
+                }),
+                update: () => {}
+            },
+            getElementById: (id) => {
+                if (id === 'mode-description') return descriptionBox;
+                return document.getElementById(id);
+            }
+        }));
+        const manager = new ModeManager();
+
+        await manager.updateCycleModeDescription();
+
+        if (!descriptionBox.innerHTML.includes('Auto Cycle Mode')) {
+            throw new Error('Description not updated for auto-cycle mode');
+        }
+
+        // Cleanup
+        descriptionBox.remove();
+    });
+
+    // === ERROR HANDLING TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🛡️ Error Handling (DI)</h4>';
+
+    await test('handles missing dependencies gracefully (DI)', async () => {
+        setModeManagerDependencies(createMockDeps({
+            AppState: null,
+            getElementById: () => null,
+            querySelectorAll: () => []
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw even with null AppState
+        await manager.refreshTaskButtonsForModeChange();
+        await manager.syncModeFromToggles();
+        await manager.updateStorageFromToggles();
+        await manager.updateCycleModeDescription();
+    });
+
+    await test('handles null AppState gracefully (DI)', async () => {
+        setModeManagerDependencies(createMockDeps({
+            AppState: null,
+            getElementById: () => null
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw
+        await manager.syncModeFromToggles();
+        await manager.updateStorageFromToggles();
+    });
+
+    await test('handles missing DOM elements gracefully (DI)', async () => {
+        setModeManagerDependencies(createMockDeps({
+            AppState: { get: () => ({ data: { routine: {} }, appState: {} }) },
+            getElementById: () => null,
+            querySelectorAll: () => []
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw
+        await manager.refreshTaskButtonsForModeChange();
+        await manager.syncModeFromToggles();
+        await manager.setupModeSelector();
+    });
+
+    // === INTEGRATION TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔗 Integration Tests (DI)</h4>';
+
+    await test('integrates with injected AppState (DI)', async () => {
+        let stateRead = false;
+        const mockAppState = {
+            isReady: () => true,
+            get: () => {
+                stateRead = true;
+                return {
+                    metadata: { version: '2.5' },
+                    settings: {},
+                    data: { routine: {
+                            'cycle-1': {
+                                autoReset: true,
+                                deleteCheckedTasks: false
+                            }
+                        }
+                    },
+                    appState: { activeRoutineId: 'cycle-1' }
+                };
+            },
+            update: (updateFn, immediate) => {}
+        };
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: mockAppState,
+            getElementById: () => null,
+            querySelectorAll: () => []
+        }));
+        const manager = new ModeManager();
+
+        await manager.syncModeFromToggles();
+
+        // syncModeFromToggles reads the injected AppState (AppState.get()) before it
+        // touches the DOM — assert it actually did. The old test called it and asserted nothing.
+        if (!stateRead) {
+            throw new Error('syncModeFromToggles should read from the injected AppState');
+        }
+    });
+
+    await test('without AppState, updateCycleModeDescription leaves the description untouched (DI)', async () => {
+        // There is no longer a loadMiniCycleData fallback (STATE_TRUTH_MIGRATION #25):
+        // state is the only source, and with none the method must warn and return.
+        const descriptionBox = document.createElement('div');
+        descriptionBox.id = 'mode-description';
+        descriptionBox.textContent = 'untouched';
+        setModeManagerDependencies(createMockDeps({
+            AppState: null,
+            getElementById: (id) => (id === 'mode-description' ? descriptionBox : null)
+        }));
+        const manager = new ModeManager();
+
+        await manager.updateCycleModeDescription();
+
+        if (descriptionBox.textContent !== 'untouched') {
+            throw new Error('the description was rewritten with no state to read from');
+        }
+    });
+
+    // === GLOBAL COMPATIBILITY TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🌍 Global Wrappers (Backward Compat)</h4>';
+
+    await test('ModeManager class is exported from module', async () => {
+        if (typeof ModeManager !== 'function') {
+            throw new Error('ModeManager not exported from module');
+        }
+    });
+
+    // NOTE: Test removed - window.modeManager global instance is not reliably set in batch
+    // test environments because the module's initialization is skipped when appInit is not ready.
+    // The global instance depends on production app initialization flow that doesn't run in tests.
+
+    // === SETUP TOGGLE AUTO RESET TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">⚙️ Setup Toggle Auto Reset (DI)</h4>';
+
+    await test('setupToggleAutoReset handles missing toggle elements gracefully', async () => {
+        setModeManagerDependencies(createMockDeps({
+            getElementById: () => null
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw when toggles don't exist
+        manager.setupToggleAutoReset();
+    });
+
+    await test('setupToggleAutoReset handles AppState not ready', async () => {
+        const toggleAutoReset = document.createElement('input');
+        toggleAutoReset.type = 'checkbox';
+        toggleAutoReset.id = 'toggleAutoReset';
+
+        const deleteCheckedTasks = document.createElement('input');
+        deleteCheckedTasks.type = 'checkbox';
+        deleteCheckedTasks.id = 'deleteCheckedTasks';
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: { isReady: () => false },
+            getElementById: (id) => {
+                if (id === 'toggleAutoReset') return toggleAutoReset;
+                if (id === 'deleteCheckedTasks') return deleteCheckedTasks;
+                return null;
+            }
+        }));
+        const manager = new ModeManager();
+
+        // Should not throw when AppState not ready
+        manager.setupToggleAutoReset();
+    });
+
+    await test('setupToggleAutoReset sets up toggles from state', async () => {
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': {
+                        autoReset: true,
+                        deleteCheckedTasks: false
+                    }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        const toggleAutoReset = document.createElement('input');
+        toggleAutoReset.type = 'checkbox';
+        toggleAutoReset.checked = false; // Start unchecked
+
+        const deleteCheckedTasks = document.createElement('input');
+        deleteCheckedTasks.type = 'checkbox';
+        deleteCheckedTasks.checked = true; // Start checked
+
+        const deleteCheckedTasksContainer = document.createElement('div');
+        deleteCheckedTasksContainer.id = 'deleteCheckedTasksContainer';
+        deleteCheckedTasksContainer.style.display = 'block';
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: {
+                isReady: () => true,
+                get: () => mockState,
+                update: () => {}
+            },
+            getElementById: (id) => {
+                if (id === 'toggleAutoReset') return toggleAutoReset;
+                if (id === 'deleteCheckedTasks') return deleteCheckedTasks;
+                if (id === 'deleteCheckedTasksContainer') return deleteCheckedTasksContainer;
+                return null;
+            }
+        }));
+        const manager = new ModeManager();
+
+        manager.setupToggleAutoReset();
+
+        // Should sync from state
+        if (toggleAutoReset.checked !== true) {
+            throw new Error('toggleAutoReset should be checked (from state)');
+        }
+        if (deleteCheckedTasks.checked !== false) {
+            throw new Error('deleteCheckedTasks should be unchecked (from state)');
+        }
+        if (deleteCheckedTasksContainer.style.display !== 'none') {
+            throw new Error('deleteCheckedTasksContainer should be hidden');
+        }
+    });
+
+    await test('setupToggleAutoReset attaches change event listeners', async () => {
+        const mockState = {
+            data: { routine: {
+                    'cycle-1': { autoReset: false, deleteCheckedTasks: false }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        let updateCalled = false;
+        const toggleAutoReset = document.createElement('input');
+        toggleAutoReset.type = 'checkbox';
+
+        const deleteCheckedTasks = document.createElement('input');
+        deleteCheckedTasks.type = 'checkbox';
+
+        setModeManagerDependencies(createMockDeps({
+            AppState: {
+                isReady: () => true,
+                get: () => mockState,
+                update: (fn) => { updateCalled = true; fn(mockState); }
+            },
+            getElementById: (id) => {
+                if (id === 'toggleAutoReset') return toggleAutoReset;
+                if (id === 'deleteCheckedTasks') return deleteCheckedTasks;
+                return null;
+            },
+            checkMiniCycle: () => {},
+            refreshTaskListUI: () => {},
+            updateRecurringButtonVisibility: () => {}
+        }));
+        const manager = new ModeManager();
+
+        manager.setupToggleAutoReset();
+
+        // Trigger change event
+        toggleAutoReset.checked = true;
+        toggleAutoReset.dispatchEvent(new Event('change'));
+
+        if (!updateCalled) {
+            throw new Error('AppState.update should be called on toggle change');
+        }
+    });
+
+    // === PERFORMANCE TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">⚡ Performance Tests (DI)</h4>';
+
+    await test('getModeName completes quickly (DI)', async () => {
+        setModeManagerDependencies(createMockDeps());
+        const manager = new ModeManager();
+
+        const startTime = performance.now();
+        for (let i = 0; i < 1000; i++) {
+            manager.getModeName('auto-cycle');
+        }
+        const endTime = performance.now();
+
+        const duration = endTime - startTime;
+
+        if (duration > 100) { // 100ms for 1000 calls
+            throw new Error(`getModeName too slow: ${duration.toFixed(2)}ms for 1000 calls`);
+        }
+    });
+
+    // === MODE RADIO GROUP TESTS ===
+    resultsDiv.innerHTML += '<h4 class="test-section">📻 Mode Radio Group (DI)</h4>';
+
+    /**
+     * Build a mode-radio-group + mode-selector scaffold for the radio tests.
+     */
+    function setupRadioGroupDOM() {
+        // Clean any previous run
+        document.getElementById('mode-radio-group')?.remove();
+        document.getElementById('mode-selector')?.remove();
+
+        const group = document.createElement('div');
+        group.id = 'mode-radio-group';
+        group.className = 'mode-radio-row';
+        group.setAttribute('role', 'radiogroup');
+        for (const value of ['auto-cycle', 'manual-cycle', 'todo-mode']) {
+            const label = document.createElement('label');
+            label.className = 'mode-radio-option';
+            const radio = document.createElement('input');
+            radio.type = 'radio';
+            radio.name = 'mode-radio';
+            radio.value = value;
+            label.appendChild(radio);
+            group.appendChild(label);
+        }
+        document.body.appendChild(group);
+
+        const selector = document.createElement('select');
+        selector.id = 'mode-selector';
+        for (const v of ['auto-cycle', 'manual-cycle', 'todo-mode']) {
+            const opt = document.createElement('option');
+            opt.value = v;
+            selector.appendChild(opt);
+        }
+        document.body.appendChild(selector);
+
+        return { group, selector };
+    }
+
+    function teardownRadioGroupDOM() {
+        document.getElementById('mode-radio-group')?.remove();
+        document.getElementById('mode-selector')?.remove();
+    }
+
+    await test('setupModeRadioGroup is defined as a method', () => {
+        const manager = new ModeManager();
+        if (typeof manager.setupModeRadioGroup !== 'function') {
+            throw new Error('setupModeRadioGroup should be a function');
+        }
+    });
+
+    await test('setupModeRadioGroup fails soft when radio group is missing', () => {
+        // Don't set up the DOM scaffold — radios don't exist
+        teardownRadioGroupDOM();
+        const manager = new ModeManager();
+        setModeManagerDependencies({
+            getElementById: (id) => document.getElementById(id),
+            safeAddEventListener: (el, evt, fn) => el.addEventListener(evt, fn)
+        });
+        try {
+            manager.setupModeRadioGroup();
+        } catch (e) {
+            throw new Error('Should not throw when radio group is missing: ' + e.message);
+        }
+    });
+
+    await test('setupModeRadioGroup fails soft when #mode-selector is missing', () => {
+        document.getElementById('mode-radio-group')?.remove();
+        document.getElementById('mode-selector')?.remove();
+        // Create just the radio group, no mode-selector
+        const group = document.createElement('div');
+        group.id = 'mode-radio-group';
+        for (const value of ['auto-cycle', 'manual-cycle', 'todo-mode']) {
+            const label = document.createElement('label');
+            label.className = 'mode-radio-option';
+            const radio = document.createElement('input');
+            radio.type = 'radio';
+            radio.name = 'mode-radio';
+            radio.value = value;
+            label.appendChild(radio);
+            group.appendChild(label);
+        }
+        document.body.appendChild(group);
+
+        const manager = new ModeManager();
+        setModeManagerDependencies({
+            getElementById: (id) => document.getElementById(id),
+            safeAddEventListener: (el, evt, fn) => el.addEventListener(evt, fn)
+        });
+        try {
+            manager.setupModeRadioGroup();
+        } catch (e) {
+            throw new Error('Should not throw when mode-selector is missing: ' + e.message);
+        }
+        teardownRadioGroupDOM();
+    });
+
+    await test('Radio change drives the #mode-selector change event', () => {
+        const { selector } = setupRadioGroupDOM();
+        let changeFired = false;
+        let changedValue = null;
+        selector.addEventListener('change', (e) => {
+            changeFired = true;
+            changedValue = e.target.value;
+        });
+
+        const manager = new ModeManager();
+        setModeManagerDependencies({
+            getElementById: (id) => document.getElementById(id),
+            safeAddEventListener: (el, evt, fn) => el.addEventListener(evt, fn)
+        });
+        manager.setupModeRadioGroup();
+
+        // Simulate user selecting the To-Do radio
+        const todoRadio = document.querySelector('input[type="radio"][value="todo-mode"]');
+        todoRadio.checked = true;
+        todoRadio.dispatchEvent(new Event('change', { bubbles: true }));
+
+        teardownRadioGroupDOM();
+        if (!changeFired) throw new Error('Selecting a radio should fire change on #mode-selector');
+        if (changedValue !== 'todo-mode') {
+            throw new Error(`Expected todo-mode, got: ${changedValue}`);
+        }
+    });
+
+    await test('Radio change does NOT re-fire when value already matches selector', () => {
+        const { selector } = setupRadioGroupDOM();
+        selector.value = 'manual-cycle';
+        let fireCount = 0;
+        selector.addEventListener('change', () => { fireCount++; });
+
+        const manager = new ModeManager();
+        setModeManagerDependencies({
+            getElementById: (id) => document.getElementById(id),
+            safeAddEventListener: (el, evt, fn) => el.addEventListener(evt, fn)
+        });
+        manager.setupModeRadioGroup();
+
+        // Selecting a radio whose value matches selector.value should be a no-op
+        const manualRadio = document.querySelector('input[type="radio"][value="manual-cycle"]');
+        manualRadio.checked = true;
+        manualRadio.dispatchEvent(new Event('change', { bubbles: true }));
+
+        teardownRadioGroupDOM();
+        if (fireCount !== 0) {
+            throw new Error(`Expected 0 fires (no-op when same), got: ${fireCount}`);
+        }
+    });
+
+    await test('setupModeRadioGroup is idempotent (second call is a no-op)', () => {
+        setupRadioGroupDOM();
+        const manager = new ModeManager();
+        setModeManagerDependencies({
+            getElementById: (id) => document.getElementById(id),
+            safeAddEventListener: (el, evt, fn) => el.addEventListener(evt, fn)
+        });
+        manager.setupModeRadioGroup();
+        const firstFlag = manager._modeRadioGroupSetupComplete;
+        // Calling a second time should not throw and should not re-wire handlers
+        manager.setupModeRadioGroup();
+        const secondFlag = manager._modeRadioGroupSetupComplete;
+        teardownRadioGroupDOM();
+        if (!firstFlag || !secondFlag) {
+            throw new Error('Idempotency flag should be true after either call');
+        }
+    });
+
+    // === MODE SWITCH ATOMICITY ===
+    resultsDiv.innerHTML += '<h4 class="test-section">🔀 Mode switch is one transaction</h4>';
+
+    await test('updateStorageFromToggles writes the mode and the repaired task maps in ONE update', async () => {
+        // A mode switch used to be two writes (the mode, then a derived per-task
+        // value), so one switch produced two undo steps. Since Schema 2.6 there is
+        // no derived value — the per-mode map is read at use time — but the mode
+        // and any map repair must still land in a single update.
+        const deps = createMockDeps();
+        const writes = [];
+        const state = deps.AppState.get();
+        const cycle = state.data.routine['cycle-test-123'];
+        cycle.tasks = [
+            { id: 't1', text: 'a', autoClear: { cycle: false, todo: true } },
+            { id: 't2', text: 'b', autoClear: { cycle: false, todo: true } }
+        ];
+        deps.AppState.update = (fn) => {
+            fn(state);
+            writes.push({
+                deleteCheckedTasks: cycle.deleteCheckedTasks,
+                maps: cycle.tasks.map(t => +!!(t.autoClear && typeof t.autoClear.todo === 'boolean')).join('')
+            });
+        };
+        // Toggles as the mode-selector leaves them for To-Do mode.
+        const autoReset = document.createElement('input');
+        autoReset.type = 'checkbox'; autoReset.checked = false;
+        const delChecked = document.createElement('input');
+        delChecked.type = 'checkbox'; delChecked.checked = true;
+        deps.getElementById = (id) => {
+            if (id === 'toggleAutoReset') return autoReset;
+            if (id === 'deleteCheckedTasks') return delChecked;
+            return document.getElementById(id) || document.createElement('div');
+        };
+        deps.appInit = { waitForCore: () => Promise.resolve() };
+        setModeManagerDependencies(deps);
+
+        const mgr = new ModeManager();
+        await mgr.updateStorageFromToggles();
+
+        if (writes.length !== 1) {
+            throw new Error(`expected exactly ONE state write, got ${writes.length}`);
+        }
+        if (writes[0].deleteCheckedTasks !== true) {
+            throw new Error('the write must carry the new mode');
+        }
+        if (writes[0].maps !== '11') {
+            throw new Error(`the SAME write must leave every task with a valid map, got "${writes[0].maps}"`);
+        }
+        if (cycle.tasks.some(t => 'deleteWhenComplete' in t)) {
+            throw new Error('the retired 2.5 mirror must not be written');
+        }
+    });
+
+    // === + BUTTON FIRST-TIME SHIMMER (state-driven, Oct 2026) ===
+    resultsDiv.innerHTML += '<h4>✨ First-time shimmer follows state</h4>';
+    const tick = () => new Promise(r => setTimeout(r, 5));
+    function shimmerFixture({ discovered = undefined, cycleCount = 0, routines = 1, ready = true } = {}) {
+        const host = document.createElement('div');
+        host.innerHTML = '<button id="quick-actions-btn" class="quick-actions-btn"></button><div id="quick-actions-menu"></div>';
+        document.body.appendChild(host);
+        const routine = {};
+        for (let i = 0; i < routines; i++) routine['r' + i] = { id: 'r' + i, title: 'R' + i, tasks: [{ id: 't', text: 'x', completed: false }], cycleCount, recurringTemplates: {} };
+        let state = ready ? { settings: discovered === undefined ? {} : { addTaskDiscovered: discovered }, data: { routine }, appState: { activeRoutineId: 'r0' } } : null;
+        const listeners = [];
+        const AppState = {
+            isReady: () => !!state,
+            get: () => state,
+            update: (fn) => { if (!state) return; fn(state); listeners.forEach(l => l(state, state)); },
+            subscribe: (key, cb) => listeners.push(cb),
+            unsubscribe: (key, cb) => { const i = listeners.indexOf(cb); if (i >= 0) listeners.splice(i, 1); return i >= 0; },
+            __become: (next) => { state = next; listeners.forEach(l => l(state, state)); },
+            __listeners: listeners
+        };
+        setModeManagerDependencies(createMockDeps({ AppState, appInit: { waitForCore: async () => {}, addHook: () => {} } }));
+        const manager = new ModeManager();
+        manager.setupQuickActionsButton();
+        const btn = host.querySelector('#quick-actions-btn');
+        return { manager, btn, AppState, flag: () => state?.settings?.addTaskDiscovered, remove: () => { manager.destroy(); host.remove(); } };
+    }
+
+    await test('shimmer: a new user gets it; a returning user does not and gets the flag recorded silently', async () => {
+        const fresh = shimmerFixture();
+        try {
+            if (!fresh.btn.classList.contains('first-time-shimmer')) throw new Error('new user: shimmer missing');
+        } finally { fresh.remove(); }
+        const back = shimmerFixture({ cycleCount: 3 });
+        try {
+            if (back.btn.classList.contains('first-time-shimmer')) throw new Error('returning user: shimmer present');
+            await tick();
+            if (back.flag() !== true) throw new Error('returning user: flag not recorded');
+        } finally { back.remove(); }
+    });
+
+    await test('shimmer: a + press clears it and records the flag EVEN WHEN the class is not on the button', async () => {
+        const f = shimmerFixture();
+        try {
+            f.btn.classList.remove('first-time-shimmer');   // the in-place-reset shape: button out of step
+            f.btn.click();
+            if (f.btn.classList.contains('first-time-shimmer')) throw new Error('class back after press');
+            if (f.flag() !== true) throw new Error('the press did not record the discovery (the old code only saved when the class was present)');
+        } finally { f.remove(); }
+    });
+
+    await test('shimmer: a press while state cannot take the write is recorded once state can', async () => {
+        const f = shimmerFixture({ ready: false });
+        try {
+            if (!f.btn.classList.contains('first-time-shimmer')) throw new Error('empty origin: shimmer should show');
+            f.btn.click();
+            if (f.btn.classList.contains('first-time-shimmer')) throw new Error('press should clear the class');
+            f.AppState.__become({ settings: {}, data: { routine: { r0: { id: 'r0', tasks: [], cycleCount: 0 } } }, appState: { activeRoutineId: 'r0' } });
+            await tick();
+            if (f.flag() !== true) throw new Error('the earlier press was not recorded once state became ready');
+            if (f.btn.classList.contains('first-time-shimmer')) throw new Error('shimmer must not come back after the press');
+        } finally { f.remove(); }
+    });
+
+    await test('shimmer: follows state — set the flag in state and the button loses it; clear it and it returns', async () => {
+        const f = shimmerFixture();
+        try {
+            f.AppState.update(s => { s.settings.addTaskDiscovered = true; });
+            if (f.btn.classList.contains('first-time-shimmer')) throw new Error('flag true in state but shimmer still on');
+            f.AppState.update(s => { delete s.settings.addTaskDiscovered; });
+            if (!f.btn.classList.contains('first-time-shimmer')) throw new Error('flag gone from state but shimmer not back');
+        } finally { f.remove(); }
+    });
+
+    await test('shimmer: an in-place factory reset re-arms it for the next user, even after a press this session', async () => {
+        const f = shimmerFixture();
+        try {
+            f.btn.click();
+            if (f.btn.classList.contains('first-time-shimmer')) throw new Error('press should clear it');
+            f.AppState.__become(null);                      // the reset neutralised state
+            document.dispatchEvent(new CustomEvent('firstrun:rearm'));
+            if (!f.btn.classList.contains('first-time-shimmer')) throw new Error('after the rearm the next user is new: shimmer should be back');
+            f.AppState.__become({ settings: {}, data: { routine: { r0: { id: 'r0', tasks: [], cycleCount: 0 } } }, appState: { activeRoutineId: 'r0' } });
+            await tick();
+            if (f.flag() === true) throw new Error('the pre-reset press must not be recorded for the new user');
+            if (!f.btn.classList.contains('first-time-shimmer')) throw new Error('shimmer should still show for the new user');
+        } finally { f.remove(); }
+    });
+
+    await test('shimmer: a task added through the input bar (ui:addTaskDiscovered) dismisses it', async () => {
+        const f = shimmerFixture();
+        try {
+            document.dispatchEvent(new CustomEvent('ui:addTaskDiscovered'));
+            if (f.btn.classList.contains('first-time-shimmer')) throw new Error('event did not clear the shimmer');
+            if (f.flag() !== true) throw new Error('event did not record the discovery');
+        } finally { f.remove(); }
+    });
+
+    await test('shimmer: destroy unsubscribes from state and drops the document listeners', async () => {
+        const f = shimmerFixture();
+        const before = f.AppState.__listeners.length;
+        f.manager.destroy();
+        if (f.AppState.__listeners.length !== before - 1) throw new Error('state subscription survived destroy');
+        f.btn.classList.remove('first-time-shimmer');
+        document.dispatchEvent(new CustomEvent('firstrun:rearm'));
+        if (f.btn.classList.contains('first-time-shimmer')) throw new Error('rearm listener survived destroy');
+        document.getElementById('quick-actions-btn')?.parentElement?.remove();
+    });
+
+    await test('syncTasksToMode repairs missing/invalid maps per key', async () => {
+        const deps = createMockDeps();
+        deps.DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS = { cycle: false, todo: true };
+        setModeManagerDependencies(deps);
+        const mgr = new ModeManager();
+        const cycle = { tasks: [
+            { id: 't1', text: 'a' },                                        // no settings at all
+            { id: 't2', text: 'b', autoClear: 'nonsense' }, // wrong type
+            { id: 't3', text: 'c', autoClear: { cycle: false } } // missing todo
+        ] };
+        mgr.syncTasksToMode(cycle, 'todo');
+        cycle.tasks.forEach(t => {
+            if (!t.autoClear || typeof t.autoClear.todo !== 'boolean' || typeof t.autoClear.cycle !== 'boolean') {
+                throw new Error(`${t.id} was not repaired to a complete map: ${JSON.stringify(t.autoClear)}`);
+            }
+        });
+        if (cycle.tasks.some(t => t.autoClear.todo !== true)) {
+            throw new Error('repaired tasks should take the default todo value (true)');
+        }
+    });
+
+    await test('syncTasksToMode preserves the OTHER mode\'s valid setting', () => {
+        // Repair used to replace the whole settings object when only the entering
+        // mode's key was missing, so { cycle: true } entering To-Do came back as
+        // { cycle: false, todo: true } — the user's Cycle setting silently reset.
+        const deps = createMockDeps();
+        deps.DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS = { cycle: false, todo: true };
+        setModeManagerDependencies(deps);
+        const mgr = new ModeManager();
+        const cycle = { tasks: [
+            { id: 't1', autoClear: { cycle: true } },          // todo missing
+            { id: 't2', autoClear: { cycle: true, todo: false } } // both valid
+        ] };
+        mgr.syncTasksToMode(cycle, 'todo');
+
+        if (cycle.tasks[0].autoClear.cycle !== true) {
+            throw new Error('repairing the missing todo key wiped a valid cycle:true');
+        }
+        if (cycle.tasks[0].autoClear.todo !== true) {
+            throw new Error('the missing key should take the default');
+        }
+        if (cycle.tasks[1].autoClear.todo !== false ||
+            cycle.tasks[1].autoClear.cycle !== true) {
+            throw new Error('a fully valid settings object must pass through untouched');
+        }
+    });
+
+    // === SUMMARY ===
+    const percentage = Math.round((passed.count / total.count) * 100);
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${percentage}%)</h3>`;
+
+    if (passed.count === total.count) {
+        resultsDiv.innerHTML += '<div class="result pass">🎉 All tests passed!</div>';
+    } else {
+        resultsDiv.innerHTML += '<div class="result fail">⚠️ Some tests failed</div>';
+    }
+
+    // 🔓 RESTORE original localStorage data (only when running individually)
+    restoreOriginalData();
+
+    return { passed: passed.count, total: total.count };
+}

@@ -1,0 +1,875 @@
+/**
+ * TaskCycleReset Tests
+ * Tests for modules/task/taskCycleReset.js
+ */
+
+import { setupTestEnvironment, createProtectedTest } from './testHelpers.js';
+
+export async function runTaskCycleResetTests(resultsDiv) {
+    const cacheBuster = window.testCacheBuster || Date.now();
+    const mod = await import(`../modules/task/taskCycleReset.js?v=${cacheBuster}`);
+    // Real signature builder so the snapshot-dedup test mirrors production
+    // (a bare counter mock can't see the update-wrapper's captures — the exact
+    // blind spot that let the Clear Completed two-snapshot leak ship).
+    const { buildSnapshotSignature } = await import(`../modules/ui/undoRedoManager.js?v=${cacheBuster}`);
+
+    resultsDiv.innerHTML = '<h2>TaskCycleReset Tests</h2><h3>Running tests...</h3>';
+    let passed = { count: 0 }, total = { count: 0 };
+    const test = createProtectedTest(resultsDiv, passed, total);
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">📦 Module Loading</h4>';
+
+    await test('setTaskCycleResetDependencies is exported as a function', () => {
+        if (typeof mod.setTaskCycleResetDependencies !== 'function') throw new Error('Missing export');
+    });
+
+    await test('clearAllTimeouts is exported as a function', () => {
+        if (typeof mod.clearAllTimeouts !== 'function') throw new Error('Missing export');
+    });
+
+    await test('isResetInProgress is exported as a function', () => {
+        if (typeof mod.isResetInProgress !== 'function') throw new Error('Missing export');
+    });
+
+    await test('resetTasksImpl is exported as a function', () => {
+        if (typeof mod.resetTasksImpl !== 'function') throw new Error('Missing export');
+    });
+
+    await test('deleteCompletedTasksImpl is exported as a function', () => {
+        if (typeof mod.deleteCompletedTasksImpl !== 'function') throw new Error('Missing export');
+    });
+
+    await test('markAllTasksCompleteImpl is exported as a function', () => {
+        if (typeof mod.markAllTasksCompleteImpl !== 'function') throw new Error('Missing export');
+    });
+
+    await test('handleCompleteAllTasksImpl is exported as a function', () => {
+        if (typeof mod.handleCompleteAllTasksImpl !== 'function') throw new Error('Missing export');
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">⚙️ DI Setup</h4>';
+
+    await test('setTaskCycleResetDependencies accepts an object without throwing', () => {
+        mod.setTaskCycleResetDependencies({});
+    });
+
+    await test('setTaskCycleResetDependencies accepts mock dependencies', () => {
+        mod.setTaskCycleResetDependencies({
+            AppState: { get: () => ({ settings: {}, appState: {}, data: { routine: {} } }), update: () => {} },
+            showNotification: () => {},
+            safeAddEventListener: () => {}
+        });
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">⚠️ Error Handling</h4>';
+
+    await test('isResetInProgress returns a boolean', () => {
+        const result = mod.isResetInProgress();
+        if (typeof result !== 'boolean') throw new Error('isResetInProgress should return boolean, got ' + typeof result);
+    });
+
+    await test('clearAllTimeouts does not throw', () => {
+        try {
+            mod.clearAllTimeouts();
+        } catch (e) {
+            throw new Error('clearAllTimeouts should not throw: ' + e.message);
+        }
+    });
+
+    await test('setTaskCycleResetDependencies handles null gracefully', () => {
+        try {
+            mod.setTaskCycleResetDependencies(null);
+        } catch (e) {
+            // Acceptable to throw on null — should not crash the module
+        }
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">🗑️ Clear Completed — state-driven (§1.1)</h4>';
+
+    // Regression — ARCH REVIEW FINDINGS §1.1: To-Do "Clear Completed" must decide which
+    // tasks to delete from STATE (task.completed), not the DOM checkbox. Build a deliberate
+    // divergence so the two sources disagree:
+    //   A: completed in STATE, checkbox UNCHECKED   → must be DELETED
+    //   B: NOT completed in STATE, checkbox CHECKED → must be KEPT
+    // (Both carry autoClear.todo=true.) Reading the checkbox would invert the outcome.
+    await test('deleteCompletedTasksImpl reads completion from state, not the DOM checkbox (§1.1)', async () => {
+        const container = document.createElement('div');
+        container.id = 'test-clear-completed-state';
+        const taskList = document.createElement('ul');
+        const mkRow = (id, checked) => {
+            const li = document.createElement('li');
+            li.className = 'task';
+            li.dataset.taskId = id;
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = checked;
+            li.appendChild(cb);
+            return li;
+        };
+        taskList.appendChild(mkRow('A', false)); // completed in state, but checkbox unchecked
+        taskList.appendChild(mkRow('B', true));  // incomplete in state, but checkbox checked
+        container.appendChild(taskList);
+        document.body.appendChild(container);
+
+        const stateObj = {
+            appState: { activeRoutineId: 'c1' },
+            data: { routine: { c1: { tasks: [
+                { id: 'A', text: 'A', completed: true, autoClear: { cycle: true, todo: true } },
+                { id: 'B', text: 'B', completed: false, autoClear: { cycle: true, todo: true } }
+            ] } } },
+            userProgress: {}
+        };
+        let updatedTasks = null;
+        const AppState = {
+            isReady: () => true,
+            get: () => stateObj,
+            update: async (producer) => { producer(stateObj); updatedTasks = stateObj.data.routine.c1.tasks; return stateObj; }
+        };
+
+        try {
+            await mod.deleteCompletedTasksImpl('c1', stateObj.data.routine.c1, taskList, { AppState });
+
+            const ids = (updatedTasks || []).map(t => t.id);
+            if (ids.includes('A')) throw new Error('Task A (completed in STATE) should have been deleted');
+            if (!ids.includes('B')) throw new Error('Task B (incomplete in STATE) should have been kept');
+            if (ids.length !== 1) throw new Error(`Expected exactly 1 task remaining, got ${ids.length}: [${ids}]`);
+        } finally {
+            mod.clearAllTimeouts(); // cancel pending clear-animation timeouts
+            container.remove();
+        }
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">🔁 Recurring tasks are excluded from Clear Completed</h4>';
+
+    // A recurring occurrence is scheduled to come back, so clearing it in To-Do Mode
+    // must NOT archive it (Cleared Tasks offered "restore" for something that restores
+    // itself) and must NOT count toward cleared-task achievements. Recurring tasks still
+    // reach achievements through completed CYCLES — a different path, untouched here.
+    //
+    // These are two SEPARATE writes to separate state (`cycle.clearedTasks` via
+    // recordMultipleClearedTasks, and `userProgress.totalTasksCompleted`), so they get
+    // separate tests: a fix that filters only one leaves the other wrong.
+    function makeClearHarness(tasks) {
+        const container = document.createElement('div');
+        const taskList = document.createElement('ul');
+        tasks.forEach(t => {
+            const li = document.createElement('li');
+            li.className = 'task';
+            li.dataset.taskId = t.id;
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            li.appendChild(cb);
+            taskList.appendChild(li);
+        });
+        container.appendChild(taskList);
+        document.body.appendChild(container);
+
+        const stateObj = {
+            appState: { activeRoutineId: 'c1' },
+            data: { routine: { c1: { tasks: tasks.map(t => ({ ...t })) } } },
+            userProgress: { totalTasksCompleted: 0 }
+        };
+        const recorded = [];
+        const AppState = {
+            isReady: () => true,
+            get: () => stateObj,
+            update: async (producer) => { producer(stateObj); return stateObj; }
+        };
+        const deps = {
+            AppState,
+            recordMultipleClearedTasks: (entries) => recorded.push(...entries)
+        };
+        return { taskList, stateObj, recorded, deps, cleanup: () => { mod.clearAllTimeouts(); container.remove(); } };
+    }
+
+    const RECURRING = { id: 'R', text: 'Recurring', completed: true, recurring: true, autoClear: { cycle: true, todo: true } };
+    const PLAIN = { id: 'P', text: 'Plain', completed: true, recurring: false, autoClear: { cycle: true, todo: true } };
+
+    await test('recurring task cleared in To-Do is NOT added to Cleared Tasks', async () => {
+        const h = makeClearHarness([RECURRING]);
+        try {
+            await mod.deleteCompletedTasksImpl('c1', h.stateObj.data.routine.c1, h.taskList, h.deps);
+            if (h.recorded.length !== 0) {
+                throw new Error(`archived ${h.recorded.length} recurring task(s); expected 0`);
+            }
+        } finally { h.cleanup(); }
+    });
+
+    await test('recurring task cleared in To-Do does NOT increment totalTasksCompleted', async () => {
+        // Deliberately separate from the archive test: different state field, different write.
+        const h = makeClearHarness([RECURRING]);
+        try {
+            await mod.deleteCompletedTasksImpl('c1', h.stateObj.data.routine.c1, h.taskList, h.deps);
+            if (h.stateObj.userProgress.totalTasksCompleted !== 0) {
+                throw new Error(`counter went to ${h.stateObj.userProgress.totalTasksCompleted}; expected 0`);
+            }
+        } finally { h.cleanup(); }
+    });
+
+    await test('non-recurring task cleared in To-Do IS archived and counted', async () => {
+        const h = makeClearHarness([PLAIN]);
+        try {
+            await mod.deleteCompletedTasksImpl('c1', h.stateObj.data.routine.c1, h.taskList, h.deps);
+            if (h.recorded.length !== 1) throw new Error(`archived ${h.recorded.length}; expected 1`);
+            if (h.recorded[0].text !== 'Plain') throw new Error(`archived the wrong task: ${h.recorded[0].text}`);
+            if (h.stateObj.userProgress.totalTasksCompleted !== 1) {
+                throw new Error(`counter=${h.stateObj.userProgress.totalTasksCompleted}; expected 1`);
+            }
+        } finally { h.cleanup(); }
+    });
+
+    await test('mixed batch archives and counts only the non-recurring task', async () => {
+        const h = makeClearHarness([RECURRING, PLAIN]);
+        try {
+            await mod.deleteCompletedTasksImpl('c1', h.stateObj.data.routine.c1, h.taskList, h.deps);
+            if (h.recorded.length !== 1) throw new Error(`archived ${h.recorded.length}; expected 1`);
+            if (h.recorded[0].text !== 'Plain') throw new Error(`archived ${h.recorded[0].text}; expected Plain`);
+            if (h.stateObj.userProgress.totalTasksCompleted !== 1) {
+                throw new Error(`counter=${h.stateObj.userProgress.totalTasksCompleted}; expected 1`);
+            }
+        } finally { h.cleanup(); }
+    });
+
+    await test('both recurring and non-recurring are still REMOVED from the task list', async () => {
+        // Exclusion is about archiving/counting only — clearing must still clear.
+        const h = makeClearHarness([RECURRING, PLAIN]);
+        try {
+            await mod.deleteCompletedTasksImpl('c1', h.stateObj.data.routine.c1, h.taskList, h.deps);
+            const remaining = h.stateObj.data.routine.c1.tasks.map(t => t.id);
+            if (remaining.length !== 0) throw new Error(`tasks left behind: [${remaining}]`);
+        } finally { h.cleanup(); }
+    });
+
+    await test('an all-recurring batch performs no archive write at all', async () => {
+        // Guards the empty-batch edge: recordMultipleClearedTasks should not be called
+        // with an empty array, which would still bump the archive's totalCleared.
+        const h = makeClearHarness([RECURRING, { ...RECURRING, id: 'R2', text: 'Recurring 2' }]);
+        let recordCalls = 0;
+        h.deps.recordMultipleClearedTasks = (entries) => { recordCalls++; h.recorded.push(...entries); };
+        try {
+            await mod.deleteCompletedTasksImpl('c1', h.stateObj.data.routine.c1, h.taskList, h.deps);
+            if (recordCalls !== 0) throw new Error(`recordMultipleClearedTasks called ${recordCalls}x; expected 0`);
+            if (h.stateObj.userProgress.totalTasksCompleted !== 0) {
+                throw new Error(`counter=${h.stateObj.userProgress.totalTasksCompleted}; expected 0`);
+            }
+        } finally { h.cleanup(); }
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">↩️ Undo snapshot at gesture boundary (v2.362)</h4>';
+
+    // Invariant: a batch gesture captures EXACTLY ONE snapshot — never zero
+    // (Undo jumps past the batch) and never two (Undo lands on a mid-batch
+    // phantom). The harness mirrors PRODUCTION: an update-wrapper captures
+    // before every AppState.update (like wrapAppStateForUndo), gated by the
+    // shared flags object and deduped by the REAL buildSnapshotSignature.
+    // A bare counter mock — the old harness — could not see the wrapper's
+    // captures and so missed the Clear Completed two-snapshot leak entirely.
+    function makeCompleteAllHarness(deleteCheckedTasks) {
+        const taskList = document.createElement('ul');
+        ['A', 'B'].forEach(id => {
+            const li = document.createElement('li');
+            li.className = 'task';
+            li.dataset.taskId = id;
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            li.appendChild(cb);
+            taskList.appendChild(li);
+        });
+        document.body.appendChild(taskList);
+
+        const stateObj = {
+            appState: { activeRoutineId: 'c1' },
+            metadata: { lastModified: 0 },
+            data: { routine: { c1: {
+                title: 'C1',
+                deleteCheckedTasks,
+                autoReset: !deleteCheckedTasks,
+                cycleCount: 0,
+                tasks: [
+                    { id: 'A', text: 'A', completed: true, autoClear: { cycle: true, todo: true } },
+                    { id: 'B', text: 'B', completed: true, autoClear: { cycle: true, todo: true } }
+                ],
+                recurringTemplates: {},
+                clearedTasks: { entries: [], totalCleared: 0, autoPruneEnabled: true }
+            } } },
+            userProgress: {}
+        };
+
+        // Shared flags object — setResettingFlag / system-mutation write here,
+        // and the faithful capture reads here, exactly as AppGlobalState does.
+        const flags = { isResetting: false, isSystemMutation: false, isPerformingUndoRedo: false };
+        const stack = [];
+
+        // Faithful captureStateSnapshot: flag-gated + real-signature dedup.
+        const capture = (raw) => {
+            if (flags.isResetting || flags.isSystemMutation || flags.isPerformingUndoRedo) return;
+            const cid = raw?.appState?.activeRoutineId;
+            const cyc = raw?.data?.routine?.[cid];
+            if (!cyc) return;
+            const snap = {
+                activeRoutineId: cid,
+                tasks: structuredClone(cyc.tasks || []),
+                title: cyc.title || '',
+                autoReset: cyc.autoReset,
+                deleteCheckedTasks: cyc.deleteCheckedTasks,
+                cycleCount: cyc.cycleCount || 0,
+                theme: cyc.theme || 'classic',
+                recurringTemplates: structuredClone(cyc.recurringTemplates || {}),
+                clearedTasks: cyc.clearedTasks ? structuredClone(cyc.clearedTasks) : null
+            };
+            const sig = buildSnapshotSignature(snap);
+            if (stack.length && stack[stack.length - 1].sig === sig) return; // dedup
+            stack.push({ sig });
+        };
+
+        const AppState = {
+            isReady: () => true,
+            get: () => stateObj,
+            // The wrapper: capture BEFORE running the producer, like production.
+            update: async (producer) => { capture(stateObj); producer(stateObj); return stateObj; }
+        };
+
+        const deps = {
+            AppState,
+            AppGlobalState: flags,
+            captureStateSnapshot: capture,
+            isPerformingUndoRedo: () => false,
+            querySelector: (sel) => (sel.includes('task-list') || sel.includes('taskList')) ? taskList : taskList.querySelector(sel),
+            checkMiniCycle: () => {},
+            // Mirror clearedTasksManager.recordMultipleClearedTasks: its OWN
+            // AppState.update bumping totalCleared is the second update whose
+            // post-record signature differs from the gesture capture.
+            recordMultipleClearedTasks: (records) => {
+                AppState.update(s => {
+                    const c = s.data.routine.c1;
+                    if (!c.clearedTasks) c.clearedTasks = { entries: [], totalCleared: 0, autoPruneEnabled: true };
+                    c.clearedTasks.totalCleared += records.length;
+                    c.clearedTasks.entries.unshift(...records.map(r => ({ ...r, id: 'clr-' + r.text })));
+                }, true);
+            }
+        };
+        return { taskList, stateObj, deps, flags, snapshots: () => stack.length };
+    }
+
+    await test('Clear Completed (To-Do) deletes tasks AND captures exactly one snapshot (no phantom intermediate)', async () => {
+        const h = makeCompleteAllHarness(true);
+        // recordMultipleClearedTasks is read from module _deps, not passed deps.
+        mod.setTaskCycleResetDependencies({
+            AppState: h.deps.AppState,
+            AppGlobalState: h.flags,
+            captureStateSnapshot: h.deps.captureStateSnapshot,
+            recordMultipleClearedTasks: h.deps.recordMultipleClearedTasks
+        });
+        try {
+            await mod.handleCompleteAllTasksImpl(() => {}, h.deps);
+            const remaining = h.stateObj.data.routine.c1.tasks.map(t => t.id);
+            if (remaining.length !== 0) throw new Error(`completed tasks should be deleted, still have [${remaining}]`);
+            // The record→delete sequence must NOT leak a second snapshot. Pre-fix
+            // this was 2 (gesture + post-record phantom) because the signature's
+            // clearedTasks count (ct) differs across the two updates.
+            if (h.snapshots() !== 1) throw new Error(`expected exactly 1 snapshot, got ${h.snapshots()} (phantom intermediate leak)`);
+        } finally {
+            mod.clearAllTimeouts();
+            mod.setTaskCycleResetDependencies({ recordMultipleClearedTasks: null });
+            h.taskList.remove();
+        }
+    });
+
+    await test('Complete All (cycle mode) marks tasks complete AND captures exactly one snapshot', async () => {
+        const h = makeCompleteAllHarness(false);
+        h.stateObj.data.routine.c1.tasks.forEach(t => { t.completed = false; });
+        try {
+            await mod.handleCompleteAllTasksImpl(() => {}, h.deps);
+            const allComplete = h.stateObj.data.routine.c1.tasks.every(t => t.completed === true);
+            if (!allComplete) throw new Error('cycle-mode Complete must mark all tasks completed');
+            if (h.snapshots() !== 1) throw new Error(`expected exactly 1 snapshot, got ${h.snapshots()}`);
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('Complete All (cycle mode) warns about a due date held in AppState, even with no date input rendered', async () => {
+        // The harness renders bare rows with no due-date inputs — the same blind
+        // spot as a dated task parked in the completed dropdown, which the old
+        // #taskList-only DOM scan never saw. The warning must come from state.
+        const h = makeCompleteAllHarness(false);
+        h.stateObj.data.routine.c1.tasks.forEach(t => { t.completed = false; });
+        h.stateObj.data.routine.c1.tasks[0].dueDate = '2026-09-20';
+        let modalShown = false;
+        h.deps.showConfirmationModal = (config) => { modalShown = true; config.callback(false); };
+        try {
+            await mod.handleCompleteAllTasksImpl(() => {}, h.deps);
+            if (!modalShown) throw new Error('a dueDate in state must trigger the reset warning');
+            const anyCompleted = h.stateObj.data.routine.c1.tasks.some(t => t.completed === true);
+            if (anyCompleted) throw new Error('declining the warning must leave every task incomplete');
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('resetTasksImpl (effect executor) captures NO snapshot of its own', async () => {
+        const taskList = document.createElement('ul');
+        document.body.appendChild(taskList);
+        const stateObj = {
+            appState: { activeRoutineId: 'c1' },
+            metadata: { lastModified: 0 },
+            data: { routine: { c1: { autoReset: true, tasks: [{ id: 'A', completed: true }], recurringTemplates: {} } } },
+            settings: {}, userProgress: {}
+        };
+        let snapshotCount = 0;
+        const deps = {
+            AppState: { isReady: () => true, get: () => stateObj, update: async (p) => { p(stateObj); return stateObj; } },
+            captureStateSnapshot: () => { snapshotCount++; },
+            isPerformingUndoRedo: () => false,
+            querySelector: () => taskList,
+            querySelectorAll: () => [],
+            checkMiniCycle: () => {},
+            incrementCycleCount: () => {}
+        };
+        try {
+            await mod.resetTasksImpl(deps);
+            // The executor delegates capture to the gesture that called it.
+            if (snapshotCount !== 0) throw new Error(`reset executor must not capture; got ${snapshotCount}`);
+        } finally {
+            mod.clearAllTimeouts();
+            taskList.remove();
+        }
+    });
+
+    await test('cycle reset re-arms reminders (startReminders fires in post-reset cleanup)', async () => {
+        // Regression guard (Aug 2026 external review #2): the reminder timer
+        // stops itself when it fires with zero incomplete tasks (long window in
+        // Manual Cycle mode: everything checked, cycle not yet completed), and
+        // resetting tasks to incomplete never restarted it — reminders stayed
+        // silent for the whole new cycle. Every reset path (auto cycle AND
+        // manual Complete via markAllTasksCompleteImpl) funnels through
+        // resetTasksImpl's POST_RESET_CLEANUP timeout, so asserting the re-arm
+        // there covers both. startReminders is injected module-level (the
+        // cleanup timeout reads _deps, not the per-call deps).
+        const taskList = document.createElement('ul');
+        document.body.appendChild(taskList);
+        const stateObj = {
+            appState: { activeRoutineId: 'c1' },
+            metadata: { lastModified: 0 },
+            data: { routine: { c1: { autoReset: true, tasks: [{ id: 'A', completed: true }], recurringTemplates: {} } } },
+            settings: {}, userProgress: {}
+        };
+        let reArmed = 0;
+        mod.setTaskCycleResetDependencies({ startReminders: () => { reArmed++; } });
+        const deps = {
+            AppState: { isReady: () => true, get: () => stateObj, update: async (p) => { p(stateObj); return stateObj; } },
+            captureStateSnapshot: () => {},
+            isPerformingUndoRedo: () => false,
+            querySelector: () => taskList,
+            querySelectorAll: () => [],
+            checkMiniCycle: () => {},
+            incrementCycleCount: () => {}
+        };
+        try {
+            await mod.resetTasksImpl(deps);
+            // POST_RESET_CLEANUP is 500ms — wait past it BEFORE clearing timeouts.
+            await new Promise(r => setTimeout(r, 700));
+            if (reArmed === 0) throw new Error('reset must call startReminders in its cleanup phase (reminders stayed dead for the new cycle)');
+        } finally {
+            mod.clearAllTimeouts();
+            mod.setTaskCycleResetDependencies({ startReminders: null });
+            taskList.remove();
+        }
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">📊 Reset counts the tasks it deletes</h4>';
+
+    // resetTasksImpl and deleteCompletedTasksImpl BOTH delete deleteWhenComplete
+    // tasks and both archive them, but only the latter advanced
+    // userProgress.totalTasksCompleted. In To-Do mode finishing the last task
+    // completes the CYCLE and lands here, so the counter never moved and no
+    // task-count achievement could unlock — the archive filled while the number
+    // behind it stayed at zero.
+    function makeResetHarness(tasks) {
+        const taskList = document.createElement('ul');
+        taskList.id = 'taskList';
+        tasks.forEach(t => {
+            const li = document.createElement('li');
+            li.className = t.recurring ? 'task recurring' : 'task';
+            li.dataset.taskId = t.id;
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = true;
+            li.appendChild(cb);
+            taskList.appendChild(li);
+        });
+        document.body.appendChild(taskList);
+        const stateObj = {
+            appState: { activeRoutineId: 'c1' },
+            settings: { disableCompletionAnimation: true },
+            data: { routine: { c1: { tasks: tasks.map(t => ({ ...t, completed: true })), cycleCount: 0 } } },
+            userProgress: {}
+        };
+        const AppState = {
+            isReady: () => true,
+            get: () => stateObj,
+            update: async (producer) => { await producer(stateObj); return stateObj; }
+        };
+        return { taskList, stateObj, deps: { AppState, querySelector: (sel) => sel === '#taskList' ? taskList : null } };
+    }
+
+    await test('reset advances totalTasksCompleted by the tasks it deleted', async () => {
+        const h = makeResetHarness([
+            { id: 'A', text: 'A', autoClear: { cycle: true, todo: true } },
+            { id: 'B', text: 'B', autoClear: { cycle: true, todo: true } },
+            { id: 'C', text: 'C', autoClear: { cycle: false, todo: true } }
+        ]);
+        try {
+            await mod.resetTasksImpl(h.deps);
+            await new Promise(r => setTimeout(r, 150));
+            const got = h.stateObj.userProgress.totalTasksCompleted;
+            if (got !== 2) {
+                throw new Error(`Expected 2 deleted tasks counted, got ${got}`);
+            }
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('reset does not count recurring occurrences toward the total', async () => {
+        // A recurring occurrence is scheduled to return, so counting it would
+        // inflate the cleared-task milestones — the same rule the Clear
+        // Completed path documents. It still reaches achievements via cycles.
+        const h = makeResetHarness([
+            { id: 'A', text: 'A', autoClear: { cycle: true, todo: true } },
+            { id: 'R', text: 'R', recurring: true, autoClear: { cycle: true, todo: true } }
+        ]);
+        try {
+            await mod.resetTasksImpl(h.deps);
+            await new Promise(r => setTimeout(r, 150));
+            const got = h.stateObj.userProgress.totalTasksCompleted;
+            if (got !== 1) {
+                throw new Error(`Recurring occurrence must not count; expected 1, got ${got}`);
+            }
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">📝 Manual vs button completion breakdown</h4>';
+
+    // Shared rig: 4 tasks, 2 already checked by the user. Manual Cycle mode
+    // (autoReset false) is the case the breakdown exists for.
+    const splitRig = (tasks, cycleId = 'c1') => {
+        const taskList = document.createElement('ul');
+        document.body.appendChild(taskList);
+        const stateObj = {
+            appState: { activeRoutineId: cycleId },
+            metadata: { lastModified: 0 },
+            data: { routine: { [cycleId]: { autoReset: false, tasks, recurringTemplates: {} } } },
+            settings: {}, userProgress: {}
+        };
+        const calls = [];
+        const deps = {
+            AppState: { isReady: () => true, get: () => stateObj, update: async (p) => { p(stateObj); return stateObj; } },
+            captureStateSnapshot: () => {},
+            isPerformingUndoRedo: () => false,
+            querySelector: () => taskList,
+            querySelectorAll: () => [],
+            checkMiniCycle: () => {},
+            incrementCycleCount: (...args) => calls.push(args)
+        };
+        return { taskList, stateObj, calls, deps, cycleData: stateObj.data.routine[cycleId] };
+    };
+
+    await test('REGRESSION (a11y): markAllTasksCompleteImpl sets each row\'s spoken status WITH the checkbox, before the reset', async () => {
+        // The reset ~1s later repaired the labels, but in between a screen reader
+        // read "Not completed" over a checked box (accessibility audit, Oct 2026).
+        const h = splitRig([
+            { id: 'a', text: 'Make coffee', completed: false },
+            { id: 'b', text: 'Stretch', completed: false }
+        ]);
+        const rows = h.cycleData.tasks.map(t => {
+            const li = document.createElement('li');
+            li.className = 'task';
+            li.dataset.taskId = t.id;
+            li.setAttribute('aria-label', `${t.text}, Not completed`);
+            const cb = document.createElement('input'); cb.type = 'checkbox';
+            const span = document.createElement('span'); span.className = 'task-text'; span.textContent = t.text;
+            li.append(cb, span);
+            h.taskList.appendChild(li);
+            return li;
+        });
+        try {
+            mod.markAllTasksCompleteImpl(h.cycleData, h.taskList, null, h.deps);
+            // Assert IMMEDIATELY — the deferred reset must not be what fixes it.
+            for (const li of rows) {
+                const name = li.querySelector('.task-text').textContent;
+                const label = li.getAttribute('aria-label') || '';
+                if (!li.querySelector('input').checked) throw new Error(`"${name}" box should be checked`);
+                if (/not completed/i.test(label)) throw new Error(`"${name}" still announces "Not completed" over a checked box: "${label}"`);
+                if (!/,\s*completed$/i.test(label)) throw new Error(`"${name}" spoken status should end with "Completed", got "${label}"`);
+            }
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('a reset stores the planned template position so the recurring task returns in place', async () => {
+        // The producer applies the recurring plan; the plan now carries the index the
+        // removed instance sat at. Without this write the watcher appends and the
+        // task comes back at the bottom of the routine.
+        const h = splitRig([
+            { id: 'a', text: 'A', completed: true },
+            { id: 'r', text: 'Recurring', completed: true, recurring: true, autoClear: { cycle: true, todo: true } },
+            { id: 'b', text: 'B', completed: true }
+        ]);
+        h.cycleData.recurringTemplates = { r: { id: 'r', recurringSettings: { frequency: 'daily' }, nextScheduledOccurrence: 1 } };
+        h.deps.removeRecurringTasksFromCycle = () => ({
+            removedIds: ['r'], keptIds: [],
+            templateUpdates: { r: { nextScheduledOccurrence: 2, lastTriggeredTimestamp: null, position: 1 } }
+        });
+        try {
+            await mod.resetTasksImpl(h.deps);
+            const tmpl = h.stateObj.data.routine.c1.recurringTemplates.r;
+            if (tmpl.position !== 1) throw new Error(`template.position should be 1, got ${tmpl.position}`);
+            if (h.stateObj.data.routine.c1.tasks.some(t => t.id === 'r')) throw new Error('the recurring instance should have been removed');
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('a reset clears the due date of a recurring template whose instance it removed', async () => {
+        // The date belonged to the cleared occurrence; left on the template it
+        // came back on every recurrence, since the watcher builds the next
+        // instance from the template (Oct 2026). Kept instances keep theirs.
+        const h = splitRig([
+            { id: 'r', text: 'Recurring', completed: true, recurring: true, dueDate: '2026-10-01', autoClear: { cycle: true, todo: true } },
+            { id: 'k', text: 'Kept recurring', completed: true, recurring: true, dueDate: '2026-10-02', autoClear: { cycle: false, todo: true } }
+        ]);
+        h.cycleData.recurringTemplates = {
+            r: { id: 'r', recurringSettings: { frequency: 'daily' }, nextScheduledOccurrence: 1, dueDate: '2026-10-01' },
+            k: { id: 'k', recurringSettings: { frequency: 'daily' }, nextScheduledOccurrence: 1, dueDate: '2026-10-02' }
+        };
+        h.deps.removeRecurringTasksFromCycle = () => ({
+            removedIds: ['r'], keptIds: ['k'],
+            templateUpdates: {
+                r: { nextScheduledOccurrence: 2, lastTriggeredTimestamp: null, position: 0 },
+                k: { nextScheduledOccurrence: 2, lastTriggeredTimestamp: null, position: 1 }
+            }
+        });
+        try {
+            await mod.resetTasksImpl(h.deps);
+            const templates = h.stateObj.data.routine.c1.recurringTemplates;
+            if (templates.r.dueDate !== null) throw new Error(`removed template should have no due date, got ${templates.r.dueDate}`);
+            if (templates.k.dueDate !== '2026-10-02') throw new Error(`kept template's due date should survive, got ${templates.k.dueDate}`);
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('a To-Do clear records where a cleared recurring instance sat', async () => {
+        const container = document.createElement('div');
+        const taskList = document.createElement('ul');
+        for (const id of ['x', 'r']) {
+            const li = document.createElement('li');
+            li.className = 'task';
+            li.dataset.taskId = id;
+            const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true;
+            li.appendChild(cb);
+            taskList.appendChild(li);
+        }
+        container.appendChild(taskList);
+        document.body.appendChild(container);
+
+        const stateObj = {
+            appState: { activeRoutineId: 'c1' },
+            data: { routine: { c1: {
+                tasks: [
+                    { id: 'x', text: 'X', completed: true, autoClear: { cycle: true, todo: true } },
+                    { id: 'r', text: 'R', completed: true, recurring: true, autoClear: { cycle: true, todo: true } }
+                ],
+                recurringTemplates: { r: { id: 'r', recurringSettings: { frequency: 'daily' } } }
+            } } },
+            userProgress: {}
+        };
+        const AppState = { isReady: () => true, get: () => stateObj, update: async (p) => { p(stateObj); return stateObj; } };
+        try {
+            await mod.deleteCompletedTasksImpl('c1', stateObj.data.routine.c1, taskList, { AppState });
+            const tmpl = stateObj.data.routine.c1.recurringTemplates.r;
+            if (tmpl.position !== 1) throw new Error(`template.position should be 1 (second in the list), got ${tmpl.position}`);
+        } finally {
+            mod.clearAllTimeouts();
+            container.remove();
+        }
+    });
+
+    await test('breakdown separates user-checked tasks from button-completed ones', async () => {
+        const h = splitRig([
+            { id: 'a', text: 'Make coffee', completed: true },
+            { id: 'b', text: 'Stretch', completed: true },
+            { id: 'c', text: 'Dishes', completed: false },
+            { id: 'd', text: 'Laundry', completed: false }
+        ]);
+        try {
+            mod.markAllTasksCompleteImpl(h.cycleData, h.taskList, null, h.deps);
+            await mod.resetTasksImpl(h.deps);
+            const split = h.calls[0]?.[2];
+            if (!split) throw new Error('incrementCycleCount received no breakdown as its 3rd argument');
+            if (split.manualCount !== 2 || split.autoCount !== 2) {
+                throw new Error(`expected 2 manual / 2 auto, got ${split.manualCount} / ${split.autoCount}`);
+            }
+            if (split.manualNames.join(',') !== 'Make coffee,Stretch') {
+                throw new Error(`manual names wrong: ${JSON.stringify(split.manualNames)}`);
+            }
+            if (split.autoNames.join(',') !== 'Dishes,Laundry') {
+                throw new Error(`button names wrong: ${JSON.stringify(split.autoNames)}`);
+            }
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('pressing the button with everything already checked records autoCount 0', async () => {
+        // Captured even though one side is empty: the breakdown's PRESENCE is
+        // what says the button was pressed, and the renderer collapses this to
+        // "All 2 tasks checked off". Bailing here would make it indistinguishable
+        // from a cycle that completed naturally.
+        const h = splitRig([
+            { id: 'a', text: 'Make coffee', completed: true },
+            { id: 'b', text: 'Stretch', completed: true }
+        ]);
+        try {
+            mod.markAllTasksCompleteImpl(h.cycleData, h.taskList, null, h.deps);
+            await mod.resetTasksImpl(h.deps);
+            const split = h.calls[0]?.[2];
+            if (!split) throw new Error('a button press must always record a breakdown');
+            if (split.manualCount !== 2 || split.autoCount !== 0) {
+                throw new Error(`expected 2 manual / 0 auto, got ${split.manualCount} / ${split.autoCount}`);
+            }
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('pressing the button with nothing checked records manualCount 0', async () => {
+        const h = splitRig([
+            { id: 'a', text: 'Make coffee', completed: false },
+            { id: 'b', text: 'Stretch', completed: false }
+        ]);
+        try {
+            mod.markAllTasksCompleteImpl(h.cycleData, h.taskList, null, h.deps);
+            await mod.resetTasksImpl(h.deps);
+            const split = h.calls[0]?.[2];
+            if (!split) throw new Error('expected a breakdown');
+            if (split.manualCount !== 0 || split.autoCount !== 2) {
+                throw new Error(`expected 0 manual / 2 auto, got ${split.manualCount} / ${split.autoCount}`);
+            }
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('a reset with no preceding Complete Cycle carries no breakdown', async () => {
+        // Auto Cycle mode completing naturally (user checks the last box) never
+        // runs the mass-complete, so there is nothing to attribute.
+        const h = splitRig([{ id: 'a', text: 'Make coffee', completed: true }]);
+        try {
+            await mod.resetTasksImpl(h.deps);
+            if (h.calls[0]?.[2]) throw new Error('a natural completion must carry no breakdown');
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('a breakdown never attaches to a different cycle', async () => {
+        // Guards the stranded-capture case: the user presses Complete Cycle,
+        // declines the due-date modal, then switches routines and completes THAT
+        // one. Without the cycle-id check the first routine's task names would be
+        // reported as belonging to the second.
+        const h = splitRig([
+            { id: 'a', text: 'Make coffee', completed: true },
+            { id: 'b', text: 'Dishes', completed: false }
+        ], 'c1');
+        try {
+            mod.markAllTasksCompleteImpl(h.cycleData, h.taskList, null, h.deps);
+            // Reset a DIFFERENT cycle than the one the breakdown was captured for.
+            h.stateObj.appState.activeRoutineId = 'c2';
+            h.stateObj.data.routine.c2 = { autoReset: false, tasks: [{ id: 'z', text: 'Other', completed: true }], recurringTemplates: {} };
+            await mod.resetTasksImpl(h.deps);
+            if (h.calls[0]?.[2]) throw new Error('a breakdown captured for c1 must not be logged against c2');
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    await test('stored task names are capped so history cannot outgrow storage', async () => {
+        // 150 tasks x 500 chars x 100 events would exceed the localStorage quota
+        // outright, so the name lists are truncated at capture. Counts stay exact.
+        const { LIMITS } = await import(`../modules/core/constants.js?v=${cacheBuster}`);
+        const many = Array.from({ length: LIMITS.HISTORY_EVENT_TASK_NAMES + 7 }, (_, i) => ({
+            id: `t${i}`, text: `Task ${i}`, completed: false
+        }));
+        const h = splitRig([{ id: 'done', text: 'Done', completed: true }, ...many]);
+        try {
+            mod.markAllTasksCompleteImpl(h.cycleData, h.taskList, null, h.deps);
+            await mod.resetTasksImpl(h.deps);
+            const split = h.calls[0]?.[2];
+            if (!split) throw new Error('expected a breakdown');
+            if (split.autoCount !== many.length) {
+                throw new Error(`count must stay exact: expected ${many.length}, got ${split.autoCount}`);
+            }
+            if (split.autoNames.length !== LIMITS.HISTORY_EVENT_TASK_NAMES) {
+                throw new Error(`names must cap at ${LIMITS.HISTORY_EVENT_TASK_NAMES}, got ${split.autoNames.length}`);
+            }
+        } finally {
+            mod.clearAllTimeouts();
+            h.taskList.remove();
+        }
+    });
+
+    // AppState is required() on the reset path (STATE_TRUTH_MIGRATION #15). Mark-all used
+    // to skip its state write silently when AppState was missing, leaving the checkboxes
+    // ticked with nothing saved. It must now fail where it happens.
+    await test('markAllTasksCompleteImpl throws when AppState is not wired (no silent DOM-only completion)', () => {
+        mod.setTaskCycleResetDependencies({ AppState: null });
+        let message = null;
+        try {
+            mod.markAllTasksCompleteImpl({ tasks: [] }, document.createElement('ul'), () => {}, {});
+        } catch (error) {
+            message = error.message;
+        } finally {
+            mod.setTaskCycleResetDependencies({
+                AppState: { get: () => ({ settings: {}, appState: {}, data: { routine: {} } }), update: () => {}, isReady: () => false }
+            });
+        }
+        if (!message || !message.includes('isReady')) {
+            throw new Error(`expected a TypeError reading isReady, got ${message === null ? 'no throw — the write was skipped silently' : message}`);
+        }
+    });
+
+    // ============================================
+    const percentage = Math.round((passed.count / total.count) * 100);
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${percentage}%)</h3>`;
+    if (passed.count === total.count) {
+        resultsDiv.innerHTML += '<div class="result pass">✅ All tests passed!</div>';
+    } else {
+        resultsDiv.innerHTML += `<div class="result fail">⚠️ ${total.count - passed.count} test(s) failed</div>`;
+    }
+    return { passed: passed.count, total: total.count };
+}

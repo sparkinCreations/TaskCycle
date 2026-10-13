@@ -1,0 +1,865 @@
+/**
+ * Menu Manager Tests (DI-Pure)
+ *
+ * Tests for modules/ui/menuManager.js
+ * Pattern: Resilient Constructor + Module-level DI
+ *
+ * Uses dependency injection pattern - imports module directly
+ *
+ * Functions tested:
+ * - setupMainMenu() - Initialize menu event listeners
+ * - closeMainMenu() - Close menu modal
+ * - updateMainMenuHeader() - Update menu title and date
+ * - hideMainMenu() - Hide menu UI
+ * - closeMenuOnClickOutside() - Click-outside handler
+ * - saveMiniCycleAsNew() - Duplicate cycle (CRITICAL)
+ * - clearAllTasks() - Uncheck all tasks (CRITICAL)
+ * - deleteAllTasks() - Delete all tasks (CRITICAL)
+ */
+
+// Import module directly for DI testing (not via appContext which may not be populated)
+let MenuManager = null;
+let setMenuManagerDependencies = null;
+let initMenuManager = null;
+
+import { LIMITS } from '../modules/core/constants.js';
+
+export async function runMenuManagerTests(resultsDiv, isPartOfSuite = false) {
+    resultsDiv.innerHTML = '<h2>🎛️ Menu Manager Tests (DI-Pure)</h2><h3>Loading module...</h3>';
+
+    // Import the module directly for DI testing
+    try {
+        const cacheBuster = window.testCacheBuster || Date.now();
+        const module = await import(`../modules/ui/menuManager.js?v=${cacheBuster}`);
+        MenuManager = module.MenuManager;
+        setMenuManagerDependencies = module.setMenuManagerDependencies;
+        initMenuManager = module.initMenuManager;
+        resultsDiv.innerHTML = '<h2>🎛️ Menu Manager Tests (DI-Pure)</h2><h3>Running tests...</h3>';
+    } catch (e) {
+        resultsDiv.innerHTML = `<h2>🎛️ Menu Manager Tests</h2><div class="result fail">❌ Failed to import module: ${e.message}</div>`;
+        return { passed: 0, total: 1 };
+    }
+
+    // Check if class is available
+    if (!MenuManager) {
+        resultsDiv.innerHTML += '<div class="result fail">MenuManager class not found. Make sure the module is properly loaded.</div>';
+        return { passed: 0, total: 1 };
+    }
+
+    resultsDiv.innerHTML = '<h2>🎛️ Menu Manager Tests (DI-Pure)</h2>';
+    let passed = { count: 0 }, total = { count: 0 };
+
+    // 🔒 SAVE REAL APP DATA ONCE before all tests run (only when running individually)
+    let savedRealData = {};
+    if (!isPartOfSuite) {
+        const protectedKeys = ['miniCycleData', 'miniCycleForceFullVersion'];
+        protectedKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                savedRealData[key] = value;
+            }
+        });
+        console.log('🔒 Saved original localStorage for individual menuManager test');
+    }
+
+    // Helper to restore original data after all tests (only when running individually)
+    function restoreOriginalData() {
+        if (!isPartOfSuite) {
+            localStorage.clear();
+            Object.keys(savedRealData).forEach(key => {
+                localStorage.setItem(key, savedRealData[key]);
+            });
+            console.log('✅ Individual menuManager test completed - original localStorage restored');
+        }
+    }
+
+    // Create mock dependencies for DI-pure testing
+    function createMockDeps(overrides = {}) {
+        const mockFullSchema = {
+            metadata: {
+                version: "2.5",
+                lastModified: Date.now(),
+                totalRoutinesCreated: 1
+            },
+            settings: {
+                theme: 'default',
+                darkMode: false
+            },
+            data: { routine: {
+                    'cycle-1': {
+                        id: 'cycle-1',
+                        title: 'Test Cycle',
+                        tasks: [
+                            { id: 'task-1', text: 'Task 1', completed: false },
+                            { id: 'task-2', text: 'Task 2', completed: true }
+                        ],
+                        cycleCount: 5,
+                        autoReset: true
+                    }
+                }
+            },
+            appState: {
+                activeRoutineId: 'cycle-1',
+                currentMode: 'auto-cycle'
+            },
+            userProgress: {
+                cyclesCompleted: 10
+            }
+        };
+
+        const mockFlattenedData = {
+            cycles: mockFullSchema.data.routine,
+            activeCycle: mockFullSchema.appState.activeRoutineId
+        };
+
+        // AppState mock: must work both as a factory function (saveMiniCycleAsNew calls this.deps.AppState())
+        // AND as a direct object (loadCollapsedStates calls this.deps.AppState?.get()).
+        const appStateMethods = {
+            isReady: () => true,
+            get: () => mockFullSchema,
+            update: (fn) => { fn(mockFullSchema); }
+        };
+        const AppStateMock = Object.assign(
+            () => appStateMethods,
+            appStateMethods
+        );
+
+        return {
+            AppMeta: { version: '1.0.0-test' },
+            AppState: AppStateMock,
+            showNotification: () => {},
+            showPromptModal: (opts) => opts.callback && opts.callback(null),
+            showConfirmationModal: (opts) => opts.callback && opts.callback(false),
+            getElementById: () => document.createElement('div'),
+            querySelector: () => document.createElement('div'),
+            querySelectorAll: () => [],
+            safeAddEventListener: () => {},
+            switchMiniCycle: () => {},
+            createNewMiniCycle: () => {},
+            loadMiniCycle: () => {},
+            updateCycleModeDescription: () => {},
+            checkGamesUnlock: () => {},
+            sanitizeInput: (input) => input,
+            updateCycleData: () => true,
+            updateProgressBar: () => {},
+            updateStatsPanel: () => {},
+            checkCompleteAllButton: () => {},
+            updateUndoRedoButtons: () => {},
+            recurringPanel: { updateRecurringPanelButtonVisibility: () => {} },
+            ...overrides
+        };
+    }
+
+    // Initialize MenuManager to trigger dynamic imports (loads getObjectSizeBytes, canAddToStorage, etc.)
+    // This populates module-level variables that are otherwise only set via initMenuManager at runtime.
+    await initMenuManager(createMockDeps());
+
+    async function test(name, testFn) {
+        total.count++;
+        try {
+            // Reset environment before each test
+            localStorage.clear();
+
+            // Reset DOM state
+            document.body.className = '';
+
+            // Await async test bodies so their assertions are actually observed.
+            // Without this, an async testFn() returns a floating promise: the try
+            // block reaches passed.count++ and reports ✅ before the body runs, and
+            // any throw inside becomes an unhandled rejection this catch never sees.
+            // Async call sites therefore MUST use `await test(...)`.
+            const result = testFn();
+            if (result instanceof Promise) {
+                await result;
+            }
+            resultsDiv.innerHTML += `<div class="result pass">✅ ${name}</div>`;
+            passed.count++;
+        } catch (error) {
+            resultsDiv.innerHTML += `<div class="result fail">❌ ${name}: ${error.message}</div>`;
+            console.error(`Test failed: ${name}`, error);
+        }
+    }
+
+    // === INITIALIZATION TESTS ===
+    resultsDiv.innerHTML += '<h4>🔧 Initialization Tests</h4>';
+
+    test('MenuManager class exists', () => {
+        if (typeof MenuManager === 'undefined') {
+            throw new Error('MenuManager class not found');
+        }
+    });
+
+    test('creates instance with DI successfully', () => {
+        const mockDeps = createMockDeps();
+        setMenuManagerDependencies(mockDeps);
+        const instance = new MenuManager();
+        if (!instance || typeof instance.setupMainMenu !== 'function') {
+            throw new Error('MenuManager not properly initialized');
+        }
+    });
+
+    test('has version property via DI', () => {
+        const mockDeps = createMockDeps();
+        setMenuManagerDependencies(mockDeps);
+        const instance = new MenuManager();
+        if (!instance.version) {
+            throw new Error('Version property missing');
+        }
+        if (instance.version !== '1.0.0-test') {
+            throw new Error('Version should come from injected AppMeta');
+        }
+    });
+
+    test('accepts constructor dependency injection', () => {
+        const mockNotify = () => {};
+
+        const instance = new MenuManager({
+            showNotification: mockNotify,
+            AppState: () => ({ isReady: () => true, get: () => ({}) })
+        });
+
+        if (!instance) {
+            throw new Error('Dependency injection failed');
+        }
+    });
+
+    test('has fallback methods for notifications', () => {
+        setMenuManagerDependencies({});
+        const instance = new MenuManager();
+
+        // Check key fallback methods exist
+        if (typeof instance.fallbackNotification !== 'function') {
+            throw new Error('Missing fallbackNotification');
+        }
+        if (typeof instance.fallbackPromptModal !== 'function') {
+            throw new Error('Missing fallbackPromptModal');
+        }
+    });
+
+    test('initializes with false flags', () => {
+        setMenuManagerDependencies(createMockDeps());
+        const instance = new MenuManager();
+        if (instance._initialized !== false) {
+            throw new Error('_initialized should start as false');
+        }
+        if (instance._setupMainMenuInitialized !== false) {
+            throw new Error('_setupMainMenuInitialized should start as false');
+        }
+    });
+
+    // === CORE FUNCTIONALITY TESTS ===
+    resultsDiv.innerHTML += '<h4>⚡ Core Functionality (DI)</h4>';
+
+    test('setupMainMenu sets initialization flag (DI)', () => {
+        setMenuManagerDependencies(createMockDeps({
+            getElementById: () => document.createElement('button'),
+            safeAddEventListener: () => {}
+        }));
+        const instance = new MenuManager();
+
+        instance.setupMainMenu();
+
+        if (instance._setupMainMenuInitialized !== true) {
+            throw new Error('_setupMainMenuInitialized should be true after setupMainMenu');
+        }
+    });
+
+    test('setupMainMenu prevents duplicate runs (DI)', () => {
+        let eventCount = 0;
+        setMenuManagerDependencies(createMockDeps({
+            getElementById: () => document.createElement('button'),
+            safeAddEventListener: () => { eventCount++; }
+        }));
+        const instance = new MenuManager();
+
+        instance.setupMainMenu();
+        const firstCount = eventCount;
+
+        instance.setupMainMenu(); // Second call
+
+        if (eventCount !== firstCount) {
+            throw new Error('setupMainMenu should not run twice');
+        }
+    });
+
+    test('this.deps exposes activateFocusMode (curated-whitelist regression)', () => {
+        // Regression test for the silent-fail bug we hit during development:
+        // even with the dep wired through manifest + depMappings + DI definition,
+        // menuManager's `this.deps` is a literal object that explicitly
+        // enumerates which deps to expose. If `activateFocusMode` is dropped
+        // from that list, `this.deps.activateFocusMode?.()` becomes a silent
+        // no-op (the curated-whitelist failure pattern documented in
+        // feedback_di_consumer_surface).
+        const sentinel = () => 'focus-activated';
+        setMenuManagerDependencies(createMockDeps({ activateFocusMode: sentinel }));
+        const instance = new MenuManager();
+        if (instance.deps.activateFocusMode !== sentinel) {
+            throw new Error('this.deps.activateFocusMode missing from curated whitelist — would silently no-op in production');
+        }
+    });
+
+    test('Enter Focus View click invokes activateFocusMode (DI)', () => {
+        // End-to-end-ish: wire setupMainMenu against real button elements,
+        // dispatch a click on the menu's Enter Focus View button, and verify
+        // activateFocusMode is called. Catches both the curated-whitelist
+        // bug AND any regression in the click handler wiring itself.
+        let activateCalled = 0;
+        // Map of element-id → button. setupMainMenu calls getElementById
+        // multiple times; giving each id a stable button avoids cross-talk
+        // in replaceStoredEventListener (which stores the handler on the
+        // element under a fixed key).
+        const buttons = new Map();
+        const getOrMake = (id) => {
+            if (!buttons.has(id)) {
+                const btn = document.createElement('button');
+                btn.id = id;
+                buttons.set(id, btn);
+            }
+            return buttons.get(id);
+        };
+
+        setMenuManagerDependencies(createMockDeps({
+            getElementById: getOrMake,
+            activateFocusMode: () => { activateCalled++; }
+        }));
+        const instance = new MenuManager();
+
+        // hideMainMenu uses querySelector, not getElementById — stub it so
+        // it doesn't throw when the click handler invokes it.
+        instance.hideMainMenu = () => {};
+
+        instance.setupMainMenu();
+
+        // The click handler defers activateFocusMode via setTimeout(fn, 0)
+        // (so the menu close transition starts before the focus-mode
+        // activation). Stub setTimeout to run synchronously for this test
+        // so the sync `test()` wrapper can observe the result.
+        const realSetTimeout = window.setTimeout;
+        window.setTimeout = (fn) => { fn(); return 0; };
+        try {
+            const focusBtn = getOrMake('menu-enter-focus-view');
+            focusBtn.dispatchEvent(new Event('click'));
+        } finally {
+            window.setTimeout = realSetTimeout;
+        }
+
+        if (activateCalled !== 1) {
+            throw new Error(`activateFocusMode should fire exactly once, got ${activateCalled}`);
+        }
+    });
+
+    test('closeMainMenu hides menu container (DI)', () => {
+        const menu = document.createElement('div');
+        menu.className = 'menu-container visible';
+
+        setMenuManagerDependencies(createMockDeps({
+            querySelector: () => menu
+        }));
+        const instance = new MenuManager();
+
+        instance.elements.menu = menu;
+        instance.closeMainMenu();
+
+        if (menu.classList.contains('visible')) {
+            throw new Error('Menu should not have visible class');
+        }
+    });
+
+    test('hideMainMenu hides menu container (DI)', () => {
+        const menu = document.createElement('div');
+        menu.className = 'menu-container visible';
+
+        // querySelector injected via DI system
+        setMenuManagerDependencies(createMockDeps({
+            querySelector: () => menu
+        }));
+        const instance = new MenuManager();
+
+        instance.hideMainMenu();
+
+        if (menu.classList.contains('visible')) {
+            throw new Error('Menu should not have visible class');
+        }
+    });
+
+    // === CRITICAL OPERATIONS TESTS ===
+    resultsDiv.innerHTML += '<h4>🔴 Critical Operations (DI)</h4>';
+
+    await test('clearAllTasks unchecks all tasks (DI)', async () => {
+        let updatedCycle = null;
+        const mockFlattenedData = {
+            cycles: {
+                'cycle-1': {
+                    tasks: [
+                        { id: 'task-1', text: 'Task 1', completed: true },
+                        { id: 'task-2', text: 'Task 2', completed: true }
+                    ]
+                }
+            },
+            activeCycle: 'cycle-1'
+        };
+
+        setMenuManagerDependencies(createMockDeps({
+            updateCycleData: (id, updateFn, save) => {
+                updatedCycle = { tasks: JSON.parse(JSON.stringify(mockFlattenedData.cycles[id].tasks)) };
+                updateFn(updatedCycle);
+                return true;
+            },
+            querySelectorAll: () => [],
+            updateProgressBar: () => {},
+            updateStatsPanel: () => {},
+            checkCompleteAllButton: () => {},
+            updateUndoRedoButtons: () => {}
+        }));
+        const instance = new MenuManager();
+
+        await instance.clearAllTasks();
+
+        // Verify all tasks were unchecked
+        if (!updatedCycle || updatedCycle.tasks.some(t => t.completed)) {
+            throw new Error('All tasks should be unchecked');
+        }
+    });
+
+    await test('REGRESSION (a11y): clearAllTasks rewrites each row\'s spoken status, not just the checkbox', async () => {
+        // The existing test above supplies no rows (querySelectorAll: () => []),
+        // so it never checked the accessible name. Measured Oct 2026: after
+        // Uncheck All a screen reader still read "Make the bed, Completed" over
+        // an unchecked box until the next re-render.
+        const rows = ['Make the bed', 'Water plants'].map(name => {
+            const li = document.createElement('li');
+            li.className = 'task';
+            li.setAttribute('aria-label', `${name}, Completed`);
+            const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true;
+            const span = document.createElement('span'); span.className = 'task-text'; span.textContent = name;
+            li.append(cb, span);
+            document.body.appendChild(li);
+            return li;
+        });
+        const mockFlattenedData = {
+            cycles: { 'cycle-1': { tasks: [
+                { id: 'task-1', text: 'Make the bed', completed: true },
+                { id: 'task-2', text: 'Water plants', completed: true }
+            ] } },
+            activeCycle: 'cycle-1'
+        };
+        setMenuManagerDependencies(createMockDeps({
+            updateCycleData: (id, updateFn) => { const c = { tasks: JSON.parse(JSON.stringify(mockFlattenedData.cycles[id].tasks)) }; updateFn(c); return true; },
+            querySelectorAll: () => rows,
+            updateProgressBar: () => {},
+            updateStatsPanel: () => {},
+            checkCompleteAllButton: () => {},
+            updateUndoRedoButtons: () => {}
+        }));
+        try {
+            const instance = new MenuManager();
+            await instance.clearAllTasks();
+            for (const li of rows) {
+                const label = li.getAttribute('aria-label') || '';
+                const name = li.querySelector('.task-text').textContent;
+                if (li.querySelector('input').checked) throw new Error(`"${name}" checkbox should be unchecked`);
+                if (!/not completed/i.test(label)) throw new Error(`"${name}" spoken status should say "Not completed", got "${label}"`);
+                if (/,\s*completed$/i.test(label)) throw new Error(`"${name}" still announces "Completed": "${label}"`);
+                if (!label.startsWith(name)) throw new Error(`accessible name should keep the task name first, got "${label}"`);
+            }
+        } finally {
+            rows.forEach(li => li.remove());
+        }
+    });
+
+    await test('REGRESSION: clearAllTasks and deleteAllTasks refresh the help-window status', async () => {
+        // The status panel ("N tasks remaining") re-renders only when asked.
+        // Both bulk actions refreshed the progress bar, stats and Complete All
+        // button but not the panel, so it kept the pre-bulk count.
+        let refreshes = 0;
+        const mockFlattenedData = {
+            cycles: { 'cycle-1': { title: 'Test Cycle', tasks: [
+                { id: 'task-1', text: 'Task 1', completed: true },
+                { id: 'task-2', text: 'Task 2', completed: false }
+            ] } },
+            activeCycle: 'cycle-1'
+        };
+        setMenuManagerDependencies(createMockDeps({
+            updateCycleData: (id, updateFn) => { const c = { tasks: JSON.parse(JSON.stringify(mockFlattenedData.cycles[id].tasks)) }; updateFn(c); return true; },
+            showConfirmationModal: (opts) => opts.callback(true),
+            querySelectorAll: () => [],
+            updateProgressBar: () => {},
+            updateStatsPanel: () => {},
+            checkCompleteAllButton: () => {},
+            updateUndoRedoButtons: () => {},
+            updateHelpWindow: () => { refreshes++; }
+        }));
+        const instance = new MenuManager();
+        await instance.clearAllTasks();
+        if (refreshes !== 1) throw new Error(`clearAllTasks should refresh the status panel once, got ${refreshes}`);
+        await instance.deleteAllTasks();
+        await new Promise(r => setTimeout(r, 50));
+        if (refreshes !== 2) throw new Error(`deleteAllTasks should refresh the status panel too, got ${refreshes} total`);
+    });
+
+    await test('deleteAllTasks removes all tasks (DI)', async () => {
+        let updatedCycle = null;
+        const mockFlattenedData = {
+            cycles: {
+                'cycle-1': {
+                    title: 'Test Cycle',
+                    tasks: [
+                        { id: 'task-1', text: 'Task 1', completed: false },
+                        { id: 'task-2', text: 'Task 2', completed: true }
+                    ]
+                }
+            },
+            activeCycle: 'cycle-1'
+        };
+
+        setMenuManagerDependencies(createMockDeps({
+            showConfirmationModal: (opts) => opts.callback(true), // User confirms
+            updateCycleData: (id, updateFn, save) => {
+                updatedCycle = { tasks: [], recurringTemplates: {} };
+                updateFn(updatedCycle);
+                return true;
+            },
+            getElementById: () => ({ innerHTML: '' }),
+            updateProgressBar: () => {},
+            updateStatsPanel: () => {},
+            checkCompleteAllButton: () => {},
+            updateUndoRedoButtons: () => {}
+        }));
+        const instance = new MenuManager();
+
+        instance.deleteAllTasks();
+
+        // Wait a tick for callback to execute
+        await new Promise(resolve => setTimeout(resolve, 10));
+
+        // Verify all tasks were deleted
+        if (!updatedCycle || updatedCycle.tasks.length !== 0) {
+            throw new Error('All tasks should be deleted');
+        }
+    });
+
+    test('saveMiniCycleAsNew creates new cycle (DI)', () => {
+        let newCycleName = null;
+        let stateUpdated = false;
+        const mockFullSchema = {
+            metadata: { totalRoutinesCreated: 1, lastModified: Date.now() },
+            data: { routine: {
+                    'cycle-1': { id: 'cycle-1', title: 'Test Cycle', tasks: [] }
+                }
+            },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        setMenuManagerDependencies(createMockDeps({
+            AppState: () => ({
+                isReady: () => true,
+                get: () => mockFullSchema,
+                update: (updateFn, immediate) => {
+                    const stateCopy = JSON.parse(JSON.stringify(mockFullSchema));
+                    updateFn(stateCopy);
+                    newCycleName = Object.keys(stateCopy.data.routine).find(k => k !== 'cycle-1');
+                    stateUpdated = true;
+                }
+            }),
+            showPromptModal: (opts) => opts.callback('New Cycle Name'),
+            sanitizeInput: (input) => input.trim(),
+            showNotification: () => {},
+            loadMiniCycle: () => {}
+        }));
+        const instance = new MenuManager();
+
+        instance.hideMainMenu = () => {};
+        instance.saveMiniCycleAsNew();
+
+        if (!stateUpdated) {
+            throw new Error('State should be updated');
+        }
+        if (!newCycleName) {
+            throw new Error('New cycle should be created');
+        }
+    });
+
+    test('REGRESSION: duplicating with an over-long name warns that it was truncated (DI)', () => {
+        // The real sanitizeInput clamps to LIMITS.CYCLE_NAME_CHARACTER, so the
+        // copy's name used to be cut silently. Faithful clamping mock here.
+        const limit = LIMITS.CYCLE_NAME_CHARACTER;
+        const notifications = [];
+        let newCycleName = null;
+        const mockFullSchema = {
+            metadata: { totalRoutinesCreated: 1, lastModified: Date.now() },
+            data: { routine: { 'cycle-1': { id: 'cycle-1', title: 'Test Cycle', tasks: [] } } },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        setMenuManagerDependencies(createMockDeps({
+            AppState: () => ({
+                isReady: () => true,
+                get: () => mockFullSchema,
+                update: (updateFn) => {
+                    const stateCopy = JSON.parse(JSON.stringify(mockFullSchema));
+                    updateFn(stateCopy);
+                    newCycleName = Object.keys(stateCopy.data.routine).find(k => k !== 'cycle-1');
+                }
+            }),
+            showPromptModal: (opts) => opts.callback('d'.repeat(limit + 40)),
+            sanitizeInput: (input, maxLength = limit) => input.trim().substring(0, maxLength),
+            showNotification: (msg, type) => notifications.push({ msg: String(msg), type }),
+            loadMiniCycle: () => {}
+        }));
+        const instance = new MenuManager();
+        instance.hideMainMenu = () => {};
+        instance.saveMiniCycleAsNew();
+
+        const warned = notifications.find(n => /truncated/i.test(n.msg) && n.msg.includes(String(limit)));
+        if (!warned) throw new Error(`expected a truncation warning, got: ${JSON.stringify(notifications.map(n => n.msg))}`);
+        if (warned.type !== 'warning') throw new Error(`expected type "warning", got "${warned.type}"`);
+        if (!newCycleName || newCycleName.length !== limit) {
+            throw new Error(`copy should be stored under a ${limit}-char name, got ${newCycleName ? newCycleName.length : 'none'}`);
+        }
+    });
+
+    // === ERROR HANDLING TESTS ===
+    resultsDiv.innerHTML += '<h4>🛡️ Error Handling (DI)</h4>';
+
+    test('handles missing menu element gracefully (DI)', () => {
+        setMenuManagerDependencies(createMockDeps({
+            querySelector: () => null
+        }));
+        const instance = new MenuManager();
+
+        // Should not throw
+        instance.closeMainMenu();
+        instance.hideMainMenu();
+    });
+
+    await test('shows an error notification when Schema 2.5 data is missing (DI)', async () => {
+        let notified = null;
+        setMenuManagerDependencies(createMockDeps({
+            AppState: () => null,  // missing data → early guard
+            showNotification: (msg, type) => { notified = { msg, type }; }
+        }));
+        const instance = new MenuManager();
+
+        await instance.clearAllTasks();
+
+        // clearAllTasks does NOT throw on missing data (menuManager.js:621-624) — it surfaces
+        // an error notification and returns. The old test wrapped the async call in a SYNC
+        // try/catch (which can't catch an async rejection) AND expected a 'Schema 2.5 data not
+        // found' throw the source never emits — dead code with a wrong expectation.
+        if (!notified) throw new Error('missing data should surface a notification');
+        if (notified.type !== 'error') throw new Error(`expected an error notification, got type ${notified.type}`);
+    });
+
+    test('handles user cancellation in saveMiniCycleAsNew (DI)', () => {
+        const mockFullSchema = {
+            data: { routine: { 'cycle-1': { title: 'Test' } } },
+            appState: { activeRoutineId: 'cycle-1' }
+        };
+
+        setMenuManagerDependencies(createMockDeps({
+            AppState: () => ({
+                isReady: () => true,
+                get: () => mockFullSchema
+            }),
+            showPromptModal: (opts) => opts.callback(null), // User cancelled
+            showNotification: () => {},
+            createNewMiniCycle: () => { throw new Error('Should not be called'); }
+        }));
+        const instance = new MenuManager();
+
+        // Should handle cancellation gracefully
+        instance.saveMiniCycleAsNew();
+    });
+
+    test('handles user cancellation in deleteAllTasks (DI)', () => {
+        setMenuManagerDependencies(createMockDeps({
+            showConfirmationModal: (opts) => opts.callback(false), // User cancelled
+            updateCycleData: () => { throw new Error('Should not be called'); },
+            showNotification: () => {}
+        }));
+        const instance = new MenuManager();
+
+        // Should handle cancellation gracefully
+        instance.deleteAllTasks();
+    });
+
+    // === DOM INTERACTION TESTS ===
+    resultsDiv.innerHTML += '<h4>🌐 DOM Interaction (DI)</h4>';
+
+    test('updateMainMenuHeader updates cycle name (DI)', () => {
+        const header = document.createElement('h2');
+        header.id = 'menu-header';
+
+        const mockFlattenedData = {
+            cycles: { 'cycle-1': { title: 'Test Cycle', cycleCount: 5 } },
+            activeCycle: 'cycle-1'
+        };
+
+        // getElementById injected via DI system
+        const getElementByIdMock = (id) => {
+            if (id === 'main-menu-mini-cycle-title') return header;
+            if (id === 'current-date') return document.createElement('span');
+            return null;
+        };
+
+        setMenuManagerDependencies(createMockDeps({
+            getElementById: getElementByIdMock
+        }));
+        const instance = new MenuManager();
+
+        instance.updateMainMenuHeader();
+
+        if (!header.textContent.includes('Test Cycle')) {
+            throw new Error('Header should show cycle name');
+        }
+    });
+
+    // === INTEGRATION TESTS ===
+    resultsDiv.innerHTML += '<h4>🔗 Integration Tests (DI)</h4>';
+
+    test('integrates with injected AppState (DI)', () => {
+        const mockAppState = {
+            isReady: () => true,
+            get: () => ({ data: {}, appState: {} })
+        };
+
+        setMenuManagerDependencies(createMockDeps({
+            AppState: () => mockAppState
+        }));
+        const instance = new MenuManager();
+
+        // Should be able to access AppState
+        const state = instance.deps.AppState();
+        if (!state || !state.get) {
+            throw new Error('AppState integration failed');
+        }
+    });
+
+    await test('clears (unchecks) tasks via updateCycleData when a cycle is active (DI)', async () => {
+        let clearedCycleId = null;
+        const cycle = { title: 'Test', tasks: [{ id: 't1', completed: true }] };
+        setMenuManagerDependencies(createMockDeps({
+            AppState: () => ({
+                isReady: () => true,
+                get: () => ({ data: { routine: { 'cycle-1': cycle } }, appState: { activeRoutineId: 'cycle-1' } })
+            }),
+            updateCycleData: (id, updateFn) => { clearedCycleId = id; updateFn(cycle); return true; },
+            querySelectorAll: () => [],
+            getElementById: () => ({ textContent: '' })
+        }));
+        const instance = new MenuManager();
+
+        await instance.clearAllTasks();
+
+        // With an active cycle, clearAllTasks routes through updateCycleData to uncheck tasks.
+        // The old test was `instance.clearAllTasks().catch(()=>{})` with no assertion — it
+        // could never fail. (Its "fallback mode when AppState null" name was also misleading:
+        // clearAllTasks reads the active routine from AppState and writes via updateCycleData.)
+        if (clearedCycleId !== 'cycle-1') throw new Error('should update the active cycle via updateCycleData');
+        if (cycle.tasks[0].completed !== false) throw new Error('tasks should be unchecked');
+    });
+
+    // === GLOBAL COMPATIBILITY TESTS ===
+    resultsDiv.innerHTML += '<h4>🌍 Global Wrappers (Backward Compat)</h4>';
+
+    test('MenuManager class is exported from module', () => {
+        if (typeof MenuManager !== 'function') {
+            throw new Error('MenuManager not exported from module');
+        }
+    });
+
+
+    // === PERFORMANCE TESTS ===
+    resultsDiv.innerHTML += '<h4>⚡ Performance Tests (DI)</h4>';
+
+    test('setupMainMenu completes quickly (DI)', () => {
+        setMenuManagerDependencies(createMockDeps({
+            getElementById: () => document.createElement('button'),
+            safeAddEventListener: () => {}
+        }));
+        const instance = new MenuManager();
+
+        const startTime = performance.now();
+        instance.setupMainMenu();
+        const endTime = performance.now();
+
+        const duration = endTime - startTime;
+
+        if (duration > 100) { // 100ms threshold
+            throw new Error(`setupMainMenu took too long: ${duration.toFixed(2)}ms`);
+        }
+    });
+
+    test('closeMainMenu completes quickly (DI)', () => {
+        const menu = document.createElement('div');
+        menu.className = 'visible';
+        setMenuManagerDependencies(createMockDeps({
+            querySelector: () => menu
+        }));
+        const instance = new MenuManager();
+        instance.elements.menu = menu;
+
+        const startTime = performance.now();
+        instance.closeMainMenu();
+        const endTime = performance.now();
+
+        const duration = endTime - startTime;
+
+        if (duration > 50) { // 50ms threshold
+            throw new Error(`closeMainMenu took too long: ${duration.toFixed(2)}ms`);
+        }
+    });
+
+    // === EDGE CASES ===
+    resultsDiv.innerHTML += '<h4>🎯 Edge Cases (DI)</h4>';
+
+    test('handles empty cycle name in header (DI)', () => {
+        const header = document.createElement('h2');
+
+        setMenuManagerDependencies(createMockDeps({
+            getElementById: (id) => {
+                if (id === 'main-menu-mini-cycle-title') return header;
+                if (id === 'current-date') return document.createElement('span');
+                return null;
+            },
+            AppState: () => ({
+                isReady: () => true,
+                get: () => ({ data: { routine: { 'cycle-1': { title: '' } } }, appState: { activeRoutineId: 'cycle-1' } })
+            })
+        }));
+        const instance = new MenuManager();
+
+        // Should not throw
+        instance.updateMainMenuHeader();
+    });
+
+    await test('shows a notification when there is no active cycle to clear (DI)', async () => {
+        let notified = null;
+        setMenuManagerDependencies(createMockDeps({
+            AppState: () => ({ isReady: () => true, get: () => ({ data: { routine: {} }, appState: { activeRoutineId: null } }) }),
+            showNotification: (msg) => { notified = msg; }
+        }));
+        const instance = new MenuManager();
+
+        await instance.clearAllTasks();
+
+        // No active cycle (menuManager.js:630-634) → surfaces a notification and returns.
+        // The old test was `.catch(()=>{})` with no assertion.
+        if (!notified) throw new Error('missing active cycle should surface a notification');
+    });
+
+    // === SUMMARY ===
+    const percentage = Math.round((passed.count / total.count) * 100);
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${percentage}%)</h3>`;
+
+    if (passed.count === total.count) {
+        resultsDiv.innerHTML += '<div class="result pass">🎉 All tests passed!</div>';
+    } else {
+        resultsDiv.innerHTML += '<div class="result fail">⚠️ Some tests failed</div>';
+    }
+
+    // 🔓 RESTORE original localStorage data (only when running individually)
+    restoreOriginalData();
+
+    return { passed: passed.count, total: total.count };
+}

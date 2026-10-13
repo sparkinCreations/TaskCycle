@@ -1,0 +1,1574 @@
+/**
+ * Layout Overlap Regression Tests
+ * =============================================================================
+ * Drives the REAL app (miniCycle.html) across a matrix of viewport sizes and
+ * asserts the geometric invariants the responsive layout must hold — the ones
+ * the unit tests can't cover because they need real CSS layout:
+ *
+ *   - the routine title never overlaps the fixed header
+ *   - the help window never overlaps the Routine|Stats nav dots
+ *   - the task-view never overlaps the nav dots
+ *   - the stats panel never overlaps the header or the nav dots
+ *   - the static pages (product) never scroll sideways, at any width
+ *
+ * These are exactly the regressions that slipped through manual checking (a
+ * header-clearance fix that pushed the help window into the nav dots). One page
+ * is loaded once, then resized through the matrix so the live ResizeObserver
+ * path (--header-total-height / --nav-dots-clearance) is exercised, not just
+ * a fresh boot.
+ *
+ * Usage:
+ *   npm run test:layout            # headless, spawns its own server
+ *   node tests/automated/run-layout-overlap-tests.cjs --headed
+ *
+ * Exits 0 if every invariant holds at every viewport, 1 otherwise (CI-ready).
+ */
+
+const { chromium } = require('playwright');
+const path = require('path');
+const { startStaticServer } = require('./_static-server.cjs');
+
+const colors = {
+    reset: '\x1b[0m', green: '\x1b[32m', red: '\x1b[31m',
+    yellow: '\x1b[33m', blue: '\x1b[34m', cyan: '\x1b[36m', gray: '\x1b[90m'
+};
+
+const PORT = 8077; // dedicated test port to avoid clashing with `npm start`
+const WEB_ROOT = path.join(__dirname, '..', '..');
+const HEADED = process.argv.includes('--headed');
+
+// 1px tolerance for sub-pixel rounding in getBoundingClientRect.
+const TOL = 1;
+
+// Viewport matrix — deliberately weighted toward the SHORT / NARROW sizes
+// where centred fixed panels collide with the chrome.
+const VIEWPORTS = [
+    { name: 'phone-tall',        width: 375,  height: 812 },
+    { name: 'phone-short',       width: 375,  height: 560 },
+    { name: 'phone-mid',         width: 390,  height: 667 },
+    { name: 'landscape-short',   width: 820,  height: 480 },
+    { name: 'tablet-portrait',   width: 834,  height: 1112 },
+    { name: 'tablet-landscape',  width: 1024, height: 768 },
+    { name: 'desktop',           width: 1280, height: 800 }
+];
+
+// Static marketing/content pages. These have no app chrome to collide with, so
+// the invariant is different and simpler: THE PAGE MUST NOT SCROLL SIDEWAYS.
+//
+// Added Aug 2026 after minicycleapp.com shipped with 296px of horizontal
+// overflow at 1280px and 6-72px between 768 and 900 — for months. The app had
+// been swept across 7 viewports this whole time; the marketing page, which is
+// the first thing a visitor sees, was covered by nothing.
+const STATIC_PAGES = [
+    { name: 'product',    path: '/pages/product.html' },
+    { name: 'learn-more', path: '/pages/learn_more.html' },
+    { name: 'mcyc-format', path: '/pages/mcyc-format.html' }
+];
+
+// Width-only matrix: these pages are long documents, so height is irrelevant to
+// horizontal overflow. 768 and 900 are here BECAUSE they were the widths that
+// broke — three .story-stat cards with min-width:160px stopped fitting the
+// content column between them.
+const STATIC_WIDTHS = [320, 375, 414, 600, 768, 800, 900, 1024, 1280, 1440];
+
+/**
+ * Horizontal overflow, plus the outermost element responsible.
+ *
+ * Reporting the offender matters: "the page scrolls sideways" sends you hunting,
+ * whereas "`.story-stats` reaches 825px in a 753px viewport" is the fix. Elements
+ * inside a scroll container (overflow-x auto/scroll/clip/hidden) are excluded —
+ * a horizontal carousel legitimately extends past the viewport and is contained.
+ */
+function measureHorizontalOverflow() {
+    const d = document.documentElement;
+    const overflowPx = Math.max(0, d.scrollWidth - d.clientWidth);
+    if (overflowPx === 0) return { overflowPx: 0, offender: null };
+
+    const contained = (el) => {
+        for (let p = el.parentElement; p; p = p.parentElement) {
+            const ox = getComputedStyle(p).overflowX;
+            if (ox === 'auto' || ox === 'scroll' || ox === 'hidden' || ox === 'clip') return true;
+        }
+        return false;
+    };
+    const offenders = [...document.querySelectorAll('body *')]
+        .filter(el => !contained(el))
+        .map(el => ({ el, r: el.getBoundingClientRect() }))
+        .filter(x => x.r.width > 0 && x.r.right > d.clientWidth + 1)
+        // keep only the OUTERMOST — a child of an offender is not the cause
+        .filter((x, _, arr) => !arr.some(y => y.el !== x.el && y.el.contains(x.el)));
+
+    const worst = offenders.sort((a, b) => b.r.right - a.r.right)[0];
+    return {
+        overflowPx,
+        offender: worst
+            ? `${worst.el.tagName.toLowerCase()}${worst.el.className && typeof worst.el.className === 'string'
+                ? '.' + worst.el.className.trim().split(/\s+/)[0] : ''}`
+                + ` reaches ${Math.round(worst.r.right)}px in a ${d.clientWidth}px viewport`
+            : 'no un-contained element found (check pseudo-elements or transforms)'
+    };
+}
+
+// Measure the routine view (title vs header, help/task-view vs nav dots).
+function measureRoutine() {
+    /* runs in the page */
+    const q = (s) => document.querySelector(s);
+    const rect = (el) => el ? el.getBoundingClientRect() : null;
+    const navClear = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--nav-dots-clearance')) || 0;
+    const headVar = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--header-total-height')) || 0;
+    const H = window.innerHeight;
+    const navLine = H - navClear; // viewport-relative top of the nav-dots band
+    const header = rect(q('.fixed-header-container'));
+    const title = rect(q('.mini-cycle-title'));
+    const help = q('#help-window');
+    const helpRect = rect(help);
+    const helpShown = help && getComputedStyle(help).display !== 'none' && getComputedStyle(help).visibility !== 'hidden';
+    const tvEl = q('#task-view');
+    const tv = rect(tvEl);
+    return {
+        H, navClear, headVar, navLine: Math.round(navLine),
+        // The header's REAL border-box height, to compare the published var
+        // against. getBoundingClientRect() is border-box — the same box
+        // measureHeaderHeight() reads.
+        headerRealHeight: header ? Math.round(header.height) : null,
+        headerBottom: header ? Math.round(header.bottom) : null,
+        titleTop: title ? Math.round(title.top) : null,
+        helpShown, helpBottom: helpRect ? Math.round(helpRect.bottom) : null,
+        taskViewBottom: tv ? Math.round(tv.bottom) : null,
+        taskViewMaxH: tvEl ? getComputedStyle(tvEl).maxHeight : null
+    };
+}
+
+/**
+ * Home view geometry with CONTENT — the main loop's measureRoutine runs on an
+ * empty routine, so it never saw a long list overflow the band. The last
+ * painted element in the column is whichever of the card, progress bar,
+ * status pill (#help-window, in flow below 1024px) or Complete button sits
+ * lowest; it must clear the nav line, and the box must reach the band.
+ */
+function measureHome() {
+    const px = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); const c = getComputedStyle(el);
+        if (r.height <= 0 || c.display === 'none' || c.visibility === 'hidden' || c.opacity === '0') return null;
+        return { top: Math.round(r.top), bottom: Math.round(r.bottom), mb: parseFloat(c.marginBottom) || 0 }; };
+    const parts = [
+        px(document.querySelector('.task-card')),
+        px(document.querySelector('.progress-container')),
+        px(document.getElementById('help-window')),
+        px(document.getElementById('completeAll')),
+    ].filter(Boolean);
+    const last = parts.reduce((a, b) => (b.bottom > a.bottom ? b : a), parts[0]);
+    const tvEl = document.getElementById('task-view');
+    const tv = tvEl.getBoundingClientRect();
+    // How far the column's content reaches, trailing margins included: the
+    // lowest in-flow child of #task-view plus its margin-bottom. On desktop the
+    // last painted thing is the progress bar or Complete button, but the box
+    // ends 20px lower because #complete-all-and-help-window-container (empty
+    // in Auto mode) carries a margin-bottom — that is content, not dead space.
+    const fill = [...tvEl.children].map((el) => { const c = getComputedStyle(el); if (c.position === 'absolute' || c.position === 'fixed' || c.display === 'none') return null;
+        const r = el.getBoundingClientRect(); return r.bottom + (parseFloat(c.marginBottom) || 0); }).filter((v) => v !== null);
+    const fillBottom = fill.length ? Math.round(Math.max(...fill)) : null;
+    const nav = document.getElementById('nav-dots');
+    const navRect = nav ? nav.getBoundingClientRect() : null;
+    const header = document.querySelector('.fixed-header-container').getBoundingClientRect();
+    const title = document.querySelector('.mini-cycle-title');
+    const gap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--home-band-gap')) || 16;
+    return {
+        contentBottom: last ? last.bottom : null,
+        fillBottom,
+        taskViewBottom: Math.round(tv.bottom),
+        navLine: navRect && navRect.height > 0 ? Math.round(navRect.top) : null,
+        headerBottom: Math.round(header.bottom),
+        titleTop: title ? Math.round(title.getBoundingClientRect().top) : null,
+        gap,
+        listScrolls: (() => { const l = document.querySelector('.task-list-container'); return l ? l.scrollHeight > l.clientHeight + 1 : false; })(),
+    };
+}
+
+/**
+ * Focus view geometry. The card must clear the chrome that actually PAINTS,
+ * which is not the same thing as the ✕ / ⋯ buttons: .mini-cycle-header-row
+ * carries the backdrop-filter and extends below them at inset 0. Three
+ * releases in a row bounded against the wrong element here (v2.469 the
+ * buttons, v2.472 still the buttons), each time landing the routine title
+ * inside the blurred band on the surface with no safe-area inset — which is
+ * every desktop browser and this test.
+ */
+function measureFocus() {
+    const px = (el) => { if (!el) return null; const r = el.getBoundingClientRect();
+        return r.height > 0 ? { top: Math.round(r.top), bottom: Math.round(r.bottom) } : null; };
+    const card = px(document.querySelector('#task-view .task-card'));
+    // The topmost painted content: the input bar when it is visible, else the
+    // title / card. The card alone missed the Oct 2026 desktop collision — the
+    // input bar sits ABOVE it and was the thing under the header row.
+    const contentTops = [
+        px(document.getElementById('task-input-row')),
+        px(document.getElementById('mini-cycle-title')),
+        card,
+    ].filter(Boolean).map(c => c.top);
+    const contentTop = contentTops.length ? Math.min(...contentTops) : null;
+    const chromeFloor = parseFloat(
+        getComputedStyle(document.documentElement).getPropertyValue('--focus-chrome-floor')) || 5;
+    const chrome = [
+        px(document.querySelector('.mini-cycle-header-row')),
+        px(document.querySelector('.header-logo')),
+        // #focus-mode-exit-btn is no longer header chrome (it sits in the
+        // progress row below the card) — mirrors headerLayoutManager.
+        px(document.getElementById('focus-mode-menu-btn')),
+    ].filter(Boolean);
+    const liveChromeBottom = chrome.length ? Math.max(...chrome.map(c => c.bottom)) : null;
+    const publishedVar = parseFloat(
+        getComputedStyle(document.documentElement).getPropertyValue('--focus-chrome-bottom')) || 0;
+    const tv = document.getElementById('task-view');
+    const nav = document.getElementById('nav-dots');
+    const navRect = nav ? nav.getBoundingClientRect() : null;
+    const help = px(document.getElementById('help-window'));
+    const progress = px(document.querySelector('.progress-focus-row'));
+    const exitBtn = px(document.getElementById('focus-mode-exit-btn'));
+    const tvBottom = tv ? Math.round(tv.getBoundingClientRect().bottom) : null;
+    return {
+        cardTop: card ? card.top : null,
+        contentTop, chromeFloor,
+        liveChromeBottom, publishedVar,
+        taskViewBottom: tvBottom,
+        // In focus mode #task-view deliberately extends BELOW the nav line —
+        // the help window's bottom margin is what creates the visible gap, so
+        // the wrapper's own edge sits inside that margin and asserting on it
+        // would fail by design. The help window is the last painted thing, and
+        // it is inside the wrapper (unclipped) precisely because the clearance
+        // holds; `helpClipped` catches the case where that stops being true.
+        helpBottom: help ? help.bottom : null,
+        // The × overhangs the 12px progress row (36px circle, absolutely
+        // positioned), so the row's painted bottom is whichever is lower.
+        progressBottom: Math.max(progress ? progress.bottom : 0, exitBtn ? exitBtn.bottom : 0) || null,
+        // Last painted content edge WITHOUT the ×'s overhang (help window on
+        // phones/tablets, progress row on desktop where help is side-docked).
+        contentBottom: Math.max(help ? help.bottom : 0, progress ? progress.bottom : 0) || null,
+        bandBottomGap: parseFloat(
+            getComputedStyle(document.documentElement).getPropertyValue('--focus-band-bottom-gap')) || 25,
+        helpClipped: help && tvBottom !== null ? help.bottom > tvBottom : false,
+        navLine: navRect && navRect.height > 0 ? Math.round(navRect.top) : null,
+    };
+}
+
+/**
+ * First-run tour ("Learn How Cycles Work") geometry. While the welcome banner
+ * is up, main.css un-fixes #task-view so the PAGE scrolls under a fixed banner;
+ * Skip hands back the locked focus view. That override has to reset every
+ * offset the focus layout sets — v2.474 added `bottom` to the focus band, the
+ * override never reset it, and on a relative element with top: auto `bottom`
+ * is an upward offset: the input bar, title and first task sat ~156px up
+ * behind the banner, unreachable by scrolling, from Aug 2026 until found by
+ * hand. Must be called at scrollTop 0 (the banner is fixed; content is not).
+ */
+function measureFirstRunTour() {
+    const top = (el) => { if (!el) return null; const r = el.getBoundingClientRect();
+        return r.height > 0 ? Math.round(r.top) : null; };
+    const banner = document.querySelector('.first-run-welcome');
+    const bannerBottom = banner ? Math.round(banner.getBoundingClientRect().bottom) : null;
+    const parts = [
+        ['input bar', top(document.getElementById('task-input-row'))],
+        ['routine title', top(document.querySelector('#task-view .title-row'))],
+        ['first task', top(document.querySelector('#taskList li'))],
+    ].filter(([, t]) => t !== null);
+    const covered = bannerBottom === null ? [] : parts.filter(([, t]) => t < bannerBottom - 1)
+        .map(([name, t]) => `${name}.top ${t}`);
+    const tv = document.getElementById('task-view');
+    const list = document.querySelector('#task-view .task-list-container');
+    const se = document.scrollingElement;
+    return {
+        active: document.body.classList.contains('first-run-welcome-active'),
+        bannerBottom, covered,
+        // Content must be reachable by scrolling the PAGE: the view's bottom
+        // edge (document coords) may not sit past the end of the scroll range.
+        contentBottom: tv ? Math.round(tv.getBoundingClientRect().bottom + se.scrollTop) : null,
+        scrollHeight: se.scrollHeight,
+        // The list must not scroll on its own inside the page. On iOS a swipe
+        // that starts in an inner scroller latches to it and never reaches the
+        // page — the list "works", the page does not move.
+        listInnerScroll: list ? list.scrollHeight - list.clientHeight : 0,
+        pageExtra: se.scrollHeight - innerHeight,
+    };
+}
+
+function measureStats() {
+    const q = (s) => document.querySelector(s);
+    const rect = (el) => el ? el.getBoundingClientRect() : null;
+    const navClear = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--nav-dots-clearance')) || 0;
+    const H = window.innerHeight;
+    const header = rect(q('.fixed-header-container'));
+    const sp = rect(q('#stats-panel'));
+    return {
+        navLine: Math.round(H - navClear),
+        headerBottom: header ? Math.round(header.bottom) : null,
+        statsTop: sp ? Math.round(sp.top) : null,
+        statsBottom: sp ? Math.round(sp.bottom) : null
+    };
+}
+
+// Open every <dialog> in turn and measure it against the viewport.
+//
+// A modal <dialog> is width:fit-content with an auto centring margin, and the
+// global reset in modals.css drops the UA's max-width. So a child that clamps
+// itself as a PERCENTAGE resolves that percentage against the shrink-wrapped
+// dialog rather than the screen — the dialog stays wider than the viewport and
+// the centring margin resolves NEGATIVE, clipping the right edge. That shipped
+// live in .miniCycle-prompt-box (width:420px + max-width:95% => 399px inside a
+// 420px dialog on a 375px phone). Nothing should ever be wider than the screen,
+// so assert it for every dialog at once rather than per-component.
+function measureDialogOverflow() {
+    const W = window.innerWidth;
+    const results = [];
+    const probe = (el, label) => {
+        const wasOpen = el.open;
+        let opened = false;
+        try {
+            if (!wasOpen) { el.showModal(); opened = true; }
+        } catch (e) {
+            return; // detached, or another dialog already holds the top layer
+        }
+        const r = el.getBoundingClientRect();
+        if (r.width > 0) {
+            results.push({
+                label,
+                right: Math.round(r.right),
+                width: Math.round(r.width),
+                over: Math.round(r.right - W)
+            });
+        }
+        if (opened) el.close();
+    };
+
+    document.querySelectorAll('dialog').forEach((d, i) => {
+        probe(d, d.id || (typeof d.className === 'string' && d.className) || `dialog[${i}]`);
+    });
+
+    // The prompt family is built in JS at call time (routineManager, taskCRUD,
+    // notifications, dailyResetManager, routineSwitcher all share this markup),
+    // so a static sweep never sees it — synthesize one so it is covered too.
+    const synth = document.createElement('dialog');
+    synth.className = 'miniCycle-prompt-dialog';
+    synth.innerHTML = '<div class="miniCycle-prompt-box">'
+        + '<div class="miniCycle-prompt-title">Probe</div>'
+        + '<input class="miniCycle-prompt-input">'
+        + '</div>';
+    document.body.appendChild(synth);
+    probe(synth, 'miniCycle-prompt-dialog (synthesized)');
+    synth.remove();
+
+    return { W, results };
+}
+
+function measureMenuClipping() {
+    // Main menu sections lay their buttons out in a 2-column grid. A column
+    // must never be wider than its share of the panel, and no label may be
+    // clipped by the grid's overflow:hidden. Measured both with and without the
+    // Lite Version button, because the item count decides which column the
+    // long labels fall into — the desktop build (no Lite button) clipped
+    // "Check for Updates" / "Enable Tour Prompts" while the web build did not.
+    const menu = document.querySelector('.menu-container');
+    if (!menu) return { missing: true, checked: 0, clipped: [] };
+    const wasVisible = menu.classList.contains('visible');
+    const sections = [...menu.querySelectorAll('.menu-section')];
+    const wasCollapsed = sections.map(s => s.classList.contains('collapsed'));
+    const lite = document.getElementById('menu-lite-version');
+    const liteDisplay = lite ? lite.style.display : null;
+    const clipped = [];
+    let checked = 0;
+    let menuWidth = 0;
+    try {
+        menu.classList.add('visible');
+        sections.forEach(s => s.classList.remove('collapsed'));
+        menuWidth = Math.round(menu.getBoundingClientRect().width);
+        for (const variant of ['lite shown', 'lite hidden']) {
+            if (lite) lite.style.display = variant === 'lite hidden' ? 'none' : '';
+            for (const s of sections) {
+                const grid = s.querySelector('.menu-section-grid');
+                if (!grid) continue;
+                const g = grid.getBoundingClientRect();
+                if (g.width === 0) continue;
+                if (grid.scrollWidth - grid.clientWidth > 1) {
+                    clipped.push({ variant, section: s.dataset.section || '?', label: '(grid)', over: grid.scrollWidth - grid.clientWidth });
+                }
+                for (const b of grid.querySelectorAll('button, .menu-link-button')) {
+                    const r = b.getBoundingClientRect();
+                    if (r.width === 0) continue;
+                    checked++;
+                    const over = Math.round(r.right - g.right);
+                    const inner = b.scrollWidth - b.clientWidth;
+                    if (over > 1 || inner > 1) {
+                        clipped.push({ variant, section: s.dataset.section || '?', label: b.textContent.trim(), over: Math.max(over, inner) });
+                    }
+                }
+            }
+        }
+    } finally {
+        if (lite) lite.style.display = liteDisplay;
+        sections.forEach((s, i) => { if (wasCollapsed[i]) s.classList.add('collapsed'); });
+        if (!wasVisible) menu.classList.remove('visible');
+    }
+    return { checked, clipped, menuWidth };
+}
+
+async function run() {
+    console.log(`${colors.blue}${'='.repeat(64)}${colors.reset}`);
+    console.log(`${colors.blue}📐 miniCycle Layout Overlap Regression Tests${colors.reset}`);
+    console.log(`${colors.blue}${'='.repeat(64)}${colors.reset}`);
+
+    // Spawn a dedicated static server for web/ on PORT.
+    let srv;
+    try {
+        srv = await startStaticServer(WEB_ROOT, PORT);
+    } catch (e) {
+        console.error(`${colors.red}❌ Could not start test server: ${e.message}${colors.reset}`);
+        process.exit(1);
+    }
+    const baseURL = srv.url;
+    console.log(`${colors.gray}   server on ${baseURL} (web/)${colors.reset}`);
+
+    const browser = await chromium.launch({ headless: !HEADED });
+    const context = await browser.newContext({ bypassCSP: true });
+    // Keep the service worker out of the way so each resize sees fresh CSS.
+    await context.addInitScript(() => {
+        if (navigator.serviceWorker) {
+            navigator.serviceWorker.register = () => Promise.reject(new Error('SW disabled for layout test'));
+        }
+    });
+    const page = await context.newPage();
+
+    const failures = [];
+    const record = (vp, name, ok, detail) => {
+        const tag = `${vp.name} (${vp.width}x${vp.height})`;
+        if (ok) {
+            console.log(`   ${colors.green}✅${colors.reset} ${tag.padEnd(26)} ${colors.gray}${name}${colors.reset}`);
+        } else {
+            console.log(`   ${colors.red}❌ ${tag.padEnd(26)} ${name} — ${detail}${colors.reset}`);
+            failures.push(`${tag}: ${name} — ${detail}`);
+        }
+    };
+
+    try {
+        // Load at a neutral size so the first matrix viewport is a real resize.
+        await page.setViewportSize({ width: 1000, height: 800 });
+        await page.goto(`${baseURL}/miniCycle.html`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.waitForFunction(() => document.documentElement.dataset.appLoaded === 'true', { timeout: 20000 });
+        // Settle into the normal (post-onboarding) layout BEFORE measuring so the
+        // first iteration isn't read mid-transition.
+        await page.evaluate(() => {
+            document.body.classList.remove('focus-mode', 'first-run-welcome-active', 'onboarding-active', 'hide-help-window');
+            const help = document.getElementById('help-window');
+            if (help) { help.classList.remove('hide'); help.classList.add('show'); }
+        });
+        await page.waitForTimeout(500);
+
+        for (const vp of VIEWPORTS) {
+            await page.setViewportSize({ width: vp.width, height: vp.height });
+            await page.waitForTimeout(500); // ResizeObserver + media-query reflow + transitions
+
+            console.log(`\n${colors.cyan}▸ ${vp.name} ${vp.width}x${vp.height}${colors.reset}`);
+
+            // --- Routine view -------------------------------------------------
+            await page.evaluate(() => {
+                // Force the normal (post-onboarding) layout. Onboarding / first-run
+                // un-fix #task-view and make the page scroll — a different layout
+                // contract; the geometry invariants here apply to the normal
+                // fixed-centred layout the user actually reported bugs in.
+                document.body.classList.remove(
+                    'focus-mode', 'first-run-welcome-active', 'onboarding-active', 'hide-help-window'
+                );
+                const tv = document.getElementById('task-view');
+                const sp = document.getElementById('stats-panel');
+                tv.classList.remove('hide'); tv.classList.add('show');
+                sp.classList.remove('show'); sp.classList.add('hide');
+                const help = document.getElementById('help-window');
+                if (help) { help.classList.remove('hide'); help.classList.add('show'); }
+            });
+            await page.waitForTimeout(150);
+            const r = await page.evaluate(measureRoutine);
+
+            // headerLayoutManager MUST publish the measured chrome — if the vars
+            // are empty the band-centering silently falls back to the wrong
+            // hardcoded guess (the real iPad bug: title creeps under the mode
+            // selector). parseFloat('') → NaN → 0, so 0 means "not published".
+            record(vp, 'header/nav-dots vars published', r.headVar > 0 && r.navClear > 0,
+                `--header-total-height=${r.headVar} --nav-dots-clearance=${r.navClear} (0 = empty/unpublished)`);
+
+            // "Published" is not the same as "correct". The check above only
+            // catches the EMPTY failure (fixed in ee98acf1); it stays green for a
+            // stale-but-nonzero value — which is exactly what a content-box
+            // ResizeObserver produced when the header's height moved through
+            // padding (env(safe-area-inset-top) changes) and no callback fired.
+            // Assert the published var still DESCRIBES the live header.
+            if (r.headerRealHeight !== null) {
+                record(vp, 'header var matches the live header',
+                    Math.abs(r.headVar - r.headerRealHeight) <= TOL,
+                    `--header-total-height=${r.headVar} but header measures ${r.headerRealHeight}`);
+            }
+
+            if (r.titleTop !== null && r.headerBottom !== null) {
+                record(vp, 'title clears header', r.titleTop >= r.headerBottom - TOL,
+                    `title.top ${r.titleTop} < header.bottom ${r.headerBottom}`);
+            }
+            // #task-view is the clip container (overflow:hidden on mobile) for the
+            // help window + Complete button, so its bottom bounds everything inside
+            // it. Asserting the task-view clears the nav dots covers the help window
+            // too — and avoids the help window's own (unclipped) rect giving a false
+            // reading when it's clipped beyond the task-view edge.
+            if (r.taskViewBottom !== null) {
+                record(vp, 'task-view (and its help window) clears nav dots',
+                    r.taskViewBottom <= r.navLine + TOL,
+                    `task-view.bottom ${r.taskViewBottom} > navLine ${r.navLine} (maxH=${r.taskViewMaxH})`);
+            }
+
+            // --- Stats view ---------------------------------------------------
+            await page.evaluate(() => {
+                const tv = document.getElementById('task-view');
+                const sp = document.getElementById('stats-panel');
+                tv.classList.remove('show'); tv.classList.add('hide');
+                sp.classList.remove('hide'); sp.classList.add('show');
+            });
+            await page.waitForTimeout(450);
+            const s = await page.evaluate(measureStats);
+
+            if (s.statsTop !== null && s.headerBottom !== null) {
+                record(vp, 'stats panel clears header', s.statsTop >= s.headerBottom - TOL,
+                    `stats.top ${s.statsTop} < header.bottom ${s.headerBottom}`);
+                record(vp, 'stats panel clears nav dots', s.statsBottom <= s.navLine + TOL,
+                    `stats.bottom ${s.statsBottom} > navLine ${s.navLine}`);
+            }
+
+            // restore routine view for the next iteration
+            await page.evaluate(() => {
+                const tv = document.getElementById('task-view');
+                const sp = document.getElementById('stats-panel');
+                tv.classList.remove('hide'); tv.classList.add('show');
+                sp.classList.remove('show'); sp.classList.add('hide');
+            });
+
+            // --- Focus view ---------------------------------------------------
+            await page.evaluate(() => {
+                document.body.classList.add('focus-mode');
+                document.dispatchEvent(new CustomEvent('focusMode:activated', { detail: {} }));
+            });
+            await page.waitForTimeout(450); // class + the re-measure it triggers
+            const f = await page.evaluate(measureFocus);
+
+            record(vp, 'focus chrome var published', f.publishedVar > 0,
+                `--focus-chrome-bottom=${f.publishedVar} (0 = empty/unpublished)`);
+
+            // Published is not the same as correct — same distinction the header
+            // var checks above draw.
+            if (f.liveChromeBottom !== null) {
+                record(vp, 'focus chrome var matches the live chrome',
+                    Math.abs(f.publishedVar - f.liveChromeBottom) <= TOL,
+                    `--focus-chrome-bottom=${f.publishedVar} but the lowest painted chrome is ${f.liveChromeBottom}`);
+            }
+
+            if (f.cardTop !== null && f.liveChromeBottom !== null) {
+                record(vp, 'focus card clears the painted chrome',
+                    f.cardTop >= f.liveChromeBottom - TOL,
+                    `card.top ${f.cardTop} < chrome.bottom ${f.liveChromeBottom}`);
+            }
+            if (f.contentTop !== null && f.liveChromeBottom !== null) {
+                record(vp, `focus content keeps ${f.chromeFloor}px from the painted chrome`,
+                    f.contentTop >= f.liveChromeBottom + f.chromeFloor - TOL,
+                    `content.top ${f.contentTop} < chrome.bottom ${f.liveChromeBottom} + ${f.chromeFloor}`);
+            }
+
+            // The band itself — this is what anchoring #task-view between the
+            // chrome and the nav dots actually guarantees, and it holds on every
+            // viewport including the ones too short to fit their own content.
+            if (f.taskViewBottom !== null && f.navLine !== null) {
+                record(vp, 'focus band clears nav dots',
+                    f.taskViewBottom <= f.navLine + TOL,
+                    `task-view.bottom ${f.taskViewBottom} > navLine ${f.navLine}`);
+            }
+
+            // Whether the CONTENT fits that band is a separate question. On a
+            // viewport this short the card-group's own floor exceeds the band,
+            // so the help window overhangs it and #task-view's overflow: hidden
+            // clips it. Pre-existing — the centred layout put the help window
+            // 59px past the nav dots here, band-anchoring plus min-height: 0 on
+            // the list brings it to 29px past the band edge — and NOT fixed, so
+            // it is named rather than asserted away. Fixing it properly means
+            // deciding what focus view drops when there is no room (the help
+            // window is the obvious candidate), which is a product call.
+            const CONTENT_FIT_KNOWN_SHORT = vp.height < 520;
+            if (f.helpBottom !== null && f.taskViewBottom !== null) {
+                if (CONTENT_FIT_KNOWN_SHORT) {
+                    console.log(`   ${colors.yellow}⚠${colors.reset}  ${vp.name.padEnd(26)} `
+                        + `${colors.gray}focus content does not fit the band (known, ${vp.height}px tall): `
+                        + `help.bottom ${f.helpBottom} vs band ${f.taskViewBottom}${colors.reset}`);
+                } else {
+                    record(vp, 'focus content fits inside the band',
+                        !f.helpClipped,
+                        `help.bottom ${f.helpBottom} > task-view.bottom ${f.taskViewBottom}`);
+                }
+            }
+
+            // --- Stats panel in Focus View ---------------------------------
+            // Had no coverage: Focus View overrode the Home band with `top: 47%`
+            // and a 63vh cap, so an expanded panel ran 233px past the nav dots on
+            // a 1280x800 desktop and into the blurred header row on tall windows
+            // (Oct 2026). Same two edges as the card: the painted chrome and the
+            // nav line, which in Focus View is #nav-dots' measured top.
+            await page.evaluate(() => {
+                const tv = document.getElementById('task-view');
+                const sp = document.getElementById('stats-panel');
+                tv.classList.remove('show'); tv.classList.add('hide');
+                sp.classList.remove('hide'); sp.classList.add('show');
+            });
+            await page.waitForTimeout(450);
+            const fs = await page.evaluate(() => {
+                const sp = document.getElementById('stats-panel').getBoundingClientRect();
+                const nav = document.getElementById('nav-dots');
+                const navRect = nav ? nav.getBoundingClientRect() : null;
+                const chrome = [document.querySelector('.mini-cycle-header-row'), document.querySelector('.header-logo'), document.getElementById('focus-mode-menu-btn')]
+                    .filter(Boolean).map(el => el.getBoundingClientRect()).filter(r => r.height > 0).map(r => r.bottom);
+                return { top: Math.round(sp.top), bottom: Math.round(sp.bottom), chromeBottom: chrome.length ? Math.round(Math.max(...chrome)) : null,
+                    navLine: navRect && navRect.height > 0 ? Math.round(navRect.top) : null,
+                    floor: parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--focus-chrome-floor')) || 5 };
+            });
+            if (fs.chromeBottom !== null) {
+                record(vp, `focus stats panel keeps ${fs.floor}px from the painted chrome`,
+                    fs.top >= fs.chromeBottom + fs.floor - TOL,
+                    `stats.top ${fs.top} < chrome.bottom ${fs.chromeBottom} + ${fs.floor}`);
+            }
+            if (fs.navLine !== null) {
+                record(vp, 'focus stats panel clears nav dots', fs.bottom <= fs.navLine + TOL,
+                    `stats.bottom ${fs.bottom} > navLine ${fs.navLine}`);
+            }
+            await page.evaluate(() => {
+                const tv = document.getElementById('task-view');
+                const sp = document.getElementById('stats-panel');
+                tv.classList.remove('hide'); tv.classList.add('show');
+                sp.classList.remove('show'); sp.classList.add('hide');
+            });
+            await page.waitForTimeout(450);
+
+            // Both carousel panels must share ONE vertical centre. #task-view's
+            // centring differs by breakpoint (band-anchored below 1024px, centred
+            // above), so this compares the panels against EACH OTHER rather than
+            // against a number — the same reason the slide check below does.
+            //
+            // v2.513: #focus-task-panel was the last focus-view geometry outside
+            // the measured-chrome model, on `top: 47%` (51% below 768px). It sat
+            // 35-37px below #task-view's centre on phones and pushed 32px past the
+            // nav dots at 375x560. FOCUS_VIEW_LAYOUT.md names opting out of
+            // measured chrome as the cause of three consecutive shipped bugs.
+            const centres = await page.evaluate(() => {
+                const tv = document.getElementById('task-view');
+                const fp = document.getElementById('focus-task-panel');
+                if (!tv || !fp) return null;
+                const tvHad = tv.classList.contains('show');
+                const fpHad = fp.classList.contains('show');
+                tv.classList.add('show'); fp.classList.add('show');
+                void tv.offsetHeight;
+                const t = tv.getBoundingClientRect(), f = fp.getBoundingClientRect();
+                if (!tvHad) tv.classList.remove('show');
+                if (!fpHad) fp.classList.remove('show');
+                return { taskView: t.y + t.height / 2, panel: f.y + f.height / 2 };
+            });
+            if (centres) {
+                const drift = Math.round(centres.panel - centres.taskView);
+                record(vp, 'focus carousel panels share a vertical centre',
+                    Math.abs(drift) <= TOL,
+                    `#focus-task-panel centre is ${drift}px from #task-view's — the view jumps vertically between panels`);
+            }
+
+            // The carousel slide must be HORIZONTAL. #task-view's vertical
+            // anchoring differs by breakpoint — band-anchored (translateY 0)
+            // below 1024px, centred (translateY -50%) at and above it — so this
+            // asserts the three carousel states agree WITH EACH OTHER rather
+            // than against any fixed number. Whatever Y the shown state uses,
+            // both exits must use the same one, or the view travels diagonally.
+            //
+            // v2.512: #task-view.hide.hide-right (one id + TWO classes) outranked
+            // `body.focus-mode #task-view` (one id, one class, one element) and
+            // reimposed translate(-50%, -50%) on a band-anchored element. The
+            // right exit lifted 294px at 390x844 and 385px at 768x1024 — the
+            // routine slid to the upper-right corner instead of straight across.
+            // Nothing compared the states, so it shipped.
+            const slide = await page.evaluate(() => {
+                const el = document.getElementById('task-view');
+                if (!el) return null;
+                const keep = [...el.classList];
+                const prevTransition = el.style.transition;
+                const yOf = () => {
+                    const t = getComputedStyle(el).transform;
+                    if (t === 'none') return 0;
+                    const m = t.match(/matrix\(([^)]+)\)/);
+                    return m ? Math.round(parseFloat(m[1].split(',')[5])) : NaN;
+                };
+                const set = (add) => {
+                    el.classList.remove('show', 'hide', 'hide-left', 'hide-right');
+                    add.forEach(c => el.classList.add(c));
+                    void el.offsetHeight;   // settle style recalc
+                };
+                el.style.transition = 'none';  // read END states, not mid-flight
+                set(['show']);                 const show  = yOf();
+                set(['hide', 'hide-right']);   const right = yOf();
+                set(['hide', 'hide-left']);    const left  = yOf();
+                el.style.transition = prevTransition;
+                el.classList.remove('show', 'hide', 'hide-left', 'hide-right');
+                keep.forEach(c => el.classList.add(c));
+                return { show, right, left };
+            });
+
+            if (slide && Number.isFinite(slide.show)) {
+                record(vp, 'focus carousel slides horizontally (right exit)',
+                    slide.right === slide.show,
+                    `#task-view translateY ${slide.show} when shown but ${slide.right} exiting right `
+                    + `(${slide.right - slide.show}px of vertical travel — the slide is diagonal)`);
+                record(vp, 'focus carousel slides horizontally (left exit)',
+                    slide.left === slide.show,
+                    `#task-view translateY ${slide.show} when shown but ${slide.left} exiting left `
+                    + `(${slide.left - slide.show}px of vertical travel — the slide is diagonal)`);
+            }
+
+            await page.evaluate(() => {
+                document.body.classList.remove('focus-mode');
+                document.dispatchEvent(new CustomEvent('focusMode:deactivated', { detail: {} }));
+            });
+            await page.waitForTimeout(250);
+
+            // --- Dialogs never exceed the viewport ----------------------------
+            const dlg = await page.evaluate(measureDialogOverflow);
+            const over = dlg.results.filter(d => d.over > TOL);
+            record(vp, `dialogs fit viewport (${dlg.results.length} checked)`,
+                over.length === 0,
+                over.map(d => `${d.label} width=${d.width} right=${d.right} — ${d.over}px past ${dlg.W}`).join('; '));
+
+            // --- Main menu: no section grid may clip its labels --------------------
+            const menu = await page.evaluate(measureMenuClipping);
+            record(vp, `main menu labels fit their section grids (${menu.checked} buttons, panel ${menu.menuWidth}px)`,
+                !menu.missing && menu.clipped.length === 0,
+                menu.missing ? 'no .menu-container found'
+                    : menu.clipped.map(c => `[${c.variant}] ${c.section}: "${c.label}" ${c.over}px past the grid`).join('; '));
+
+            // --- Routine switcher: Close must never leave the screen --------------
+            // The picker is taller than a short viewport. It used to solve that by
+            // making the WHOLE dialog the scroller (overflow-y: auto on
+            // .mini-cycle-switch-modal-content), which put the Close button — the
+            // last child — below the fold with no visible affordance to scroll to
+            // it. Measured at 1280x600: its bottom sat at 677px in a 600px viewport.
+            //
+            // The contract now is: the shell is capped and clips, and ONLY the list
+            // and preview scroll. Assert all three parts, because fixing one without
+            // the others silently reintroduces the bug — capping the shell without
+            // `min-height: 0` on the flexible row leaves it overflowing anyway
+            // (a flex item's default min-height is `auto`, which refuses to shrink).
+            {
+                const sw = await page.evaluate(() => {
+                    const d = document.getElementById('routine-switcher-modal');
+                    if (!d) return { missing: true };
+                    const wasOpen = d.open;
+                    if (!wasOpen) d.showModal();
+                    const content = d.querySelector('.mini-cycle-switch-modal-content');
+                    const list = document.getElementById('miniCycleList');
+                    const close = document.getElementById('miniCycleSwitchClose');
+                    if (!content || !list || !close) { if (!wasOpen) d.close(); return { missing: true }; }
+
+                    // Overfill the list so the scroll region is genuinely overflowing;
+                    // an empty picker fits anywhere and would pass vacuously.
+                    const restore = list.innerHTML;
+                    list.innerHTML = Array.from({ length: 40 }, (_, i) =>
+                        `<div class="mini-cycle-switch-item" role="option">Routine ${i + 1}</div>`).join('');
+
+                    const cr = content.getBoundingClientRect();
+                    const br = close.getBoundingClientRect();
+                    const out = {
+                        missing: false,
+                        shellScrolls: content.scrollHeight > content.clientHeight + 1,
+                        listScrolls: list.scrollHeight > list.clientHeight + 1,
+                        closeTop: Math.round(br.top),
+                        closeBottom: Math.round(br.bottom),
+                        shellBottom: Math.round(cr.bottom),
+                        vh: window.innerHeight
+                    };
+                    list.innerHTML = restore;
+                    if (!wasOpen) d.close();
+                    return out;
+                });
+
+                if (!sw.missing) {
+                    record(vp, 'routine switcher: Close button is fully on screen',
+                        sw.closeTop >= 0 && sw.closeBottom <= sw.vh + TOL,
+                        `Close spans ${sw.closeTop}-${sw.closeBottom}px in a ${sw.vh}px viewport`);
+
+                    record(vp, 'routine switcher: the dialog itself does not scroll',
+                        !sw.shellScrolls,
+                        'the shell is the scroller again — Close is the last child, so it goes below the fold');
+
+                    record(vp, 'routine switcher: the routine list is the scroller',
+                        sw.listScrolls,
+                        'an overfilled list did not scroll — it is being allowed to grow instead, '
+                        + 'which pushes the fixed rows off-screen');
+
+                    // The Close button bleeds past the shell horizontally on purpose
+                    // (negative margins + overflow clipping) but must not hang below
+                    // it: the shell clips rather than scrolls now, so a vertical
+                    // overhang is cut off permanently instead of being scrollable to.
+                    // Flush, not merely "not overhanging". The button is a
+                    // full-bleed footer: it spans the shell's full width and sits
+                    // on its bottom edge, with the shell's border-radius rounding
+                    // its corners. A gap BELOW it exposes a strip of card and
+                    // reads as a misaligned button — which is what the mobile
+                    // `padding` shorthand reintroduced at <=480px once the
+                    // compensating -20px margin was removed. An overhang is just
+                    // as wrong in the other direction: the shell clips rather
+                    // than scrolls now, so it would be cut off permanently.
+                    record(vp, 'routine switcher: Close sits flush with the shell bottom',
+                        Math.abs(sw.shellBottom - sw.closeBottom) <= TOL,
+                        `Close bottom ${sw.closeBottom}px vs shell bottom ${sw.shellBottom}px — `
+                        + `${sw.shellBottom - sw.closeBottom}px of card showing below the button `
+                        + '(negative = the button overhangs and is clipped away)');
+                }
+            }
+        }
+
+        // --- Modal contrast across every colour layer -------------------------
+        // Three layers stack on this modal and each was written as if it were the
+        // only one:
+        //   1. the vocab theme's colorPreset (--pref-*), built for a LIGHT modal
+        //      — Scholar's modalText is #1e1b4b;
+        //   2. the colour theme ([data-theme]), which may be light (golden-glow)
+        //      or dark (dark, dark-ocean);
+        //   3. dark mode, which overrides --theme-modal-* but not --theme-header-bg.
+        // Every measured failure so far was two of those layers disagreeing:
+        // preset text on a dark-mode panel (2.48:1), dark-mode text on golden
+        // -glow's app-header colour (1.23:1), preset text on the dark theme's
+        // app-header colour in LIGHT mode (1.04:1). So sweep the whole matrix —
+        // both modes, every colour theme, every preset — reading all three lists
+        // from the app itself so a new theme is covered the day it lands.
+        {
+            const vp = { name: 'theme-contrast', width: 390, height: 844 };
+            await page.setViewportSize({ width: vp.width, height: vp.height });
+            console.log(`\n${colors.cyan}▸ ${vp.name} ${vp.width}x${vp.height} (light + dark mode)${colors.reset}`);
+
+            let probe = { out: [], skipped: 0, measuredEls: 0 };
+            try {
+            probe = await page.evaluate(async () => {
+                const v = globalThis.APP_VERSION;
+                const mod = await import(`/modules/labels/themes.js?v=${v}`);
+                const defs = mod.THEME_DEFINITIONS || {};
+
+                // Snapshot every piece of page state this block writes, and park it
+                // where the restore pass below can reach it — so an early throw
+                // can't hand the next scenario a dark, modal-open, preset-tinted
+                // page.
+                const root = document.documentElement;
+                const dlg = document.getElementById('themes-modal');
+                globalThis.__themeContrastRestore = {
+                    rootDark: root.classList.contains('dark-mode'),
+                    bodyDark: document.body.classList.contains('dark-mode'),
+                    dataTheme: root.getAttribute('data-theme'),
+                    themeClasses: Array.from(document.body.classList).filter(c => c.indexOf('theme-') === 0),
+                    dlgOpen: !!(dlg && dlg.open),
+                    prefText: document.body.style.getPropertyValue('--pref-modal-text'),
+                    prefBg: document.body.style.getPropertyValue('--pref-modal-bg')
+                };
+
+                // .theme-radio-option transitions `all`, so switching theme between
+                // iterations left the row mid-fade and the probe measured blended
+                // colours that drifted with loop order. Freeze animation for the
+                // duration of the sweep.
+                const freeze = document.createElement('style');
+                freeze.id = '__theme-contrast-freeze';
+                freeze.textContent = '*, *::before, *::after { transition: none !important;'
+                    + ' animation: none !important; }';
+                document.head.appendChild(freeze);
+
+                if (dlg && !dlg.open) dlg.showModal();
+                await new Promise(r => setTimeout(r, 350));
+
+                const srgb = (c) => { c /= 255; return c <= 0.03928 ? c/12.92 : Math.pow((c+0.055)/1.055, 2.4); };
+                const lum = (r) => 0.2126*srgb(r[0]) + 0.7152*srgb(r[1]) + 0.0722*srgb(r[2]);
+                const parse = (str) => { const n = (str.match(/[\d.]+/g) || []).map(Number);
+                    return { rgb: n.slice(0,3), a: n.length > 3 ? n[3] : 1 }; };
+                const over = (f, b) => f.rgb.map((c,i) => c*f.a + b[i]*(1-f.a));
+                // Composite the background stack, but return null rather than
+                // guessing when nothing in the chain is opaque. The app paints its
+                // background through a layer that leaves backgroundColor
+                // transparent all the way to <html>, so an assumed white base
+                // produced confident, wrong ratios for anything on a glass surface
+                // — light-on-dark text scored as light-on-white. Only elements that
+                // resolve to a real colour are asserted on; the rest are counted.
+                const effBg = (el) => { const L = []; let n = el, opaque = false;
+                    while (n) { const c = parse(getComputedStyle(n).backgroundColor);
+                        if (c.a > 0) L.push(c);
+                        if (c.a === 1) { opaque = true; break; }
+                        n = n.parentElement; }
+                    if (!opaque) return null;
+                    let base = L.pop().rgb;
+                    for (let i = L.length-1; i >= 0; i--) base = over(L[i], base);
+                    return base; };
+                const ratio = (a,b) => { const la = lum(a), lb = lum(b);
+                    const hi = Math.max(la,lb), lo = Math.min(la,lb); return (hi+0.05)/(lo+0.05); };
+
+                // Colour themes are a SECOND layer over the vocab preset: each one
+                // sets --theme-header-bg, which paints the modal heading's own
+                // background. Read them out of the stylesheets rather than a hand
+                // list, so a new [data-theme] block is covered the day it lands.
+                // themes.css arrives through an @import in main.css, so a flat pass
+                // over document.styleSheets never reaches it — recurse through
+                // imported sheets and grouping rules (@media/@supports) too.
+                const colorThemes = ['default'];
+                const scan = (rules) => {
+                    for (const rule of Array.from(rules || [])) {
+                        const m = /\[data-theme=["']?([\w-]+)["']?\]/.exec(rule.selectorText || '');
+                        if (m && !colorThemes.includes(m[1])) colorThemes.push(m[1]);
+                        try {
+                            if (rule.styleSheet) scan(rule.styleSheet.cssRules);  // @import
+                            else if (rule.cssRules) scan(rule.cssRules);          // @media/@supports
+                        } catch { /* cross-origin sheet — nothing readable inside */ }
+                    }
+                };
+                for (const sheet of Array.from(document.styleSheets)) {
+                    try { scan(sheet.cssRules); } catch { /* cross-origin */ }
+                }
+
+                const out = [];
+                let skipped = 0, measuredEls = 0;
+                for (const mode of ['light', 'dark']) {
+                    root.classList.toggle('dark-mode', mode === 'dark');
+                    document.body.classList.toggle('dark-mode', mode === 'dark');
+
+                    for (const theme of colorThemes) {
+                        // Mirror themeManager.applyTheme(): the [data-theme] attribute
+                        // AND the body.theme-<name> class. Setting only the attribute
+                        // left the page background on the default palette, which
+                        // changes what translucent modal layers composite over.
+                        for (const t of colorThemes) document.body.classList.remove('theme-' + t);
+                        if (theme === 'default') delete root.dataset.theme;
+                        else { root.dataset.theme = theme; document.body.classList.add('theme-' + theme); }
+
+                        // One record per (mode, colour theme), carrying the worst
+                        // preset — a per-preset line would be 40 rows of noise, and
+                        // the failing preset is named in the message either way.
+                        let worst = Infinity, sample = null, culprit = null, below = 0;
+                        for (const [id, def] of Object.entries(defs)) {
+                            const preset = def.colorPreset || {};
+                            // Apply the preset exactly as themeManager does: inline on <body>.
+                            if (preset.modalText) document.body.style.setProperty('--pref-modal-text', preset.modalText);
+                            if (preset.modalBg)   document.body.style.setProperty('--pref-modal-bg', preset.modalBg);
+                            await new Promise(r => setTimeout(r, 60));
+
+                            document.querySelectorAll('.vocab-theme-name, .themes-modal-content h2').forEach(el => {
+                                // Start AT the element: a heading paints its own
+                                // background, and measuring from the parent would
+                                // score it against a colour it never shows.
+                                const bg = effBg(el);
+                                if (!bg) { skipped++; return; }
+                                measuredEls++;
+                                const fgP = parse(getComputedStyle(el).color);
+                                const fg = fgP.a < 1 ? over(fgP, bg) : fgP.rgb;
+                                const r = ratio(fg, bg);
+                                if (r < 4.5) below++;
+                                if (r < worst) { worst = r; culprit = id;
+                                    sample = { fg: getComputedStyle(el).color,
+                                        bg: 'rgb(' + bg.map(Math.round).join(', ') + ')',
+                                        el: el.tagName.toLowerCase() + (el.className ? '.' + String(el.className).trim().split(/\s+/).join('.') : '') }; }
+                            });
+                            document.body.style.removeProperty('--pref-modal-text');
+                            document.body.style.removeProperty('--pref-modal-bg');
+                        }
+                        if (worst !== Infinity) out.push({ mode, theme, culprit, below, worst: +worst.toFixed(2), ...sample });
+                    }
+                }
+                return { out, skipped, measuredEls };
+            });
+            } finally {
+                // Put the page back the way it was, whether the block finished or
+                // threw — inset-change measures the same page right after this.
+                await page.evaluate(() => {
+                    const freeze = document.getElementById('__theme-contrast-freeze');
+                    if (freeze) freeze.remove();
+                    const prev = globalThis.__themeContrastRestore;
+                    if (!prev) return;
+                    delete globalThis.__themeContrastRestore;
+                    const root = document.documentElement;
+                    const dlg = document.getElementById('themes-modal');
+                    if (dlg && dlg.open && !prev.dlgOpen) dlg.close();
+                    root.classList.toggle('dark-mode', prev.rootDark);
+                    document.body.classList.toggle('dark-mode', prev.bodyDark);
+                    if (prev.dataTheme === null) root.removeAttribute('data-theme');
+                    else root.setAttribute('data-theme', prev.dataTheme);
+                    Array.from(document.body.classList)
+                        .filter(c => c.indexOf('theme-') === 0)
+                        .forEach(c => document.body.classList.remove(c));
+                    (prev.themeClasses || []).forEach(c => document.body.classList.add(c));
+                    for (const pair of [['--pref-modal-text', prev.prefText],
+                                        ['--pref-modal-bg', prev.prefBg]]) {
+                        if (pair[1]) document.body.style.setProperty(pair[0], pair[1]);
+                        else document.body.style.removeProperty(pair[0]);
+                    }
+                });
+            }
+
+            const measured = probe.out;
+            record(vp, 'themes modal exposes labels to measure', probe.measuredEls > 0,
+                `no label resolved to a measurable background (${probe.skipped} skipped) — `
+                + 'the check would pass vacuously');
+            if (probe.skipped > 0) {
+                console.log(`   ${colors.yellow}⚠${colors.reset}  theme-contrast: ${probe.skipped} label(s) sit on a `
+                    + `fully translucent stack and were NOT measured (see effBg)`);
+            }
+            for (const m of measured) {
+                record(vp, `${m.theme} theme, ${m.mode} mode: modal text meets AA (4.5:1)`, m.worst >= 4.5,
+                    `${m.worst}:1 on ${m.el} with the ${m.culprit} preset — fg=${m.fg} on bg=${m.bg}; `
+                    + `${m.below} measurement(s) below the floor in this combination; `
+                    + `two colour layers disagree (vocab preset --pref-*, colour theme, or dark mode)`);
+            }
+        }
+
+        // --- Main menu contrast across every colour layer ---------------------
+        // The menu joined vocab theming in Sep 2026 (it was the only major surface
+        // that ignored it), which puts it under the same three-layer stack as the
+        // modal above: vocab preset --pref-menu-*, colour theme, dark mode.
+        //
+        // It cannot be measured the way the modal is. The menu's background is a
+        // GRADIENT, i.e. a background-image, so `backgroundColor` is transparent
+        // and effBg() walks straight past it to whatever is behind — every ratio
+        // would be computed against the wrong surface. So assert on the TOKENS:
+        // resolve --menu-bg-effective, take both gradient stops, and check the
+        // text and heading tokens against the worse of the two. A gradient is
+        // monotonic in luminance between its stops, so passing at both ends means
+        // passing everywhere along it.
+        {
+            const vp = { name: 'menu-contrast', width: 390, height: 844 };
+            const probe = await page.evaluate(async () => {
+                const srgb = (c) => { c /= 255; return c <= 0.03928 ? c/12.92 : Math.pow((c+0.055)/1.055, 2.4); };
+                const lum = (r) => 0.2126*srgb(r[0]) + 0.7152*srgb(r[1]) + 0.0722*srgb(r[2]);
+                const ratio = (a, b) => { const la = lum(a), lb = lum(b);
+                    return (Math.max(la,lb) + 0.05) / (Math.min(la,lb) + 0.05); };
+                const toRgb = (str) => {
+                    const t = (str || '').trim();
+                    if (t.startsWith('#')) { let h = t.slice(1);
+                        if (h.length === 3) h = h.split('').map(c => c + c).join('');
+                        return [0,2,4].map(i => parseInt(h.slice(i, i+2), 16)); }
+                    const n = (t.match(/[\d.]+/g) || []).map(Number);
+                    return n.slice(0, 3);
+                };
+
+                // Read the theme lists from the app, not a hand list, so a new
+                // vocab theme or colour theme is covered the day it lands.
+                const cb = Date.now();
+                const { THEME_DEFINITIONS } = await import(`/modules/labels/themes.js?v=${cb}`);
+                const vocabIds = Object.keys(THEME_DEFINITIONS)
+                    .filter(id => THEME_DEFINITIONS[id] && THEME_DEFINITIONS[id].colorPreset);
+                const colourThemes = [null];
+                for (const sheet of document.styleSheets) {
+                    let rules; try { rules = sheet.cssRules; } catch { continue; }
+                    for (const r of rules || []) {
+                        const m = r.selectorText && r.selectorText.match(/\[data-theme="([^"]+)"\]/);
+                        if (m && !colourThemes.includes(m[1])) colourThemes.push(m[1]);
+                    }
+                }
+
+                const body = document.body, root = document.documentElement;
+                const savedClass = body.className;
+                const savedTheme = root.dataset.theme;
+                const results = [];
+                for (const vocab of [null, ...vocabIds]) {
+                    for (const ct of colourThemes) {
+                        for (const dark of [false, true]) {
+                            ['--pref-menu-bg', '--pref-menu-text', '--pref-menu-accent']
+                                .forEach(n => body.style.removeProperty(n));
+                            body.className = body.className.split(/\s+/)
+                                .filter(c => c && !/^(dark-mode|theme-)/.test(c)).join(' ');
+                            delete root.dataset.theme;
+                            if (dark) body.classList.add('dark-mode');
+                            if (ct) { body.classList.add('theme-' + ct); root.dataset.theme = ct; }
+                            if (vocab) {
+                                const cp = THEME_DEFINITIONS[vocab].colorPreset;
+                                if (cp.menuBg) body.style.setProperty('--pref-menu-bg', cp.menuBg);
+                                if (cp.menuText) body.style.setProperty('--pref-menu-text', cp.menuText);
+                                if (cp.menuAccent) body.style.setProperty('--pref-menu-accent', cp.menuAccent);
+                            }
+                            const cs = getComputedStyle(body);
+                            const grad = cs.getPropertyValue('--menu-bg-effective').trim();
+                            const stops = (grad.match(/rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/g) || []).map(toRgb);
+                            const text = toRgb(cs.getPropertyValue('--menu-text-effective'));
+                            const head = toRgb(cs.getPropertyValue('--menu-heading-effective'));
+                            if (!stops.length || !text.length || !head.length) {
+                                results.push({ vocab: vocab || 'classic', ct: ct || 'none', dark, unresolved: true });
+                                continue;
+                            }
+                            let worst = Infinity, culprit = '';
+                            for (const stop of stops) {
+                                const t = ratio(text, stop), h = ratio(head, stop);
+                                if (t < worst) { worst = t; culprit = 'button text'; }
+                                if (h < worst) { worst = h; culprit = 'section heading'; }
+                            }
+
+                            // The three action buttons own a solid fill, so they are
+                            // measured against their OWN background rather than the
+                            // gradient. They were the last part of the menu still
+                            // reading the button token chain instead of the menu one
+                            // — a blue pill on a green Fitness menu — so check the
+                            // themed fill actually carries their white label.
+                            // The two action buttons are deliberately TRANSPARENT — they read
+                            // as menu rows, so their label sits on the gradient and is checked
+                            // against the worse stop. The close bars own a solid fill and are
+                            // checked against that. Resolve which applies per element rather
+                            // than assuming, so flipping one back to a fill still gets measured.
+                            for (const id of ['menu-open-title-screen', 'menu-enter-focus-view', 'close-main-menu']) {
+                                const el = document.getElementById(id);
+                                if (!el) continue;
+                                const es = getComputedStyle(el);
+                                const bgN = (es.backgroundColor.match(/[\d.]+/g) || []).map(Number);
+                                const opaque = bgN.length >= 3 && (bgN.length < 4 || bgN[3] === 1);
+                                const fg = toRgb(es.color);
+                                const surfaces = opaque ? [bgN.slice(0, 3)] : stops;
+                                for (const surf of surfaces) {
+                                    const r2 = ratio(fg, surf);
+                                    if (r2 < worst) { worst = r2; culprit = '#' + id; }
+                                }
+                            }
+                            results.push({ vocab: vocab || 'classic', ct: ct || 'none', dark,
+                                worst: +worst.toFixed(2), culprit, stops: stops.length });
+                        }
+                    }
+                }
+                body.className = savedClass;
+                if (savedTheme) root.dataset.theme = savedTheme; else delete root.dataset.theme;
+                [...body.style].filter(n => n.startsWith('--pref-menu-'))
+                    .forEach(n => body.style.removeProperty(n));
+                return { results, vocabIds, colourThemes };
+            });
+
+            // A gradient that resolves to nothing means the token chain broke —
+            // that is a silent full-surface failure, not a pass.
+            const unresolved = probe.results.filter(r => r.unresolved);
+            record(vp, 'menu colour tokens resolve in every theme combination',
+                unresolved.length === 0,
+                unresolved.map(r => `${r.vocab}/${r.ct}/${r.dark ? 'dark' : 'light'}`).join(', '));
+
+            record(vp, 'menu contrast sweep covers every theme',
+                probe.results.length > 0 && probe.vocabIds.length > 0,
+                `${probe.results.length} combination(s) from ${probe.vocabIds.length} preset(s) `
+                + `x ${probe.colourThemes.length} colour theme(s) x 2 modes`);
+
+            for (const r of probe.results.filter(x => !x.unresolved)) {
+                record(vp, `menu: ${r.vocab} preset, ${r.ct} theme, ${r.dark ? 'dark' : 'light'} meets AA (4.5:1)`,
+                    r.worst >= 4.5,
+                    `${r.worst}:1 on the ${r.culprit} against the worse of ${r.stops} gradient stop(s) — `
+                    + 'a --pref-menu-* value is surviving into a surface it was not drawn for, '
+                    + 'or a gradient stop is too dark for its paired text');
+            }
+        }
+
+        // --- Safe-area inset change (padding-only header growth) --------------
+        // The header's height moves through padding:
+        //   padding: calc(env(safe-area-inset-top, 0px) + 28px) ...
+        // so a call banner / hotspot bar / screen recording grows the BORDER box
+        // while leaving the CONTENT box identical. A default (content-box)
+        // ResizeObserver never fires for that, and --header-total-height silently
+        // keeps describing the old chrome until relaunch. env() cannot be
+        // emulated headlessly, so drive the same geometry directly.
+        {
+            const vp = { name: 'inset-change', width: 390, height: 844 };
+            await page.setViewportSize({ width: vp.width, height: vp.height });
+            console.log(`\n${colors.cyan}▸ ${vp.name} ${vp.width}x${vp.height}${colors.reset}`);
+            await page.waitForTimeout(400);
+            const before = await page.evaluate(measureRoutine);
+
+            const grew = await page.evaluate(async () => {
+                const el = document.querySelector('.fixed-header-container');
+                if (!el) return null;
+                const startPad = parseFloat(getComputedStyle(el).paddingTop) || 0;
+                el.style.paddingTop = `${startPad + 60}px`;   // as if the top inset grew
+                await new Promise(r => setTimeout(r, 500));   // let RO + rAF settle
+                return Math.round(el.getBoundingClientRect().height);
+            });
+
+            if (grew !== null) {
+                const after = await page.evaluate(measureRoutine);
+                record(vp, 'header grew when its padding grew', after.headerRealHeight > before.headerRealHeight,
+                    `header ${before.headerRealHeight} -> ${after.headerRealHeight} (test setup did not take effect)`);
+                record(vp, 'published var tracks a padding-only header change',
+                    Math.abs(after.headVar - after.headerRealHeight) <= TOL,
+                    `--header-total-height=${after.headVar} but header measures ${after.headerRealHeight} `
+                    + `(was ${before.headVar}/${before.headerRealHeight}) — content-box observer missed it`);
+            }
+            await page.evaluate(() => {
+                const el = document.querySelector('.fixed-header-container');
+                if (el) el.style.paddingTop = '';
+            });
+        }
+
+        // ── First-run tour: nothing behind the banner, the page scrolls ──────
+        // Every check above strips first-run-welcome-active to measure the
+        // normal layout, so the tour's own layout contract had no coverage —
+        // which is how v2.474 hid the top of the routine behind the banner
+        // for months. Driven through the REAL first-run choice in a fresh
+        // context (the choice screen only shows with empty storage).
+        {
+            const tourContext = await browser.newContext({ bypassCSP: true });
+            await tourContext.addInitScript(() => {
+                if (navigator.serviceWorker) {
+                    navigator.serviceWorker.register = () => Promise.reject(new Error('SW disabled for layout test'));
+                }
+            });
+            try {
+                const tp = await tourContext.newPage();
+                await tp.setViewportSize({ width: 390, height: 844 });
+                await tp.goto(`${baseURL}/miniCycle.html`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                await tp.click('[data-choice="learn"]', { timeout: 20000 });
+                await tp.waitForFunction(
+                    () => document.body.classList.contains('first-run-welcome-active'), null, { timeout: 20000 });
+                // Hold one slide: auto-advance re-measures the banner height, and
+                // a mid-fade read is noise, not a regression.
+                await tp.waitForTimeout(1500);
+                await tp.evaluate(() => {
+                    const b = document.querySelector('.first-run-welcome');
+                    const t = document.querySelector('.first-run-welcome__toggle');
+                    if (t && b && !b.classList.contains('first-run-welcome--paused')) t.click();
+                });
+                // A longer routine, so the page genuinely has to scroll on every
+                // viewport and a capped inner list would show.
+                for (let i = 1; i <= 6; i++) {
+                    await tp.fill('#taskInput', `Layout tour task ${i}`);
+                    await tp.press('#taskInput', 'Enter');
+                    await tp.waitForTimeout(120);
+                }
+
+                for (const vp of VIEWPORTS) {
+                    await tp.setViewportSize({ width: vp.width, height: vp.height });
+                    await tp.waitForTimeout(600);
+                    await tp.evaluate(() => window.scrollTo(0, 0));
+                    await tp.waitForTimeout(100);
+                    const t = await tp.evaluate(measureFirstRunTour);
+                    console.log(`\n${colors.cyan}▸ tour ${vp.name} ${vp.width}x${vp.height}${colors.reset}`);
+                    record(vp, 'tour is active', t.active, 'first-run-welcome-active not on <body>');
+                    record(vp, 'tour: nothing sits behind the banner', t.covered.length === 0,
+                        `${t.covered.join(', ')} < banner.bottom ${t.bannerBottom}`);
+                    record(vp, 'tour: whole routine reachable by page scroll',
+                        t.contentBottom !== null && t.contentBottom <= t.scrollHeight + TOL,
+                        `task-view ends at ${t.contentBottom} but the page only scrolls to ${t.scrollHeight}`);
+                    record(vp, 'tour: task list has no inner scroll', t.listInnerScroll <= TOL,
+                        `.task-list-container scrolls ${t.listInnerScroll}px on its own`);
+                }
+
+                // Skip → the locked focus view comes back: no page scroll at all.
+                await tp.evaluate(() => {
+                    const skip = document.querySelector('.first-run-welcome button[class*="skip" i]')
+                        || [...document.querySelectorAll('.first-run-welcome button')]
+                            .find(b => /^\s*skip\s*$/i.test(b.textContent));
+                    if (skip) skip.click();
+                });
+                await tp.waitForFunction(
+                    () => !document.body.classList.contains('first-run-welcome-active'), null, { timeout: 5000 });
+                for (const vp of VIEWPORTS) {
+                    await tp.setViewportSize({ width: vp.width, height: vp.height });
+                    await tp.waitForTimeout(400);
+                    const extra = await tp.evaluate(() => document.scrollingElement.scrollHeight - innerHeight);
+                    record(vp, 'after Skip: focus view is locked (no page scroll)', extra <= TOL,
+                        `page still scrolls ${extra}px after the tour ended`);
+                }
+
+                // ── The eye / × control sits at the ACTIVE panel's bottom-right ──
+                // One element each, moved by focusMode into the active panel's
+                // slot (panelCarousel:changed). Before Oct 2026 it lived only in
+                // the routine card's progress row, so Stats and the Task panel
+                // had no way in or out of Focus View of their own. "Bottom-right
+                // of THAT panel": inside the panel's box, within one control's
+                // width of its right edge and within one row of its bottom edge
+                // — a shorter panel puts it higher, by design.
+                const controlPlacement = async (vp, hostSel, boxSel, btnId, label) => {
+                    const r = await tp.evaluate(({ hostSel, boxSel, btnId }) => {
+                        const host = document.querySelector(hostSel); const box = document.querySelector(boxSel); const btn = document.getElementById(btnId);
+                        if (!host || !box || !btn) return null;
+                        const p = box.getBoundingClientRect(); const b = btn.getBoundingClientRect(); const c = getComputedStyle(btn);
+                        const nav = document.getElementById('nav-dots'); const navRect = nav ? nav.getBoundingClientRect() : null;
+                        return { visible: b.width > 0 && c.display !== 'none' && c.visibility !== 'hidden', hostOk: !!btn.closest(hostSel),
+                            below: b.top >= p.bottom - 1, drop: Math.round(b.top - p.bottom), rightOffset: Math.round(p.right - b.right),
+                            navLine: navRect && navRect.height > 0 ? Math.round(navRect.top) : null, bottom: Math.round(b.bottom) };
+                    }, { hostSel, boxSel, btnId });
+                    record(vp, `${label}: control is visible`, !!r && r.visible, 'control hidden or missing');
+                    // BENEATH the panel's box, hanging off its lower-right corner, like the
+                    // routine card: a hair below it (1-8px — not touching, not a gap) with
+                    // the right edges aligned — never inside it.
+                    record(vp, `${label}: control hangs just beneath the panel at its lower-right`, !!r && r.hostOk && r.below && r.drop >= 1 && r.drop <= 8 && Math.abs(r.rightOffset) <= 6,
+                        r ? `host=${r.hostOk} below=${r.below} drop=${r.drop} rightOffset=${r.rightOffset}` : 'not found');
+                    if (r && r.navLine !== null) {
+                        record(vp, `${label}: control clears the nav dots`, r.bottom <= r.navLine + TOL, `control.bottom ${r.bottom} > navLine ${r.navLine}`);
+                    }
+                };
+                const goDot = async (panelId) => { await tp.evaluate((id) => document.querySelector(`#nav-dots .dot[aria-controls="${id}"]`)?.click(), panelId); await tp.waitForTimeout(600); };
+                for (const vp of [VIEWPORTS[0], VIEWPORTS[4], VIEWPORTS[6]]) {
+                    await tp.setViewportSize({ width: vp.width, height: vp.height });
+                    await tp.waitForTimeout(400);
+                    console.log(`\n${colors.cyan}▸ ${vp.name} ${vp.width}x${vp.height} (control follows the panel)${colors.reset}`);
+                    // The Complete Cycle / Clear action button (#focus-action-btn, its
+                    // own fixed element under <body>) must NOT move with the carousel
+                    // and must sit at the viewport's bottom-right: panels are
+                    // transformed, and a transformed ancestor captures position:
+                    // fixed — which is how the old eye-as-action-button jumped to the
+                    // Stats / Task panel's corner when the eye followed the × (Oct 2026).
+                    await tp.evaluate(() => { const s = document.getElementById('mode-selector'); if (s && s.value !== 'manual-cycle') { s.value = 'manual-cycle'; s.dispatchEvent(new Event('change', { bubbles: true })); } });
+                    await tp.waitForTimeout(500);
+                    const actionRect = () => tp.evaluate(() => { const el = document.getElementById('focus-action-btn'); const b = el?.getBoundingClientRect(); return b && b.width > 0 ? [Math.round(b.left), Math.round(b.top), el.parentNode === document.body, Math.round(innerWidth - b.right), Math.round(innerHeight - b.bottom)] : null; });
+                    await goDot('task-view');
+                    const actionHome = await actionRect();
+                    await goDot('stats-panel');
+                    const actionOnStats = await actionRect();
+                    await goDot('focus-task-panel');
+                    const actionOnTask = await actionRect();
+                    record(vp, 'focus: the action button (Complete Cycle / Clear) stays put across panels, at the viewport\'s bottom-right',
+                        !!actionHome && actionHome[2] && actionHome[3] <= 32 && actionHome[4] <= 64
+                            && JSON.stringify(actionHome) === JSON.stringify(actionOnStats) && JSON.stringify(actionHome) === JSON.stringify(actionOnTask),
+                        `routine ${JSON.stringify(actionHome)} vs stats ${JSON.stringify(actionOnStats)} vs task ${JSON.stringify(actionOnTask)} ([left, top, underBody, fromRight, fromBottom])`);
+                    await goDot('stats-panel');
+                    await controlPlacement(vp, '#stats-panel', '#stats-panel', 'focus-mode-exit-btn', 'focus: Stats panel ×');
+                    await goDot('focus-task-panel');
+                    await controlPlacement(vp, '#focus-task-panel', '#focus-task-panel .focus-task-card', 'focus-mode-exit-btn', 'focus: Task panel ×');
+                    await goDot('task-view');
+                    await controlPlacement(vp, '#task-view .progress-focus-row', '#task-view .task-card', 'focus-mode-exit-btn', 'focus: routine card ×');
+                    // Home view: the eye, on the Stats panel too.
+                    await tp.evaluate(() => document.getElementById('focus-mode-exit-btn')?.click());
+                    await tp.waitForTimeout(700);
+                    record(vp, 'the × leaves Focus View', !(await tp.evaluate(() => document.body.classList.contains('focus-mode'))), 'focus-mode still on <body>');
+                    await goDot('stats-panel');
+                    await controlPlacement(vp, '#stats-panel', '#stats-panel', 'focus-mode-btn', 'home: Stats panel eye');
+                    await goDot('task-view');
+                    await controlPlacement(vp, '#task-view .progress-focus-row', '#task-view .task-card', 'focus-mode-btn', 'home: routine card eye');
+                    await tp.evaluate(() => document.getElementById('focus-mode-btn')?.click());
+                    await tp.waitForTimeout(700);
+                    record(vp, 'the eye re-enters Focus View', await tp.evaluate(() => document.body.classList.contains('focus-mode')), 'focus-mode not on <body>');
+                }
+
+                // ── Focus view, SHORT routine: the list background hugs the tasks ──
+                // The band bounds the content; it must not inflate it. The card
+                // group is flex-grow 1 for Home view, so in the band (whose box
+                // is the band's full height) anything that does not pin it to
+                // flex-grow 0 stretches the list background over the free space:
+                // 274px of empty list below three tasks at 1280x800 (2.597-2.600,
+                // when the pin was still scoped to <1024px). A list that is FULL
+                // scrolls instead, and then the last task sits below the list's
+                // edge, which passes this check by construction. The six-task
+                // tour routine fits every band here.
+                for (const vp of VIEWPORTS) {
+                    await tp.setViewportSize({ width: vp.width, height: vp.height });
+                    await tp.waitForTimeout(500);
+                    const hug = await tp.evaluate(() => {
+                        const list = document.querySelector('.task-list-container');
+                        const items = document.querySelectorAll('#taskList li');
+                        if (!list || !items.length) return null;
+                        const last = items[items.length - 1].getBoundingClientRect();
+                        const lr = list.getBoundingClientRect();
+                        return { empty: Math.round(lr.bottom - last.bottom), pad: parseFloat(getComputedStyle(list).paddingBottom) || 0, tasks: items.length };
+                    });
+                    if (hug) {
+                        record(vp, `focus list hugs a short routine (${hug.tasks} tasks, no stretched background)`,
+                            hug.empty <= hug.pad + 8 + TOL,
+                            `${hug.empty}px of list below the last task against ${hug.pad}px of padding — the card group is growing to fill the band`);
+                    }
+                }
+
+                // ── Focus view, long routine, short desktop window ──────────
+                // At >=1024px #task-view is centred and content-sized
+                // (focus-mode.css), so the chrome floor is only exercised when
+                // the content is tall relative to the window. The main loop's
+                // page has NO routine (fresh storage, choice screen bypassed), so
+                // its focus checks ran against an empty list — which is how the
+                // input bar sat under the header row at 1100x600 with 13 tasks
+                // (Oct 2026) while everything passed. This page has the tour's
+                // routine; lengthen it and re-check on the windows where the cap
+                // binds, plus the tall desktop where it must NOT move anything.
+                const seeded = await tp.evaluate(async () => {
+                    const input = document.getElementById('taskInput');
+                    const add = document.getElementById('addTaskBtn');
+                    if (!input || !add) return -1;
+                    const before = document.querySelectorAll('#taskList li').length;
+                    for (let i = 1; i <= 8; i++) {
+                        input.value = `Layout focus task ${i}`;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        add.click();
+                        await new Promise(r => setTimeout(r, 120));
+                    }
+                    return document.querySelectorAll('#taskList li').length - before;
+                });
+                record({ name: 'long-routine-seed', width: 0, height: 0 },
+                    'lengthened the tour routine for the focus-view floor checks', seeded >= 8,
+                    `${seeded} task(s) added (expected 8)`);
+                await tp.evaluate(() => {
+                    document.body.classList.add('focus-mode');
+                    document.dispatchEvent(new CustomEvent('focusMode:activated', { detail: {} }));
+                });
+                await tp.waitForTimeout(450);
+
+                // Input bar showing: it is part of the band's content and the
+                // iPad report had it up. (Skip restores whatever the tour left.)
+                await tp.evaluate(() => document.body.classList.add('input-bar-visible'));
+                const LONG_ROUTINE_VIEWPORTS = [
+                    { name: 'desktop-short-long',   width: 1100, height: 600 },
+                    { name: 'tablet-land-long',     width: 1024, height: 768 },
+                    { name: 'desktop-long',         width: 1280, height: 800 },
+                    { name: 'tablet-portrait-long', width: 834,  height: 1112 },
+                    { name: 'phone-tall-long',      width: 375,  height: 812 },
+                    { name: 'landscape-short-long', width: 820,  height: 480 },
+                    { name: 'phone-short-long',     width: 375,  height: 560 },
+                ];
+                for (const vp of LONG_ROUTINE_VIEWPORTS) {
+                    await tp.setViewportSize({ width: vp.width, height: vp.height });
+                    await tp.waitForTimeout(500);
+                    console.log(`\n${colors.cyan}▸ ${vp.name} ${vp.width}x${vp.height} (focus, 14 tasks)${colors.reset}`);
+                    const f = await tp.evaluate(measureFocus);
+                    record(vp, 'focus chrome var matches the live chrome',
+                        f.liveChromeBottom !== null && Math.abs(f.publishedVar - f.liveChromeBottom) <= TOL,
+                        `--focus-chrome-bottom=${f.publishedVar} vs live ${f.liveChromeBottom}`);
+                    if (f.contentTop !== null && f.liveChromeBottom !== null) {
+                        record(vp, `focus content keeps ${f.chromeFloor}px from the painted chrome`,
+                            f.contentTop >= f.liveChromeBottom + f.chromeFloor - TOL,
+                            `content.top ${f.contentTop} < chrome.bottom ${f.liveChromeBottom} + ${f.chromeFloor}`);
+                    }
+                    if (f.taskViewBottom !== null && f.navLine !== null) {
+                        record(vp, 'focus band clears nav dots',
+                            f.taskViewBottom <= f.navLine + TOL,
+                            `task-view.bottom ${f.taskViewBottom} > navLine ${f.navLine}`);
+                    }
+                    // The content has to FIT the band, not just the wrapper: with
+                    // the chain above the list unable to shrink, a long routine
+                    // overflowed the band by 120px on iPad portrait and put the
+                    // progress row, × and status pill over the nav dots (Oct 2026)
+                    // while every wrapper check passed. Below 1024px the wrapper's
+                    // overflow is visible at tablet widths and hidden on phones, so
+                    // measure the painted content: the last thing in the band is
+                    // the help window; the progress row (with the ×) is the one
+                    // above it. Both must end above the nav line. Known-short
+                    // viewports (<520px tall) are reported, not asserted — same
+                    // product call as the main loop.
+                    if (f.navLine !== null && (f.helpBottom !== null || f.progressBottom !== null)) {
+                        const last = Math.max(f.helpBottom || 0, f.progressBottom || 0);
+                        if (vp.height < 520) {
+                            console.log(`   ${colors.yellow}⚠${colors.reset}  ${vp.name.padEnd(26)} `
+                                + `${colors.gray}focus content vs nav dots (known, ${vp.height}px tall): `
+                                + `content.bottom ${last} vs navLine ${f.navLine}${colors.reset}`);
+                        } else {
+                            record(vp, 'focus content (progress row, help window) clears nav dots',
+                                last <= f.navLine + TOL,
+                                `content.bottom ${last} > navLine ${f.navLine}`);
+                            // ...and USES the band. A long routine must fill it: the
+                            // band's bottom edge sits --focus-band-bottom-gap above
+                            // the nav line, and the last painted thing must reach
+                            // that edge. Desktop sat ~90px short of the dots until
+                            // Oct 2026 (centred, list capped at 100dvh - 340px);
+                            // this is what stops a literal cap creeping back in at
+                            // any width. The × overhangs the progress row, hence
+                            // the row's own bottom rather than the ×'s.
+                            const bandGap = f.bandBottomGap;
+                            record(vp, 'focus band reaches the nav dots (no dead space)',
+                                f.taskViewBottom >= f.navLine - bandGap - TOL,
+                                `band.bottom ${f.taskViewBottom} is ${f.navLine - f.taskViewBottom}px above the nav line (gap token ${bandGap})`);
+                            record(vp, 'long routine fills the band',
+                                f.contentBottom >= f.taskViewBottom - TOL,
+                                `content.bottom ${f.contentBottom} < band.bottom ${f.taskViewBottom} — the list is capped short of the band`);
+                        }
+                    }
+                }
+
+                // ── Home view, long routine, both cycle modes ──────────────
+                // Leave focus view through the real ✕ so the band vars are
+                // re-measured for Home. The main loop's Home checks run on an
+                // empty routine; on iPad with 15 tasks the status pill sat 44px
+                // into the nav dots (Auto) and the Complete Cycle button 100px
+                // into them (Manual), with the pill over the footer — nothing
+                // above 768px could shrink, and the caps were literals (Oct
+                // 2026). Drive both modes through the real mode selector.
+                await tp.evaluate(() => document.getElementById('focus-mode-exit-btn')?.click());
+                await tp.waitForTimeout(600);
+                const HOME_LONG_VIEWPORTS = [
+                    { name: 'home-tablet-portrait-long', width: 834,  height: 1112 },
+                    { name: 'home-tablet-land-long',     width: 1024, height: 768 },
+                    { name: 'home-tablet-land-xl-long',  width: 1112, height: 834 },
+                    { name: 'home-desktop-long',         width: 1280, height: 800 },
+                    { name: 'home-phone-tall-long',      width: 390,  height: 844 },
+                    { name: 'home-phone-short-long',     width: 375,  height: 560 },
+                ];
+                for (const mode of ['auto-cycle', 'manual-cycle']) {
+                    await tp.evaluate((m) => { const sel = document.getElementById('mode-selector'); sel.value = m; sel.dispatchEvent(new Event('change', { bubbles: true })); }, mode);
+                    await tp.waitForTimeout(500);
+                    for (const base of HOME_LONG_VIEWPORTS) {
+                        const vp = { ...base, name: `${base.name}:${mode === 'auto-cycle' ? 'auto' : 'manual'}` };
+                        await tp.setViewportSize({ width: vp.width, height: vp.height });
+                        await tp.evaluate(() => document.body.classList.remove('focus-mode'));
+                        await tp.waitForTimeout(600);
+                        console.log(`\n${colors.cyan}▸ ${vp.name} ${vp.width}x${vp.height} (home, 14 tasks)${colors.reset}`);
+                        const hm = await tp.evaluate(measureHome);
+                        record(vp, 'home: a focus-mode leftover is not on <body>',
+                            !(await tp.evaluate(() => document.body.classList.contains('focus-mode'))), 'focus-mode still set');
+                        if (hm.titleTop !== null) {
+                            record(vp, 'home: title clears header', hm.titleTop >= hm.headerBottom - TOL,
+                                `title.top ${hm.titleTop} < header.bottom ${hm.headerBottom}`);
+                        }
+                        if (hm.contentBottom !== null && hm.navLine !== null) {
+                            record(vp, 'home: last painted content (pill / Complete button) clears nav dots',
+                                hm.contentBottom <= hm.navLine + TOL,
+                                `content.bottom ${hm.contentBottom} > navLine ${hm.navLine}`);
+                            if (vp.height >= 520) {
+                                // The box is centred on the band and capped to it, so
+                                // with a long routine its bottom edge sits --home-band-gap
+                                // above the nav line, and the last element (plus its own
+                                // margin) reaches that edge. This is the no-dead-space half.
+                                record(vp, 'home: box reaches the band edge',
+                                    hm.taskViewBottom >= hm.navLine - hm.gap - TOL,
+                                    `task-view.bottom ${hm.taskViewBottom} is ${hm.navLine - hm.taskViewBottom}px above the nav line (gap token ${hm.gap})`);
+                                record(vp, 'home: long routine fills the band',
+                                    hm.fillBottom !== null && hm.fillBottom >= hm.taskViewBottom - TOL,
+                                    `content reaches ${hm.fillBottom} (margins included) < box.bottom ${hm.taskViewBottom} — a literal cap is binding`);
+                            }
+                        }
+                    }
+                }
+            } finally {
+                await tourContext.close();
+            }
+        }
+
+        // ── Static pages: no sideways scroll at any width ────────────────────
+        // Separate phase because these pages have no app chrome and no
+        // ResizeObserver plumbing — one navigation per page, then a width sweep.
+        for (const pageDef of STATIC_PAGES) {
+            console.log(`\n${colors.cyan}▸ ${pageDef.name} ${pageDef.path}${colors.reset}`);
+            await page.goto(`${baseURL}${pageDef.path}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+            for (const width of STATIC_WIDTHS) {
+                await page.setViewportSize({ width, height: 900 });
+                // Media queries + any reveal/animation settling.
+                await page.waitForTimeout(350);
+                const { overflowPx, offender } = await page.evaluate(measureHorizontalOverflow);
+                const vp = { name: `${pageDef.name} @${width}`, width, height: 900 };
+                record(vp, 'page does not scroll sideways', overflowPx <= TOL,
+                    `${overflowPx}px of horizontal overflow — ${offender}`);
+            }
+        }
+    } catch (e) {
+        console.error(`\n${colors.red}❌ Test run errored: ${e.message}${colors.reset}`);
+        failures.push(`run error: ${e.message}`);
+    } finally {
+        await context.close();
+        await browser.close();
+        if (srv) await srv.close();
+    }
+
+    console.log(`\n${colors.blue}${'='.repeat(64)}${colors.reset}`);
+    if (failures.length === 0) {
+        console.log(`${colors.green}🎉 All layout invariants hold across ${VIEWPORTS.length} app viewports`
+            + ` and ${STATIC_PAGES.length} static page(s) x ${STATIC_WIDTHS.length} widths.${colors.reset}`);
+        console.log(`${colors.blue}${'='.repeat(64)}${colors.reset}\n`);
+        process.exit(0);
+    } else {
+        console.log(`${colors.red}⚠️  ${failures.length} layout invariant(s) violated:${colors.reset}`);
+        failures.forEach(f => console.log(`   ${colors.red}• ${f}${colors.reset}`));
+        console.log(`${colors.blue}${'='.repeat(64)}${colors.reset}\n`);
+        process.exit(1);
+    }
+}
+
+process.on('unhandledRejection', (e) => {
+    console.error(`${colors.red}❌ Unhandled: ${e.message}${colors.reset}`);
+    process.exit(1);
+});
+
+run();

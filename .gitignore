@@ -1,0 +1,5 @@
+.DS_Store
+web/node_modules/
+web/test-results/
+web/dist/
+web/scripts/__pycache__/

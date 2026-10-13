@@ -1,0 +1,350 @@
+/**
+ * SettingsUIManager Tests
+ * Tests for modules/ui/settingsUIManager.js
+ */
+
+import { setupTestEnvironment, createProtectedTest } from './testHelpers.js';
+
+export async function runSettingsUIManagerTests(resultsDiv) {
+    const cacheBuster = window.testCacheBuster || Date.now();
+    const mod = await import(`../modules/ui/settingsUIManager.js?v=${cacheBuster}`);
+
+    resultsDiv.innerHTML = '<h2>SettingsUIManager Tests</h2><h3>Running tests...</h3>';
+    let passed = { count: 0 }, total = { count: 0 };
+    const test = createProtectedTest(resultsDiv, passed, total);
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">📦 Module Loading</h4>';
+
+    await test('setSettingsUIManagerDependencies is exported as a function', () => {
+        if (typeof mod.setSettingsUIManagerDependencies !== 'function') throw new Error('Missing export');
+    });
+
+    await test('setupSettingsMenu is exported as a function', () => {
+        if (typeof mod.setupSettingsMenu !== 'function') throw new Error('Missing export');
+    });
+
+    await test('initAllToggles is exported as a function', () => {
+        if (typeof mod.initAllToggles !== 'function') throw new Error('Missing export');
+    });
+
+    await test('setupDarkModeToggle is exported as a function', () => {
+        if (typeof mod.setupDarkModeToggle !== 'function') throw new Error('Missing export');
+    });
+
+    // ============================================
+    // 🎚️ Toggle setup behavior (AppState-driven initial state)
+    // These read saved settings and reflect them onto the DOM. Each clears the
+    // module idempotency guards via _resetForTesting() and cleans up the classes/
+    // CSS vars it applied so tests stay isolated.
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">🎚️ Toggle Setup Behavior</h4>';
+
+    // AppState reaches the module as a callable (a Proxy in production), so the
+    // mock is a factory.
+    const appStateWith = (state) => () => ({ isReady: () => true, get: () => state, update: async (fn) => fn(state) });
+    const wire = (settings) => mod.setSettingsUIManagerDependencies({
+        AppState: appStateWith({ settings }),
+        safeAddEventListener: (el, ev, fn) => el.addEventListener(ev, fn),
+        showNotification: () => {}
+    });
+
+    await test('setupReducedMotionToggle reflects saved state onto toggle + root classes', () => {
+        mod._resetForTesting();
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.id = 'toggle-reduced-motion';
+        document.body.appendChild(toggle);
+        try {
+            wire({ reducedMotion: true });
+            mod.setupReducedMotionToggle();
+            if (toggle.checked !== true) throw new Error('toggle should be checked when reducedMotion is saved true');
+            if (!document.body.classList.contains('reduced-motion')) throw new Error('body should get reduced-motion class');
+            if (!document.documentElement.classList.contains('reduced-motion')) throw new Error('root should get reduced-motion class');
+        } finally {
+            toggle.remove();
+            document.body.classList.remove('reduced-motion');
+            document.documentElement.classList.remove('reduced-motion');
+        }
+    });
+
+    await test('setupHighContrastToggle reflects saved state onto toggle + body class', () => {
+        mod._resetForTesting();
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.id = 'toggle-high-contrast';
+        document.body.appendChild(toggle);
+        try {
+            wire({ highContrast: true });
+            mod.setupHighContrastToggle();
+            if (toggle.checked !== true) throw new Error('toggle should be checked when highContrast is saved true');
+            if (!document.body.classList.contains('high-contrast')) throw new Error('body should get high-contrast class');
+        } finally {
+            toggle.remove();
+            document.body.classList.remove('high-contrast');
+        }
+    });
+
+    await test('setupFontSizeSelect applies the saved size to the select + --font-size-base', () => {
+        mod._resetForTesting();
+        const select = document.createElement('select');
+        select.id = 'font-size-select';
+        [16, 20].forEach(v => { const o = document.createElement('option'); o.value = String(v); select.appendChild(o); });
+        document.body.appendChild(select);
+        try {
+            wire({ fontSize: '20' });
+            mod.setupFontSizeSelect();
+            if (select.value !== '20') throw new Error(`select should show saved size, got "${select.value}"`);
+            // Source: non-default sizes set the root CSS var to `${size}px`.
+            if (document.documentElement.style.getPropertyValue('--font-size-base') !== '20px') {
+                throw new Error(`--font-size-base should be 20px, got "${document.documentElement.style.getPropertyValue('--font-size-base')}"`);
+            }
+        } finally {
+            select.remove();
+            document.documentElement.style.removeProperty('--font-size-base');
+        }
+    });
+
+    await test('applyPriorityColor sets the global var and leaves per-task colours to the renderers', () => {
+        // No idempotency guard / no listener — purely AppState-driven.
+        // Per-task colours are the task's LEVEL under the active theme, painted by
+        // taskDOM / taskDOMPatch. This pass used to write the raw stored hex over
+        // them on startup, undoing the theme mapping for the whole list.
+        mod.setSettingsUIManagerDependencies({
+            AppState: appStateWith({
+                settings: { defaultPriority: 'high' },
+                appState: { activeRoutineId: 'c1' },
+                data: { routine: { c1: { tasks: [{ id: 't1', priority: 'low' }] } } }
+            })
+        });
+        const el = document.createElement('div');
+        el.setAttribute('data-task-id', 't1');
+        document.body.appendChild(el);
+        try {
+            mod.applyPriorityColor();
+            if (document.documentElement.style.getPropertyValue('--priority-color') !== '#dc3545') {
+                throw new Error('global --priority-color should be the default level\'s swatch');
+            }
+            if (el.style.getPropertyValue('--task-priority-color') !== '') {
+                throw new Error('applyPriorityColor must not write the stored per-task hex over the renderer\'s colour');
+            }
+        } finally {
+            el.remove();
+            document.documentElement.style.removeProperty('--priority-color');
+        }
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">💾 syncCurrentSettingsToStorage</h4>';
+
+    await test('syncCurrentSettingsToStorage writes toggle states into the active cycle', async () => {
+        const autoReset = document.createElement('input');
+        autoReset.type = 'checkbox'; autoReset.id = 'toggleAutoReset'; autoReset.checked = true;
+        const delChecked = document.createElement('input');
+        delChecked.type = 'checkbox'; delChecked.id = 'deleteCheckedTasks'; delChecked.checked = false;
+        document.body.appendChild(autoReset);
+        document.body.appendChild(delChecked);
+
+        // AppState is resolved as a FACTORY here (_deps.AppState?.()), and update() mutates
+        // state.data.routine[activeCycle]. Capture that state so we can assert the writes.
+        const captured = { data: { routine: { c1: {} } }, appState: { activeRoutineId: 'c1' } };
+        mod.setSettingsUIManagerDependencies({
+            AppState: () => ({ isReady: () => true, get: () => captured, update: async (fn) => fn(captured) })
+        });
+
+        try {
+            await mod.syncCurrentSettingsToStorage();
+            if (captured.data.routine.c1.autoReset !== true) throw new Error('autoReset should mirror the checked toggle');
+            if (captured.data.routine.c1.deleteCheckedTasks !== false) throw new Error('deleteCheckedTasks should mirror the unchecked toggle');
+        } finally {
+            autoReset.remove();
+            delChecked.remove();
+        }
+    });
+
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">⚙️ DI Setup</h4>';
+
+    await test('injected dependencies actually take effect (not just no-throw)', () => {
+        // Prove the injected AppState is the one applyPriorityColor reads.
+        let read = false;
+        mod.setSettingsUIManagerDependencies({
+            AppState: () => ({ isReady: () => true, get: () => { read = true; return { settings: {} }; } })
+        });
+        mod.applyPriorityColor();
+        if (!read) throw new Error('applyPriorityColor should read the injected AppState');
+    });
+
+    await test('setSettingsUIManagerDependencies(null) preserves previously injected deps', () => {
+        let read = false;
+        mod.setSettingsUIManagerDependencies({ AppState: () => ({ isReady: () => true, get: () => { read = true; return { settings: {} }; } }) });
+        mod.setSettingsUIManagerDependencies(null); // no-op in diBase — must not wipe deps
+        mod.applyPriorityColor();
+        if (!read) throw new Error('a null DI call should not clear the previously injected AppState');
+    });
+
+    // ============================================
+    // 🚨 Irreversible operations must use the high-friction confirmation
+    //
+    // `destructive: true` does two things in notifications.js: red confirm
+    // button, AND it skips arming the Enter-anywhere handler. Without it, a
+    // stray Enter while the settings panel is open confirms the dialog.
+    //
+    // Both operations below are permanently irreversible — neither
+    // userProgress/achievements nor the undo stores are recoverable once
+    // cleared — so a one-line omission here has no undo path. It regresses
+    // silently, hence these tests.
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">🚨 Destructive Confirmations</h4>';
+
+    /** Wire deps, click the button, and return the options showConfirmationModal got. */
+    const captureConfirmOptions = (buttonId, setupFn) => {
+        mod._resetForTesting();
+        const btn = document.createElement('button');
+        btn.id = buttonId;
+        document.body.appendChild(btn);
+        let captured = null;
+        try {
+            mod.setSettingsUIManagerDependencies({
+                AppState: appStateWith({ settings: {} }),
+                safeAddEventListener: (el, ev, fn) => el.addEventListener(ev, fn),
+                showNotification: () => {},
+                // Capture and never invoke the callback — we are asserting on how
+                // the dialog is CONFIGURED, not on what confirming would do.
+                showConfirmationModal: (options) => { captured = options; }
+            });
+            setupFn();
+            btn.click();
+        } finally {
+            btn.remove();
+        }
+        return captured;
+    };
+
+    await test('Reset Achievement Progress opens a destructive confirmation', () => {
+        const options = captureConfirmOptions('reset-achievement-progress', mod.setupResetAchievementProgressButton);
+        if (!options) throw new Error('showConfirmationModal was never called');
+        if (options.destructive !== true) {
+            throw new Error(
+                'Resetting achievements is irreversible (userProgress/achievements are not restorable ' +
+                `from an undo snapshot) but destructive was ${options.destructive} — Enter anywhere would confirm it`
+            );
+        }
+    });
+
+    await test('Clear Undo History opens a destructive confirmation', () => {
+        const options = captureConfirmOptions('clear-undo-history', mod.setupClearUndoHistoryButton);
+        if (!options) throw new Error('showConfirmationModal was never called');
+        if (options.destructive !== true) {
+            throw new Error(
+                'Clearing undo history destroys the mechanism that would reverse it, but destructive ' +
+                `was ${options.destructive} — Enter anywhere would confirm it`
+            );
+        }
+    });
+
+    // ============================================
+    // 🔁 Setup must survive being called before state is ready
+    // ============================================
+    resultsDiv.innerHTML += '<h4 class="test-section">🔁 Re-wirable after a state-not-ready call</h4>';
+
+    // `core-ready does not mean state-ready`: on a first run AppState.init()
+    // deliberately returns with data = null, so the settings UI can initialise
+    // while currentSettings() is still empty. A setup function that latches its
+    // idempotency flag BEFORE that guard converts the transient miss into a
+    // permanent one — it can never be retried, so the change handler is never
+    // attached and the control is dead for the session.
+    //
+    // This is the sequence that exposes it, and the ONLY one that does:
+    //   setup() with state missing  →  state becomes ready  →  setup() again
+    // A test that boots with state already ready passes either way.
+    //
+    // Measured Oct 2026 before the fix: the checkbox flipped to checked:true,
+    // settings.showThreeDots stayed false, the body class never applied, and zero
+    // three-dots buttons were built. So the assertion reads the STORED value, never
+    // `toggle.checked` — the browser sets `checked` on click whether or not a
+    // handler exists, which is exactly why this looked like it worked.
+    await test('setupThreeDotsToggle still wires up when the first call happened before state was ready', async () => {
+        mod._resetForTesting();
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.id = 'toggle-three-dots';   // DOM_IDS.TOGGLE_THREE_DOTS
+        document.body.appendChild(toggle);
+        try {
+            // 1. First run: element present, state NOT ready.
+            mod.setSettingsUIManagerDependencies({
+                AppState: () => ({ isReady: () => false, get: () => null, update: async () => {} }),
+                safeAddEventListener: (el, ev, fn) => el.addEventListener(ev, fn),
+                showNotification: () => {}
+            });
+            mod.setupThreeDotsToggle();
+
+            // 2. State becomes ready (the first-run choice screen persisted a routine).
+            const live = { settings: { showThreeDots: false } };
+            mod.setSettingsUIManagerDependencies({
+                AppState: () => ({ isReady: () => true, get: () => live, update: async (fn) => fn(live) }),
+                safeAddEventListener: (el, ev, fn) => el.addEventListener(ev, fn),
+                showNotification: () => {}
+            });
+
+            // 3. Re-run, exactly as initAllToggles() would on the next pass.
+            mod.setupThreeDotsToggle();
+
+            // 4. The handler must now exist AND persist. Assert the stored value.
+            toggle.checked = true;
+            toggle.dispatchEvent(new Event('change', { bubbles: true }));
+            await new Promise(r => setTimeout(r, 60));
+
+            if (live.settings.showThreeDots !== true) {
+                throw new Error('the toggle did not persist showThreeDots after a state-not-ready first call — '
+                    + 'the idempotency flag latched before the state guard, so the change handler was never attached '
+                    + 'and the control is dead for the session');
+            }
+            if (!document.body.classList.contains('show-three-dots-enabled')) {
+                throw new Error('showThreeDots persisted but the body class was not applied, so nothing re-renders');
+            }
+        } finally {
+            toggle.remove();
+            document.body.classList.remove('show-three-dots-enabled');
+        }
+    });
+
+    await test('setupThreeDotsToggle is still idempotent once it HAS wired successfully', () => {
+        mod._resetForTesting();
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.id = 'toggle-three-dots';
+        document.body.appendChild(toggle);
+        let attachCount = 0;
+        try {
+            // Latching late must not mean latching never — a second call after a
+            // SUCCESSFUL wire has to be a no-op, or every re-init stacks a handler.
+            mod.setSettingsUIManagerDependencies({
+                AppState: () => ({ isReady: () => true, get: () => ({ settings: { showThreeDots: false } }), update: async () => {} }),
+                safeAddEventListener: (el, ev, fn) => { attachCount++; el.addEventListener(ev, fn); },
+                showNotification: () => {}
+            });
+            mod.setupThreeDotsToggle();
+            mod.setupThreeDotsToggle();
+            mod.setupThreeDotsToggle();
+            if (attachCount !== 1) {
+                throw new Error(`expected exactly one listener attach across three calls, got ${attachCount} — `
+                    + 'the idempotency guard is not holding after a successful wire');
+            }
+        } finally {
+            toggle.remove();
+            document.body.classList.remove('show-three-dots-enabled');
+        }
+    });
+
+
+    // ============================================
+    const percentage = Math.round((passed.count / total.count) * 100);
+    resultsDiv.innerHTML += `<h3>Results: ${passed.count}/${total.count} tests passed (${percentage}%)</h3>`;
+    if (passed.count === total.count) {
+        resultsDiv.innerHTML += '<div class="result pass">✅ All tests passed!</div>';
+    } else {
+        resultsDiv.innerHTML += `<div class="result fail">⚠️ ${total.count - passed.count} test(s) failed</div>`;
+    }
+    return { passed: passed.count, total: total.count };
+}

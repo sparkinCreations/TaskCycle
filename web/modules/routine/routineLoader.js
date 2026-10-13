@@ -1,0 +1,602 @@
+/**
+ * miniCycle Routine Loader Module (Schema 2.5, DI-Pure)
+ * - Pure module with explicit dependency injection
+ * - No window probing, no stubs, no retry loops
+ * - No window.* fallbacks (DI-pure)
+ *
+ * Handles loading and rendering routines (cycles) from AppState,
+ * including task rendering, UI state updates, and theme application.
+ *
+ * @module routineLoader
+ * @see {@link file://docs/reference/DATA_SCHEMA_GUIDE.md} - Schema reference
+ */
+
+/**
+ * @typedef {import('../core/types.js').Task} Task
+ * @typedef {import('../core/types.js').Cycle} Cycle
+ * @typedef {import('../core/types.js').Schema25Data} Schema25Data
+ */
+
+import { createDIModule, optional } from '../core/diBase.js';
+import { isPriorityLevel } from '../utils/priorityLevel.js';
+import { DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS, DOM_IDS, DOM_CLASSES, FONT_SIZE } from '../core/constants.js';
+import { getLabel } from '../labels/labelResolver.js';
+import { normalizeFontSize } from '../utils/styleValidators.js';
+import { getActiveRoutineId, getRoutine, getRoutines, syncTaskAutoClear } from '../utils/cycleMode.js';
+import { announce } from '../utils/announce.js';
+// NOTE: taskToAddTaskOptions injected via DI to avoid duplicate module loading
+
+// ============================================================================
+// DEPENDENCY INJECTION SETUP (using diBase.js)
+// ============================================================================
+
+const di = createDIModule('RoutineLoader', {
+  appInit: optional(null),
+  AppState: optional(null),
+  createInitialSchema25Data: optional(null),
+  addTask: optional(null),
+  updateThemeColor: optional(null),
+  startReminders: optional(null),
+  catchUpMissedRecurringTasks: optional(null),
+  helpWindowManager: optional(null),
+  updateProgressBar: optional(null),
+  checkCompleteAllButton: optional(null),
+  updateMainMenuHeader: optional(null),
+  updateStatsPanel: optional(null),
+  syncAllTasksWithMode: optional(null),
+  taskToAddTaskOptions: optional(null),  // From taskUtils - injected to avoid duplicate module loading
+  updateSearchVisibility: optional(null),  // Task search visibility based on count
+  syncModeFromToggles: optional(null),  // Sync mode selector with routine's saved mode
+  completedTasksManager: optional(null),  // For organizing completed tasks into dropdown
+  refreshThemeLabels: optional(null),  // Re-apply vocab theme colors and labels on routine switch
+  updateRecurringInfoLink: optional(null),  // Refresh recurring count below task list on routine switch
+  TaskRenderer: optional(null),  // The ONE task projector — boot/switch render through it (see renderTasksToDOM)
+});
+
+// Late-binding deps via Proxy (standard: _deps with underscore prefix)
+/** @type {{appInit: Object|null, AppState: Object|null, createInitialSchema25Data: Function|null, addTask: Function|null, updateThemeColor: Function|null, startReminders: Function|null, catchUpMissedRecurringTasks: Function|null, updateProgressBar: Function|null, checkCompleteAllButton: Function|null, updateMainMenuHeader: Function|null, updateStatsPanel: Function|null, syncAllTasksWithMode: Function|null, taskToAddTaskOptions: Function|null, updateSearchVisibility: Function|null, syncModeFromToggles: Function|null, completedTasksManager: Object|null}} */
+const _deps = new Proxy({}, {
+  get(_, prop) {
+    return di.resolve()[prop];
+  }
+});
+
+/**
+ * Set dependencies for routine loader module
+ * @param {Object} overrides - Dependency overrides
+ * @param {Function} [overrides.AppState] - AppState getter or instance
+ * @param {Function} [overrides.addTask] - Task addition function
+ * @param {Function} [overrides.updateProgressBar] - Progress bar updater
+ * @param {Function} [overrides.syncModeFromToggles] - Mode sync function
+ */
+function setRoutineLoaderDependencies(overrides = {}) {
+  di.setDependencies(overrides);
+}
+
+/**
+ * Get AppState instance (handles both function and direct references)
+ * @returns {Object} AppState instance
+ */
+function getAppState() {
+  // ✅ Handle both getter function and direct reference
+  return typeof _deps.AppState === 'function' ? _deps.AppState() : _deps.AppState;
+}
+
+/**
+ * Assert that a dependency has been injected
+ * @param {string} name - Dependency name
+ * @param {Function} fn - Dependency function to check
+ * @throws {Error} If dependency is not a function
+ */
+function assertInjected(name, fn) {
+  if (typeof fn !== 'function') {
+    throw new Error(`routineLoader: missing dependency ${name}`);
+  }
+}
+
+/**
+ * Load and render the active routine (cycle)
+ * Main coordination function that loads tasks, updates UI, and syncs state.
+ * Called in Phase 3 after all modules are initialized.
+ *
+ * @async
+ * @returns {Promise<void>}
+ * @throws {Error} If the AppState dependency is missing
+ * @throws {Error} If addTask dependency is missing
+ */
+async function loadMiniCycle() {
+
+  const appState = getAppState();
+  if (!appState) throw new Error('routineLoader: missing dependency AppState');
+  assertInjected('addTask', _deps.addTask);
+
+  // Reads AppState only (STATE_TRUTH_MIGRATION #25): the routine rendered below
+  // IS the live state tree, never a copy parsed from storage.
+  const state = appState.isReady?.() ? appState.get() : null;
+
+  if (!state) {
+    console.error('❌ No state data found');
+    _deps.createInitialSchema25Data?.();
+    return;
+  }
+
+  const cycles = getRoutines(state) || {};
+  const activeCycleId = getActiveRoutineId(state);
+
+  if (!activeCycleId || !cycles[activeCycleId]) {
+    console.error('❌ No valid active cycle found (id:', activeCycleId, ')');
+    return;
+  }
+
+  const currentCycle = cycles[activeCycleId];
+
+  // 1) Validate and repair cycle + task data (comprehensive, like import does)
+  await repairRoutineBeforeRender(activeCycleId, currentCycle);
+
+  // What the user is looking at RIGHT NOW, captured before the render awaits.
+  // updateCycleUIState uses it to decide whether this load is a routine SWITCH
+  // worth announcing; read after the await it can already be the new title.
+  const titleBeforeLoad =
+    document.getElementById(DOM_IDS.MINI_CYCLE_TITLE)?.textContent ?? '';
+
+  // 2) Render tasks
+  // ✅ FIXED: renderTasksToDOM now calls addTask with isLoading=true
+  // This prevents addTask from pushing duplicate tasks to AppState
+  // It only creates DOM elements from the existing task data
+  await renderTasksToDOM(currentCycle.tasks || []);
+
+  // 2.5) Sync visual indicators with current mode
+  // ✅ After rendering tasks, sync all delete-when-complete visual indicators (DI-pure)
+  const syncFn = _deps.syncAllTasksWithMode;
+  if (currentCycle.tasks && syncFn) {
+    const currentMode = currentCycle.deleteCheckedTasks === true ? 'todo' : 'cycle';
+    const tasksDataMap = {};
+    currentCycle.tasks.forEach(task => {
+      tasksDataMap[task.id] = task;
+    });
+
+    syncFn(currentMode, tasksDataMap, {
+      DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS
+    });
+  }
+
+  // 3) Update UI state
+  updateCycleUIState(currentCycle, state.settings || {}, titleBeforeLoad);
+
+  // 4) Reminders
+  await setupRemindersForCycle(state.customReminders || {});
+
+  // 5) Dependent UI components
+  updateDependentComponents();
+
+  // 6) Organize completed tasks into dropdown (if feature enabled)
+  //
+  // NOW REDUNDANT on the success path, and measured so: renderTasks() projects
+  // BOTH lists from state during its atomic swap, so this found nothing to move
+  // (identical DOM with and without, v2.541). Kept rather than deleted because it
+  // is free and still covers the one path the projection does not reach —
+  // renderTasks bails early and preserves the existing DOM when a task element
+  // throws mid-build. Do not read its presence as evidence the render needs it.
+  _deps.completedTasksManager?.organize?.();
+
+}
+
+/**
+ * Warning sink for repairAndCleanTasks: silent for the detection pass on a copy
+ * (the same repair then runs for real and logs), console.warn otherwise.
+ * Kept out of repairAndCleanTasks so the branch does not add to its complexity.
+ * @param {boolean} quiet
+ * @returns {Function}
+ */
+function repairLogger(quiet) {
+  if (quiet) return () => {};
+  return (...args) => console.warn(...args);
+}
+
+/**
+ * Repair & cleanup - validates and repairs cycle-level AND task-level data
+ * Handles corrupted or incomplete data gracefully (like import does)
+ */
+function repairAndCleanTasks(currentCycle, cycleKey = 'unknown', { quiet = false } = {}) {
+  // quiet: used by the detection pass on a copy, so each repair is only logged once
+  const warn = repairLogger(quiet);
+  let tasksModified = false;
+
+  // ============================================================================
+  // CYCLE-LEVEL VALIDATION (matches routineSwitcher._validateAndRepairCycleData)
+  // ============================================================================
+
+  // Ensure title exists
+  if (!currentCycle.title || typeof currentCycle.title !== 'string') {
+    currentCycle.title = cycleKey !== 'unknown' ? cycleKey : 'Untitled Routine';
+    tasksModified = true;
+    warn(`⚠️ Repaired missing cycle title: "${currentCycle.title}"`);
+  }
+
+  // Ensure cycleCount is a valid number
+  if (typeof currentCycle.cycleCount !== 'number' || currentCycle.cycleCount < 0 || isNaN(currentCycle.cycleCount)) {
+    currentCycle.cycleCount = 0;
+    tasksModified = true;
+    warn('⚠️ Repaired invalid cycleCount to 0');
+  }
+
+  // Ensure autoReset is a boolean
+  if (typeof currentCycle.autoReset !== 'boolean') {
+    currentCycle.autoReset = true;
+    tasksModified = true;
+    warn('⚠️ Repaired autoReset to default (true)');
+  }
+
+  // Ensure deleteCheckedTasks is a boolean
+  if (typeof currentCycle.deleteCheckedTasks !== 'boolean') {
+    currentCycle.deleteCheckedTasks = false;
+    tasksModified = true;
+    warn('⚠️ Repaired deleteCheckedTasks to default (false)');
+  }
+
+  // ============================================================================
+  // TASK ARRAY VALIDATION
+  // ============================================================================
+
+  if (!currentCycle.tasks || !Array.isArray(currentCycle.tasks)) {
+    currentCycle.tasks = [];
+    tasksModified = true;
+    warn('⚠️ Repaired invalid tasks array');
+    return { tasks: [], wasModified: tasksModified };
+  }
+
+  const originalLength = currentCycle.tasks.length;
+
+  // Determine current mode for deleteWhenComplete defaults
+  const isToDoMode = currentCycle.deleteCheckedTasks === true;
+  const currentMode = isToDoMode ? 'todo' : 'cycle';
+
+  // ============================================================================
+  // TASK-LEVEL VALIDATION (comprehensive, like import does)
+  // ============================================================================
+
+  currentCycle.tasks.forEach((task, index) => {
+    if (!task) return;
+    if (typeof task !== 'object') return; // Skip non-objects (strings, numbers, etc.)
+
+    // ✅ Repair missing ID
+    if (!task.id || typeof task.id !== 'string') {
+      task.id = `task-${Date.now()}-${index}-${(task.text || '').length}`;
+      tasksModified = true;
+      warn('⚠️ Repaired task with missing ID:', task.id);
+    }
+
+    // ✅ Repair missing text (don't filter out yet)
+    const hasText = task.text || task.taskText;
+    if (!hasText || (typeof hasText === 'string' && hasText.trim() === '')) {
+      task.text = `[Task ${index + 1}]`;
+      tasksModified = true;
+      warn('⚠️ Repaired task with missing text:', task.id);
+    } else if (task.taskText && !task.text) {
+      // Migrate legacy taskText to text. This is the WRITE-side normaliser: after
+      // it runs, live tasks carry only `text`. The read-side counterpart is
+      // getTaskText() in task/taskUtils.js, for the few readers that can see a
+      // task before this repair (STATE_TRUTH_MIGRATION #5).
+      task.text = task.taskText;
+      delete task.taskText;
+      tasksModified = true;
+    }
+
+    // ✅ Repair boolean fields with proper defaults
+    if (typeof task.completed !== 'boolean') {
+      task.completed = Boolean(task.completed);
+      tasksModified = true;
+      warn('⚠️ Repaired task with invalid completed field:', task.id);
+    }
+
+    // Priority is a level or null (Schema 2.6). Anything else — a 2.5 flag that
+    // slipped past the migration, a typo in a hand-edited file — reads as "no
+    // priority" and is stored that way, so the shape on disk stays explicit.
+    if (task.priority !== null && !isPriorityLevel(task.priority)) {
+      task.priority = null;
+      tasksModified = true;
+      warn('⚠️ Repaired task with invalid priority:', task.id);
+    }
+
+    if (typeof task.remindersEnabled !== 'boolean') {
+      task.remindersEnabled = Boolean(task.remindersEnabled);
+      tasksModified = true;
+      warn('⚠️ Repaired task with invalid remindersEnabled field:', task.id);
+    }
+
+    if (typeof task.recurring !== 'boolean') {
+      task.recurring = Boolean(task.recurring);
+      tasksModified = true;
+      warn('⚠️ Repaired task with invalid recurring field:', task.id);
+    }
+
+    // ✅ Repair dueDate (should be null, string, or number)
+    if (task.dueDate === undefined) {
+      task.dueDate = null;
+      tasksModified = true;
+      warn('⚠️ Repaired task with missing dueDate:', task.id);
+    }
+
+    // ✅ Repair recurringSettings (should be object if recurring)
+    if (task.recurring && (!task.recurringSettings || typeof task.recurringSettings !== 'object')) {
+      task.recurringSettings = {};
+      tasksModified = true;
+      warn('⚠️ Repaired missing recurringSettings for recurring task:', task.id);
+    }
+
+    // ✅ Repair schemaVersion (should be a number, default to 2)
+    if (typeof task.schemaVersion !== 'number' || task.schemaVersion < 1) {
+      task.schemaVersion = 2;
+      tasksModified = true;
+      warn('⚠️ Repaired task with missing schemaVersion:', task.id);
+    }
+
+    // Repair the autoClear map PER KEY (shared with modeManager and taskButtons;
+    // utils/cycleMode.js). Replacing the whole object threw away the other mode's
+    // valid value ({cycle:true, todo:<bad>} loaded in To-Do became
+    // {cycle:false, todo:true}). Since Schema 2.6 there is no derived mirror to
+    // re-derive here — the reconciler that kept the 2.5 pair in agreement is gone.
+    const autoClearSync = syncTaskAutoClear(task, currentMode, DEFAULT_DELETE_WHEN_COMPLETE_SETTINGS);
+    if (autoClearSync.repaired) {
+      warn('⚠️ Repaired task with missing/invalid autoClear map:', task.id);
+      tasksModified = true;
+    }
+  });
+
+  // ✅ ONLY filter out tasks that are completely null/undefined
+  // DO NOT filter out tasks with empty strings (they've been repaired above)
+  const validTasks = currentCycle.tasks.filter(t => {
+    if (!t) return false; // Null or undefined
+    if (typeof t !== 'object') return false; // Not an object
+    // At this point, all tasks have been repaired to have .text and .id
+    return true;
+  });
+
+  currentCycle.tasks = validTasks;
+
+  const removedCount = originalLength - validTasks.length;
+  if (removedCount > 0) {
+    warn(`⚠️ Removed ${removedCount} corrupted tasks during sanitization`);
+  }
+
+
+  return {
+    tasks: validTasks,
+    wasModified: tasksModified || validTasks.length !== originalLength
+  };
+}
+
+/**
+ * Render tasks - calls addTask which will create DOM elements
+ * BUT we need to make sure existing tasks keep their IDs and completion states
+ */
+async function renderTasksToDOM(tasks = []) {
+  // ONE projector. Boot and routine-switch render through the same
+  // TaskRenderer.renderTasks() that undo/redo and refreshUIFromState use, rather
+  // than keeping a second, thinner copy here (STATE_TRUTH_MIGRATION #4).
+  //
+  // The per-task work was ALREADY shared — both paths called
+  // taskToAddTaskOptions() then addTask() — so this is not two renderers merging
+  // into one; it is a thin wrapper deleting itself in favour of the better one.
+  // What the boot copy lacked: the DocumentFragment build, the try/catch that
+  // preserves the existing list if a build throws mid-way, the completed/active
+  // partition projected from state, drag handlers, active-task-options restore,
+  // and reapplyActiveFilter() (which matters here — a routine switch with a
+  // search filter active used to leave every task visible under a query).
+  //
+  // Verified safe before switching, against v2.540:
+  //   - Availability: taskDOM is Phase 3, routineLoader Phase 6, and
+  //     uiOrchestrator (also Phase 6) already declares renderTasks in requires.
+  //   - No task can be dropped: renderTasks skips tasks with no `id`, and
+  //     repairAndCleanTasks() backfills ids at step 1, before this runs.
+  //   - `task.taskText` needed no fallback here: the same repair migrates
+  //     taskText -> text and deletes it, so `task.text` is always set by now.
+  const renderer = _deps.TaskRenderer;
+  if (!renderer?.renderTasks) {
+    // Not a silent degrade: with no renderer the user gets an EMPTY routine that
+    // looks like data loss. Say so loudly and leave the existing DOM alone.
+    console.error('renderTasksToDOM: TaskRenderer unavailable — task list not rendered');
+    return;
+  }
+
+  await renderer.renderTasks(tasks);
+}
+
+/**
+ * Update UI state
+ */
+function updateCycleUIState(currentCycle, settings, titleBeforeLoad = null) {
+  const titleElement = document.getElementById(DOM_IDS.MINI_CYCLE_TITLE);
+  if (titleElement) {
+    // Announce a routine SWITCH. This is the single funnel every load path runs
+    // through, so announcing here covers the switcher, the menu, import and
+    // pull-to-refresh alike — but only when the routine actually CHANGES.
+    //
+    // Compare against the TITLE ELEMENT, not a module-scope tracker. A tracker
+    // goes stale the moment another path writes the title without coming
+    // through here — createNewMiniCycle does exactly that — and then switching
+    // BACK to the last routine this function loaded reads as "no change" and
+    // stays silent. Measured: create "Second Routine", switch to "Your First
+    // Routine", tracker still said "Your First Routine", nothing announced.
+    // The rendered title is what the user was actually on, so it cannot drift.
+    //
+    // But it must be READ BEFORE THE RENDER AWAITS, not here. loadMiniCycle now
+    // awaits the task render, and the switcher calls loadMiniCycle() WITHOUT
+    // awaiting it (a floating promise inside a setTimeout). During that gap
+    // another path — appInit's setup block — writes `currentCycle.title` into
+    // this same element from state, so by the time this line runs the element
+    // can already hold the NEW title, `isSwitch` reads false, and the switch is
+    // announced to nobody. Timing-dependent: green locally, failed on CI
+    // (PR #101, v2.541). loadMiniCycle captures the value up front and passes it
+    // in; the DOM read survives only as the fallback for direct callers.
+    //
+    // An empty element means first paint — opening the app is not a context
+    // change worth speaking, and it would talk over the screen reader's own
+    // page-load announcement. Reloading the SAME routine is silent too.
+    const nextTitle = currentCycle.title || getLabel('routine.untitledCycle');
+    const shownTitle = (titleBeforeLoad !== null ? titleBeforeLoad : titleElement.textContent).trim();
+    const isSwitch = shownTitle !== '' && shownTitle !== nextTitle;
+
+    titleElement.textContent = nextTitle;
+
+    if (isSwitch) {
+      announce(getLabel('accessibility.routineSwitched', { vars: { name: nextTitle } }));
+    }
+  }
+
+  const toggleAutoReset = document.getElementById(DOM_IDS.TOGGLE_AUTO_RESET);
+  const deleteCheckedTasks = document.getElementById(DOM_IDS.DELETE_CHECKED_TASKS);
+
+  if (toggleAutoReset) {
+    toggleAutoReset.checked = currentCycle.autoReset || false;
+  }
+  if (deleteCheckedTasks) {
+    deleteCheckedTasks.checked = currentCycle.deleteCheckedTasks || false;
+  }
+
+  // Sync mode selector dropdown and body classes with routine's saved mode
+  _deps.syncModeFromToggles?.();
+
+  applyThemeSettings(settings || {});
+}
+
+/**
+ * Theme settings
+ */
+function applyThemeSettings(settings) {
+  document.body.classList.toggle(DOM_CLASSES.DARK_MODE, !!settings.darkMode);
+  document.documentElement.classList.toggle(DOM_CLASSES.DARK_MODE, !!settings.darkMode);
+
+  const allThemes = [DOM_CLASSES.THEME_DARK_OCEAN, DOM_CLASSES.THEME_GOLDEN_GLOW];
+  allThemes.forEach(t => document.body.classList.remove(t));
+
+  if (settings.theme && settings.theme !== 'default') {
+    document.body.classList.add(`theme-${settings.theme}`);
+  }
+
+  _deps.updateThemeColor?.();
+
+  // Accessibility settings
+  document.body.classList.toggle(DOM_CLASSES.REDUCED_MOTION, !!settings.reducedMotion);
+  document.documentElement.classList.toggle(DOM_CLASSES.REDUCED_MOTION, !!settings.reducedMotion);
+  document.body.classList.toggle(DOM_CLASSES.HIGH_CONTRAST, !!settings.highContrast);
+  // Font size: only set an inline override when the user chose a non-default
+  // size. For the default, REMOVE the inline property so control returns to the
+  // stylesheet (the max-width:480px media query bumps the base to 17px on phones).
+  // Unconditionally writing an inline '16px' here — as this did before — beats the
+  // media query at every specificity and killed any CSS-level responsive default.
+  // Validated before it reaches setProperty: settings.fontSize is a plain
+  // stored string, and this applies it on every routine load.
+  const fontSize = normalizeFontSize(settings.fontSize);
+  if (fontSize !== null && fontSize !== FONT_SIZE.DEFAULT_PX) {
+    document.documentElement.style.setProperty('--font-size-base', `${fontSize}px`);
+  } else {
+    document.documentElement.style.removeProperty('--font-size-base');
+  }
+}
+
+/**
+ * Reminders
+ */
+async function setupRemindersForCycle(reminders) {
+  const enableReminders = document.getElementById(DOM_IDS.ENABLE_REMINDERS);
+  const frequencySection = document.getElementById(DOM_IDS.FREQUENCY_SECTION);
+  if (!enableReminders) return;
+
+  const enabled = reminders.enabled === true;
+  enableReminders.checked = enabled;
+
+  if (frequencySection) {
+    frequencySection.classList.toggle(DOM_CLASSES.HIDDEN, !enabled);
+  }
+  if (enabled) {
+    _deps.startReminders?.();
+  }
+
+  // ✅ Catch up on missed recurring tasks when switching cycles
+  if (_deps.catchUpMissedRecurringTasks) {
+    await _deps.catchUpMissedRecurringTasks();
+  }
+}
+
+/**
+ * Dependent UI refresh
+ */
+function updateDependentComponents() {
+  _deps.updateProgressBar?.();
+  _deps.checkCompleteAllButton?.();
+  _deps.updateMainMenuHeader?.();
+  _deps.updateStatsPanel?.();
+  _deps.refreshThemeLabels?.();  // Apply vocab theme colors and labels for the newly active routine
+  // Release any temporary help-window content (mode description, customizer
+  // tip). Both hold isShowingModeDescription for 10-30s, and while it is set
+  // updateConstantMessage() early-returns — so switching routines shortly after
+  // changing modes left the PREVIOUS routine's message on screen. Not
+  // updateHelpWindow(): that routes to refreshLabels(), which deliberately
+  // PRESERVES the temporary state (it exists for theme changes, where keeping
+  // it is correct).
+  const helpMgr = typeof _deps.helpWindowManager === 'function'
+    ? _deps.helpWindowManager()
+    : _deps.helpWindowManager;
+  helpMgr?.clearTemporaryMessage?.();
+  _deps.updateRecurringInfoLink?.();  // Refresh recurring count for the newly active routine
+}
+
+/**
+ * Repair the routine being loaded without mutating live state outside update().
+ *
+ * While state is ready, the loader renders the LIVE AppState tree, so the
+ * old in-place repair changed live state before any update() ran (CLAUDE.md #13):
+ * subscribers were then notified with an oldState that already held the repair, and
+ * the save that followed assigned the same object back over itself
+ * (STATE_TRUTH_MIGRATION #11). Now the repair is detected on a copy
+ * and, only if something needs repairing, applied inside update() to state itself.
+ *
+ * While state is not ready the loader holds a copy read from storage — not live
+ * state — so that copy is repaired directly for rendering; there is no state to save
+ * it to yet.
+ *
+ * @param {string} routineId - Id of the routine being loaded
+ * @param {Object} routine - The routine object the loader renders from
+ * @returns {Promise<void>}
+ */
+async function repairRoutineBeforeRender(routineId, routine) {
+  const appState = getAppState();
+  if (!appState?.isReady?.()) {
+    repairAndCleanTasks(routine, routineId);
+    return;
+  }
+
+  const needsRepair = repairAndCleanTasks(structuredClone(routine), routineId, { quiet: true }).wasModified;
+  if (!needsRepair) return;
+
+  let liveRoutine = null;
+  try {
+    await appState.update((state) => {
+      liveRoutine = getRoutine(state, routineId) ?? null;
+      if (liveRoutine) repairAndCleanTasks(liveRoutine, routineId);
+    }, true); // immediate = true for repairs
+  } catch (e) {
+    console.error('❌ Failed to save routine repair via AppState', e);
+  }
+
+  // Normally `routine` IS the live object and is now repaired. If the loader was
+  // handed a copy anyway (a caller passing its own object), repair that copy too
+  // so the render matches what was saved.
+  if (liveRoutine !== routine) repairAndCleanTasks(routine, routineId, { quiet: true });
+}
+
+// ✅ REMOVED: Backward compatibility global attachment
+// featureBoot.js now handles window.loadMiniCycle exposure
+// Prefer importing loadMiniCycle directly from this module
+
+export {
+  loadMiniCycle,
+  repairAndCleanTasks,
+  renderTasksToDOM,
+  updateCycleUIState,
+  applyThemeSettings,
+  setupRemindersForCycle,
+  updateDependentComponents,
+  setRoutineLoaderDependencies
+};
