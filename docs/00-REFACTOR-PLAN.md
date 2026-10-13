@@ -22,7 +22,7 @@ TaskCycle properly — on the architecture miniCycle matured into — so that:
 ```
 TaskCycle (original monolith — 3,616-line main.js)
    └── 🚀 Extract miniCycle as standalone app
-          └── miniCycle (124 modules, schema 2.5, strict DI)  ← the mature architecture
+          └── miniCycle (124 modules, schema 2.6, strict DI)  ← the mature architecture
                  └── TaskCycle v2 (THIS PLAN) — fork that architecture, add Pro on top
 ```
 
@@ -105,7 +105,7 @@ Each phase ends with a working app. We never have a months-long "nothing runs" w
 
 ### Phase 2 — File formats
 - Build the `format/` layer: `tcycCodec` (native read/write), `mcycCodec` (read = upcast), `formatDowngrade` (write degraded `.mcyc` + loss manifest), and the warning modal.
-- Migration: schema 2.5 → TaskCycle schema (additive; see formats doc).
+- Migration: miniCycle schema 2.6 → TaskCycle schema (additive; see formats doc).
 - **Exit:** round-trip `.tcyc` save/load; import a real miniCycle `.mcyc` losslessly; export degraded `.mcyc` and see an accurate data-loss warning. Tests cover upcast, downcast, and the loss manifest.
 
 ### Phase 3 — Tiers & licensing
@@ -154,7 +154,7 @@ Each phase ends with a working app. We never have a months-long "nothing runs" w
 | **Offline licensing is inherently crackable** | Certain | Accept it. Use pragmatic signed-key verification (good-faith, privacy-respecting). Don't over-engineer DRM; it hurts honest users. See licensing doc. |
 | **Format downgrade silently loses data** | Medium | Downgrade is *never* silent — always produces a loss manifest surfaced in a confirm modal. Tested. |
 | **Solo-founder bandwidth** | High | Phases each ship something usable; you can stop after any milestone with a coherent product. |
-| **Schema migration bugs** | Medium | TaskCycle schema is **additive** over 2.5; reuse miniCycle's `migrationManager`/`migrationFacade` patterns; migrations are tested with real fixtures. |
+| **Schema migration bugs** | Medium | TaskCycle schema is **additive** over 2.6; reuse miniCycle's `migrationManager`/`migrationFacade` patterns; migrations are tested with real fixtures. |
 
 ---
 

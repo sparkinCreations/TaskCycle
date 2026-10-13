@@ -20,7 +20,7 @@ touches is declared in `moduleManifests.js` (`requires` / `optionalDeps` / `lazy
 ```javascript
 const state = this.deps.AppState.get();
 this.deps.AppState.update(state => {
-    state.data.cycles[cycleId].tasks.push(newTask);
+    state.data.routine[routineId].tasks.push(newTask);
 }, true); // immediate save; default = 600ms debounce
 ```
 `dataAccess.js` is legacy — new code uses `AppState.get/.update` directly.
@@ -95,24 +95,38 @@ web/
 
 ---
 
-## 4. Data schema (additive over miniCycle 2.5)
+## 4. Data schema (additive over miniCycle 2.6)
 
-TaskCycle's schema is **miniCycle schema 2.5 plus additive fields** — never a breaking change. Reuse
-miniCycle's `core/types.js`, `routine/migrationManager.js`, and `core/migrationFacade.js` patterns.
+TaskCycle's schema is **miniCycle schema 2.6 plus additive fields** — never a breaking change. Reuse
+miniCycle's `core/types.js`, `routine/migrationManager.js`, `routine/schemaMigration26.js`, and
+`core/migrationFacade.js` patterns. Canonical reference: miniCycle `web/docs/reference/SCHEMA_2_6.md`.
+
+**What 2.6 means for the fork (changed from 2.5 in Sep 2026):**
+- Routines live under `data.routine[<generated id>]` (not `data.cycles[<name>]`); the display name is `title`.
+- `appState.activeRoutineId` (not `activeCycleId`).
+- Task priority is a **level**: `priority: "high" | "medium" | "low" | null`. No colour is stored
+  (the old `highPriority` + `priorityColor` pair is gone).
+- Per-mode clear setting is one open map: `autoClear: { cycle, todo }` (replaces `deleteWhenCompleteSettings`
+  + the derived `deleteWhenComplete` mirror).
+- Two version stamps: document `schemaVersion` is the string `"2.6"`; each task carries `schemaVersion: 2`
+  (a number). They are intentionally different counters.
+- Mode is **derived** from `autoReset` / `deleteCheckedTasks`; nothing stores a mode string.
 
 ```jsonc
 {
-  "schemaVersion": "2.5",          // base schema stays 2.5 (compatible)
+  "schemaVersion": "2.6",          // base schema stays 2.6 (compatible)
   "tcycVersion": "1.0",            // NEW: TaskCycle-format envelope version
   "generator": "taskcycle",        // NEW: provenance — "taskcycle" | "minicycle"
-  "metadata": { /* unchanged: createdAt, lastModified, appVersion, migrationHistory, totals */ },
+  "metadata": { /* unchanged: createdAt, lastModified, totalRoutinesCreated, ... */ },
   "data": {
-    "cycles": {
-      "cycle-abc": {
-        /* ...all miniCycle 2.5 cycle fields unchanged... */
+    "routine": {
+      "routine-1789760998636-bqphapbbc": {
+        /* ...all miniCycle 2.6 routine fields unchanged: title, theme, autoReset,
+           deleteCheckedTasks, cycleCount, taskOptionButtons, history, clearedTasks... */
         "tasks": [
           {
-            /* ...all miniCycle 2.5 task fields unchanged... */
+            /* ...all miniCycle 2.6 task fields unchanged: id, text, completed, priority,
+               autoClear, recurring, recurringSettings, schemaVersion: 2... */
             "taskType": "standard",      // NEW (Pro): standard|counter|boolean|multiChoice|comment
             "subtasks": [],              // NEW (Pro)
             "tools": {}                  // NEW (Pro): attached timer/stopwatch/counter/notes state
@@ -125,8 +139,9 @@ miniCycle's `core/types.js`, `routine/migrationManager.js`, and `core/migrationF
 ```
 
 **Compatibility rules (the contract):**
-- A TaskCycle file with **only standard tasks, no subtasks, no tools** is byte-compatible with miniCycle's
-  reader (it just ignores the extra envelope keys).
+- miniCycle is **never expected to read `.tcyc`**. The only artefact handed to a miniCycle user is a
+  downcast `.mcyc` (see [02-FILE-FORMATS.md](02-FILE-FORMATS.md)). A TaskCycle file with **only standard
+  tasks, no subtasks, no tools** downcasts with an empty loss manifest.
 - A miniCycle `.mcyc` read by TaskCycle gets the NEW fields defaulted (`taskType: "standard"`, `subtasks: []`,
   `tools: {}`) — a lossless **upcast**.
 - Writing `.mcyc` from a TaskCycle file with Pro fields populated is a lossy **downcast** — handled with an

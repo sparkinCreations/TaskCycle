@@ -15,7 +15,7 @@ This folder is the planning home for the rebuild. Read in order.
 
 TaskCycle and miniCycle are the *same engine* — miniCycle was literally extracted from TaskCycle
 (`🚀 Extract miniCycle as standalone app`). So we don't start cold and we don't adopt React: we fork
-miniCycle's battle-tested architecture (124 modules, schema 2.5, strict DI, zero `window.*` globals) and
+miniCycle's battle-tested architecture (124 modules, schema 2.6, strict DI, zero `window.*` globals) and
 build TaskCycle's extras *on top* as additive modules. Three tiers — **Free** (≤3 routines, saving locked
 beyond), **Pro** (one-time, everything unlocked locally), **Online** (subscription, sync + teams, deferred)
 — are a licensing concern, not an architecture concern. Native format is **`.tcyc`** (a superset of
