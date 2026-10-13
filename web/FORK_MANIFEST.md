@@ -4,9 +4,9 @@ Forked from the miniCycle repository (local checkout `../../miniCycle`, branch `
 
 | Field | Value |
 |-------|-------|
-| Source commit | `251664e96d18cf26a3c9a77cff9d8df411b0e424` |
-| Source app version | 2.613 |
-| Fork date | 2026-10-12 |
+| Source commit | `95d52f88` (miniCycle branch `schema-2.6-cleanup` = v2.615 + the schema 2.6 cleanup; first fork was `251664e9` v2.613) |
+| Source app version | 2.615 (+ 3 cleanup commits) |
+| Fork date | 2026-10-12, re-synced 2026-10-13 |
 | Phase | 0 — Scaffold (see `../docs/00-REFACTOR-PLAN.md`) |
 
 ## Copied
@@ -62,3 +62,8 @@ upstream's to fix, and the fork should pick the fix up rather than diverge.
   TaskCycle has no Lite tier; these need removing or re-pointing in Phase 1.
 - `scripts/validate-html.py`, `validate-csp.py`, `validate-inline.py`, `update-version.sh`, `build-web.cjs`
   and the Capacitor/Electron build scripts still name `miniCycle.html`; not run in Phase 0.
+
+## Sync log
+| Date | Upstream | What came in |
+|------|----------|--------------|
+| 2026-10-13 | `95d52f88` (`schema-2.6-cleanup`, v2.615 + 3 commits) | releases 2.614/2.615 (focus view, a11y, SW precache) and the schema 2.6 cleanup: `.mcyc` exporter no longer dual-writes the 2.5 pair; `taskContext.hasPriority`; DI names `createInitialSchemaData`, `saveRoutineToState`, `applyRecurringToTask`. Mirror copy of the forked paths, then the RENAMES above re-applied; fork-vs-upstream diff is exactly the RENAMES set. |

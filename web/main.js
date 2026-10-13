@@ -3,7 +3,7 @@
  * main.js - Application Entrypoint
  * ============================================================================
  *
- * This is the ONLY file loaded by miniCycle.html.
+ * This is the ONLY file loaded by index.html.
  * It imports the orchestrator which handles the full boot sequence.
  *
  * ERROR HANDLING STRATEGY:
